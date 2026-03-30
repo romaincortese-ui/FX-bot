@@ -1,6 +1,6 @@
 """
 OANDA FX Trading Bot — Multi-Strategy + Adaptive Learning + Session Intelligence
-+ Dynamic Pair Selection (spread filter + volatility ranking)
++ Dynamic Pair Selection + Auto‑restarting Price Stream
 """
 
 import time
@@ -242,6 +242,10 @@ CORRELATION_GROUPS = {
     "JPY_SHORT": ["USD_JPY", "EUR_JPY", "GBP_JPY"],
 }
 
+# ── Streaming thread control ───────────────────────────────────
+_stream_thread = None
+_stop_stream_event = threading.Event()
+
 # ═══════════════════════════════════════════════════════════════
 #  UTILITIES
 # ═══════════════════════════════════════════════════════════════
@@ -347,8 +351,80 @@ def refresh_dynamic_watchlist():
         DYNAMIC_PAIRS = new_list
         LAST_WATCHLIST_UPDATE = time.time()
         log.info(f"✅ Dynamic watchlist updated with {len(DYNAMIC_PAIRS)} pairs.")
+        _restart_price_stream()
     else:
         log.warning("Dynamic watchlist refresh returned empty – keeping old list.")
+
+# ═══════════════════════════════════════════════════════════════
+#  PRICE STREAMING WITH RESTART
+# ═══════════════════════════════════════════════════════════════
+
+def _price_stream_worker(stream_pairs):
+    """Background thread that keeps a streaming connection alive."""
+    instruments = ",".join(stream_pairs)
+    url = f"{OANDA_STREAM_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing/stream"
+    while not _stop_stream_event.is_set():
+        try:
+            # Use a session that can be closed on stop
+            with requests.Session() as sess:
+                sess.headers.update(_oanda_headers())
+                resp = sess.get(url, params={"instruments": instruments}, stream=True, timeout=30)
+                log.info("🔌 Price stream connected")
+                for line in resp.iter_lines():
+                    if _stop_stream_event.is_set():
+                        break
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        if data.get("type") == "PRICE":
+                            inst = data["instrument"]
+                            bid = float(data["bids"][0]["price"]) if data.get("bids") else 0
+                            ask = float(data["asks"][0]["price"]) if data.get("asks") else 0
+                            with _price_lock:
+                                _live_prices[inst] = (bid, ask, time.time())
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+        except Exception as e:
+            if not _stop_stream_event.is_set():
+                log.warning(f"🔌 Stream error: {e} — reconnecting in 5s")
+                time.sleep(5)
+        # If we exit loop due to stop, break out completely
+        if _stop_stream_event.is_set():
+            break
+
+def _start_price_stream(pairs=None):
+    """Start (or restart) the price stream with the given pair list."""
+    global _stream_thread, _stop_stream_event
+
+    # If a stream is already running, stop it
+    if _stream_thread and _stream_thread.is_alive():
+        log.info("Stopping existing price stream...")
+        _stop_stream_event.set()
+        _stream_thread.join(timeout=5)
+        if _stream_thread.is_alive():
+            log.warning("Stream thread did not stop in time, proceeding anyway.")
+        _stream_thread = None
+
+    # Determine which pairs to stream
+    if pairs is None:
+        pairs = DYNAMIC_PAIRS if DYNAMIC_PAIRS else STATIC_ALL_PAIRS
+    # Always include pairs with open trades
+    open_trade_pairs = list({t["instrument"] for t in open_trades})
+    all_pairs = list(set(pairs + open_trade_pairs))
+    if not all_pairs:
+        return
+
+    log.info(f"Starting price stream with {len(all_pairs)} pairs: {all_pairs[:5]}...")
+    _stop_stream_event.clear()
+    _stream_thread = threading.Thread(target=_price_stream_worker, args=(all_pairs,), daemon=True, name="price-stream")
+    _stream_thread.start()
+
+def _restart_price_stream():
+    """Restart the price stream to include the latest watchlist + open trades."""
+    if PAPER_TRADE or not OANDA_API_KEY:
+        return
+    _start_price_stream()  # uses current DYNAMIC_PAIRS and open_trades
 
 # ═══════════════════════════════════════════════════════════════
 #  SESSION DETECTION (uses dynamic list)
@@ -1943,48 +2019,6 @@ def send_daily_summary(balance: float):
     )
 
 # ═══════════════════════════════════════════════════════════════
-#  PRICE STREAMING
-# ═══════════════════════════════════════════════════════════════
-
-def _start_price_stream():
-    def _stream():
-        pairs_to_stream = DYNAMIC_PAIRS if DYNAMIC_PAIRS else STATIC_ALL_PAIRS
-        instruments = ",".join(pairs_to_stream)
-        while True:
-            url = f"{OANDA_STREAM_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing/stream"
-            try:
-                r = requests.get(
-                    url,
-                    params={"instruments": instruments},
-                    headers=_oanda_headers(),
-                    stream=True,
-                    timeout=30,
-                )
-                log.info("🔌 Price stream connected")
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                        if data.get("type") == "PRICE":
-                            inst = data["instrument"]
-                            bid = float(data["bids"][0]["price"]) if data.get("bids") else 0
-                            ask = float(data["asks"][0]["price"]) if data.get("asks") else 0
-                            with _price_lock:
-                                _live_prices[inst] = (bid, ask, time.time())
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
-            except Exception as e:
-                log.warning(f"🔌 Stream error: {e} — reconnecting in 5s")
-                time.sleep(5)
-
-    if PAPER_TRADE or not OANDA_API_KEY:
-        return
-    t = threading.Thread(target=_stream, daemon=True, name="price-stream")
-    t.start()
-    log.info("🔌 Price stream starting...")
-
-# ═══════════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════════════
 
@@ -2010,6 +2044,7 @@ def run():
         DYNAMIC_PAIRS = STATIC_ALL_PAIRS
         log.warning(f"⚠️ Using static pairs: {DYNAMIC_PAIRS}")
 
+    # Start price stream (will include open trades automatically)
     if not PAPER_TRADE and OANDA_API_KEY:
         _start_price_stream()
 
@@ -2050,7 +2085,7 @@ def run():
             if df_eurusd_1h is not None:
                 _market_regime_mult = compute_market_regime(df_eurusd_1h)
 
-            refresh_dynamic_watchlist()
+            refresh_dynamic_watchlist()   # This will also restart stream if needed
 
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             today_pnl = sum(t.get("pnl", 0) for t in trade_history
