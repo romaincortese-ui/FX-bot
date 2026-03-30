@@ -53,18 +53,18 @@ DYNAMIC_PAIRS = []                 # will be filled at runtime
 LAST_WATCHLIST_UPDATE = 0
 WATCHLIST_UPDATE_INTERVAL = int(os.getenv("WATCHLIST_UPDATE_INTERVAL", "14400"))  # 4 hours
 MAX_WATCHLIST_SIZE = int(os.getenv("MAX_WATCHLIST_SIZE", "8"))
-MAX_SPREAD_FILTER_PIPS = float(os.getenv("MAX_SPREAD_FILTER_PIPS", "1.5"))   # discard pairs with wider spread
+MAX_SPREAD_FILTER_PIPS = float(os.getenv("MAX_SPREAD_FILTER_PIPS", "1.5"))
 
 # ── Spread betting min stake ──────────────────────────────────
 SPREAD_BET_MIN_STAKE = float(os.getenv("SPREAD_BET_MIN_STAKE", "0.10"))
 
-# ── Capital allocation (unchanged) ───────────────────────────
+# ── Capital allocation ───────────────────────────────────────
 SCALPER_ALLOCATION_PCT  = float(os.getenv("SCALPER_ALLOCATION_PCT",  "0.30"))
 TREND_ALLOCATION_PCT    = float(os.getenv("TREND_ALLOCATION_PCT",    "0.40"))
 REVERSAL_ALLOCATION_PCT = float(os.getenv("REVERSAL_ALLOCATION_PCT", "0.15"))
 BREAKOUT_ALLOCATION_PCT = float(os.getenv("BREAKOUT_ALLOCATION_PCT", "0.15"))
 
-# ── Risk management (unchanged) ───────────────────────────────
+# ── Risk management ─────────────────────────────────────────
 MAX_RISK_PER_TRADE     = float(os.getenv("MAX_RISK_PER_TRADE",     "0.01"))
 MAX_RISK_PER_PAIR      = float(os.getenv("MAX_RISK_PER_PAIR",      "0.03"))
 MAX_TOTAL_EXPOSURE     = float(os.getenv("MAX_TOTAL_EXPOSURE",      "0.15"))
@@ -88,7 +88,7 @@ SESSION_NY_MULT        = float(os.getenv("SESSION_NY_MULT",        "0.92"))
 SESSION_TOKYO_MULT     = float(os.getenv("SESSION_TOKYO_MULT",     "1.15"))
 SESSION_OFF_HOURS_MULT = float(os.getenv("SESSION_OFF_HOURS_MULT", "1.30"))
 
-# ── Strategy parameters (unchanged, but include trail pips) ───
+# ── Scalper strategy ────────────────────────────────────────
 SCALPER_MAX_TRADES    = int(os.getenv("SCALPER_MAX_TRADES",    "3"))
 SCALPER_BUDGET_PCT    = float(os.getenv("SCALPER_BUDGET_PCT",  "0.35"))
 SCALPER_THRESHOLD     = int(os.getenv("SCALPER_THRESHOLD",     "40"))
@@ -108,6 +108,7 @@ SCALPER_CONFLUENCE_BONUS = float(os.getenv("SCALPER_CONFLUENCE_BONUS", "15"))
 SCALPER_MAX_SPREAD_PIPS  = float(os.getenv("SCALPER_MAX_SPREAD_PIPS", "1.5"))
 SCALPER_TRAIL_PIPS = float(os.getenv("SCALPER_TRAIL_PIPS", "5"))
 
+# ── Trend strategy ──────────────────────────────────────────
 TREND_MAX_TRADES      = int(os.getenv("TREND_MAX_TRADES",      "2"))
 TREND_BUDGET_PCT      = float(os.getenv("TREND_BUDGET_PCT",    "0.40"))
 TREND_THRESHOLD       = int(os.getenv("TREND_THRESHOLD",       "45"))
@@ -120,6 +121,7 @@ TREND_BREAKEVEN_ATR   = float(os.getenv("TREND_BREAKEVEN_ATR", "1.5"))
 TREND_MAX_SPREAD_PIPS = float(os.getenv("TREND_MAX_SPREAD_PIPS", "2.0"))
 TREND_TRAIL_PIPS      = float(os.getenv("TREND_TRAIL_PIPS",   "15"))
 
+# ── Reversal strategy ───────────────────────────────────────
 REVERSAL_MAX_TRADES   = int(os.getenv("REVERSAL_MAX_TRADES",   "2"))
 REVERSAL_BUDGET_PCT   = float(os.getenv("REVERSAL_BUDGET_PCT", "0.25"))
 REVERSAL_THRESHOLD    = int(os.getenv("REVERSAL_THRESHOLD",    "50"))
@@ -131,6 +133,7 @@ REVERSAL_RSI_OVERBOUGHT = int(os.getenv("REVERSAL_RSI_OVERBOUGHT", "75"))
 REVERSAL_MAX_SPREAD_PIPS = float(os.getenv("REVERSAL_MAX_SPREAD_PIPS", "1.5"))
 REVERSAL_TRAIL_PIPS   = float(os.getenv("REVERSAL_TRAIL_PIPS", "5"))
 
+# ── Breakout strategy ───────────────────────────────────────
 BREAKOUT_MAX_TRADES   = int(os.getenv("BREAKOUT_MAX_TRADES",   "2"))
 BREAKOUT_BUDGET_PCT   = float(os.getenv("BREAKOUT_BUDGET_PCT", "0.25"))
 BREAKOUT_THRESHOLD    = int(os.getenv("BREAKOUT_THRESHOLD",    "55"))
@@ -142,7 +145,7 @@ BREAKOUT_BB_SQUEEZE_THRESHOLD = float(os.getenv("BREAKOUT_BB_SQUEEZE_THRESHOLD",
 BREAKOUT_MAX_SPREAD_PIPS = float(os.getenv("BREAKOUT_MAX_SPREAD_PIPS", "2.0"))
 BREAKOUT_TRAIL_PIPS   = float(os.getenv("BREAKOUT_TRAIL_PIPS", "10"))
 
-# ── Macro intelligence (unchanged) ───────────────────────────
+# ── Macro intelligence ──────────────────────────────────────
 DXY_EMA_PERIOD          = int(os.getenv("DXY_EMA_PERIOD",          "50"))
 DXY_GATE_THRESHOLD      = float(os.getenv("DXY_GATE_THRESHOLD",   "0.005"))
 VIX_HIGH_THRESHOLD      = float(os.getenv("VIX_HIGH_THRESHOLD",   "25"))
@@ -262,9 +265,7 @@ def pip_value(instrument: str, units: float, account_currency: str = "GBP") -> f
 # ═══════════════════════════════════════════════════════════════
 
 def get_daily_atr(pair: str) -> tuple[float, float]:
-    """
-    Fetch daily candles and return ATR (as price) and ATR% (as percentage of current price).
-    """
+    """Fetch daily candles and return ATR (price) and ATR% (percentage)."""
     df = fetch_candles(pair, "D", 30)
     if df is None or len(df) < 20:
         return 0.0, 0.0
@@ -276,19 +277,17 @@ def get_daily_atr(pair: str) -> tuple[float, float]:
     return atr, atr_pct
 
 def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: float = MAX_SPREAD_FILTER_PIPS) -> list:
-    """Fetch all currency pairs from OANDA, filter by spread, rank by ATR%, return top N."""
+    """Fetch all currency pairs, filter by spread, rank by ATR%, return top N."""
     if PAPER_TRADE or not OANDA_API_KEY:
         log.warning("Dynamic watchlist skipped (paper trade or no API key). Using static list.")
         return STATIC_ALL_PAIRS
 
     try:
-        # 1. Get all instruments
         resp = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/instruments")
         instruments = resp.get("instruments", [])
         fx_pairs = []
         for inst in instruments:
             if inst.get("type") == "CURRENCY":
-                # OANDA uses "/" internally, but API returns name with "_"
                 name = inst["name"].replace("/", "_")
                 fx_pairs.append(name)
 
@@ -297,7 +296,7 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
 
         log.info(f"📊 Found {len(fx_pairs)} currency pairs. Checking spreads...")
 
-        # 2. Filter by spread
+        # Filter by spread
         chunk_size = 40
         spread_ok = []
         for i in range(0, len(fx_pairs), chunk_size):
@@ -318,7 +317,7 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
 
         log.info(f"📊 {len(spread_ok)} pairs passed spread filter. Ranking by volatility...")
 
-        # 3. Rank by ATR%
+        # Rank by ATR%
         pair_volatility = {}
         for pair in spread_ok:
             _, atr_pct = get_daily_atr(pair)
@@ -328,7 +327,7 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
                 pair_volatility[pair] = 0.0
 
         if not pair_volatility:
-            return spread_ok[:top_n]  # fallback to just spread-filtered
+            return spread_ok[:top_n]
 
         sorted_pairs = sorted(pair_volatility.items(), key=lambda x: x[1], reverse=True)
         top_pairs = [p for p, _ in sorted_pairs[:top_n]]
@@ -348,8 +347,6 @@ def refresh_dynamic_watchlist():
         DYNAMIC_PAIRS = new_list
         LAST_WATCHLIST_UPDATE = time.time()
         log.info(f"✅ Dynamic watchlist updated with {len(DYNAMIC_PAIRS)} pairs.")
-        # Restart price stream with new list? We'll just keep streaming with previous list
-        # but the scanning will now use the new list.
     else:
         log.warning("Dynamic watchlist refresh returned empty – keeping old list.")
 
@@ -365,9 +362,7 @@ def get_current_session() -> dict:
     london_active = LONDON_OPEN_UTC <= hour < LONDON_CLOSE_UTC
     ny_active     = NY_OPEN_UTC <= hour < NY_CLOSE_UTC
 
-    # Use dynamic list if available, else static
     all_pairs = DYNAMIC_PAIRS if DYNAMIC_PAIRS else STATIC_ALL_PAIRS
-    # For core pairs, we can use a simple filter: majors
     core_pairs = [p for p in all_pairs if p in ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "NZD_USD"]]
     if not core_pairs:
         core_pairs = all_pairs[:6]
@@ -397,7 +392,6 @@ def get_current_session() -> dict:
             "aggression": "MEDIUM",
         }
     elif tokyo_active:
-        # Tokyo session: limit to JPY, AUD, NZD pairs
         tokyo_pairs = [p for p in all_pairs if "JPY" in p or "AUD" in p or "NZD" in p]
         return {
             "name": "TOKYO",
@@ -431,7 +425,7 @@ def is_weekend() -> bool:
     return False
 
 # ═══════════════════════════════════════════════════════════════
-#  OANDA API (same as before, with minor updates)
+#  OANDA API
 # ═══════════════════════════════════════════════════════════════
 
 def _oanda_headers() -> dict:
@@ -729,7 +723,7 @@ def modify_trade(trade_id: str, tp_price: float = None, sl_price: float = None,
     return True
 
 # ═══════════════════════════════════════════════════════════════
-#  TECHNICAL INDICATORS (unchanged)
+#  TECHNICAL INDICATORS
 # ═══════════════════════════════════════════════════════════════
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
@@ -834,7 +828,7 @@ def keltner_squeeze(df: pd.DataFrame, bb_period: int = 20, kc_period: int = 20,
     }
 
 # ═══════════════════════════════════════════════════════════════
-#  TELEGRAM & COMMANDS (unchanged)
+#  TELEGRAM & COMMANDS
 # ═══════════════════════════════════════════════════════════════
 
 def telegram(msg: str, parse_mode: str = "HTML"):
@@ -989,7 +983,7 @@ def _handle_metrics_command():
     )
 
 # ═══════════════════════════════════════════════════════════════
-#  STATE PERSISTENCE (unchanged)
+#  STATE PERSISTENCE
 # ═══════════════════════════════════════════════════════════════
 
 def save_state():
@@ -1038,7 +1032,7 @@ def load_state():
         log.warning(f"State load failed ({e}) — starting fresh")
 
 # ═══════════════════════════════════════════════════════════════
-#  MACRO INTELLIGENCE (unchanged)
+#  MACRO INTELLIGENCE
 # ═══════════════════════════════════════════════════════════════
 
 def update_dxy_proxy():
@@ -1130,7 +1124,7 @@ def compute_market_regime(df: pd.DataFrame) -> float:
     return round(mult, 3)
 
 # ═══════════════════════════════════════════════════════════════
-#  DIRECTION DETERMINATION (unchanged)
+#  DIRECTION DETERMINATION
 # ═══════════════════════════════════════════════════════════════
 
 def determine_direction(instrument: str, df_5m: pd.DataFrame,
@@ -1192,22 +1186,679 @@ def determine_direction(instrument: str, df_5m: pd.DataFrame,
     return "LONG" if signals["long"] >= signals["short"] else "SHORT"
 
 # ═══════════════════════════════════════════════════════════════
-#  SCORING FUNCTIONS (unchanged except trail_pips already included)
+#  SCORING FUNCTIONS
 # ═══════════════════════════════════════════════════════════════
 
-# [All scoring functions remain exactly as in the previous version – omitted for brevity]
-# They are identical to the earlier code (score_scalper, score_trend, score_reversal, score_breakout)
-# Please insert them here.
+def score_scalper(instrument: str, session: dict) -> dict | None:
+    spread_pips = get_spread_pips(instrument)
+    if spread_pips > SCALPER_MAX_SPREAD_PIPS:
+        return None
+
+    df_5m = fetch_candles(instrument, "M5", 60)
+    if df_5m is None or len(df_5m) < 30:
+        return None
+
+    df_1h = fetch_candles(instrument, "H1", 60)
+
+    close  = df_5m["close"]
+    volume = df_5m["volume"]
+    rsi    = calc_rsi(close)
+    atr    = calc_atr(df_5m, 14)
+    atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0
+
+    if rsi > SCALPER_MAX_RSI or rsi < SCALPER_MIN_RSI:
+        return None
+
+    ema9  = calc_ema(close, 9)
+    ema21 = calc_ema(close, 21)
+    crossed_now    = ((float(ema9.iloc[-1]) > float(ema21.iloc[-1])) and
+                      (float(ema9.iloc[-2]) <= float(ema21.iloc[-2])))
+    crossed_recent = ((float(ema9.iloc[-2]) > float(ema21.iloc[-2])) and
+                      (float(ema9.iloc[-3]) <= float(ema21.iloc[-3])))
+    crossed_down_now = ((float(ema9.iloc[-1]) < float(ema21.iloc[-1])) and
+                        (float(ema9.iloc[-2]) >= float(ema21.iloc[-2])))
+
+    crossed = crossed_now or crossed_recent or crossed_down_now
+
+    avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 1
+    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
+
+    rsi_prev = calc_rsi(close.iloc[:-1])
+    rsi_delta = rsi - rsi_prev if not np.isnan(rsi_prev) else 0
+
+    ma_score = 30 if crossed else (15 if float(ema9.iloc[-1]) != float(ema21.iloc[-1]) else 0)
+    rsi_score = max(0, 40 - min(rsi, 100 - rsi)) if rsi < 45 or rsi > 55 else 0
+    vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
+
+    confluence = 0
+    if crossed and vol_ratio > 1.5 and abs(rsi_delta) > 2:
+        confluence = SCALPER_CONFLUENCE_BONUS
+
+    macd = calc_macd(df_5m)
+    macd_bonus = 5 if macd["cross_up"] or macd["cross_down"] else 0
+
+    spread_penalty = max(0, (spread_pips - 0.5) * 5)
+
+    score = ma_score + rsi_score + vol_score + confluence + macd_bonus - spread_penalty
+
+    direction = determine_direction(instrument, df_5m, df_1h, strategy="SCALPER")
+
+    if direction == "SHORT":
+        if not (crossed_down_now or (float(ema9.iloc[-1]) < float(ema21.iloc[-1]))):
+            score *= 0.5
+
+    eff_threshold = SCALPER_THRESHOLD * session["multiplier"] * _market_regime_mult
+    eff_threshold += _adaptive_offsets.get("SCALPER", 0)
+
+    if score < eff_threshold:
+        return None
+
+    tp_pips = max(SCALPER_TP_MIN_PIPS, min(SCALPER_TP_MAX_PIPS,
+                  price_to_pips(instrument, atr * SCALPER_TP_ATR_MULT)))
+    sl_pips = max(SCALPER_SL_MIN_PIPS, min(SCALPER_SL_MAX_PIPS,
+                  price_to_pips(instrument, atr * SCALPER_SL_ATR_MULT)))
+
+    if tp_pips / sl_pips < 1.5:
+        tp_pips = sl_pips * 1.5
+
+    return {
+        "instrument": instrument,
+        "score":      round(score, 2),
+        "direction":  direction,
+        "rsi":        round(rsi, 2),
+        "rsi_delta":  round(rsi_delta, 2),
+        "vol_ratio":  round(vol_ratio, 2),
+        "atr":        atr,
+        "atr_pct":    round(atr_pct, 6),
+        "spread_pips": round(spread_pips, 2),
+        "tp_pips":    round(tp_pips, 1),
+        "sl_pips":    round(sl_pips, 1),
+        "trail_pips": SCALPER_TRAIL_PIPS,
+        "crossed_now": crossed_now or crossed_down_now,
+        "entry_signal": "CROSSOVER" if crossed else ("VOL_SPIKE" if vol_ratio > 2 else "TREND"),
+        "macd":       macd,
+    }
+
+def score_trend(instrument: str, session: dict) -> dict | None:
+    spread_pips = get_spread_pips(instrument)
+    if spread_pips > TREND_MAX_SPREAD_PIPS:
+        return None
+
+    df_5m = fetch_candles(instrument, "M5", 60)
+    df_1h = fetch_candles(instrument, "H1", 100)
+    df_4h = fetch_candles(instrument, "H4", 60)
+
+    if df_1h is None or len(df_1h) < 50:
+        return None
+    if df_4h is None or len(df_4h) < 30:
+        return None
+
+    close_1h = df_1h["close"]
+    close_4h = df_4h["close"]
+
+    ema20_1h = calc_ema(close_1h, 20)
+    ema50_1h = calc_ema(close_1h, 50)
+    ema20_4h = calc_ema(close_4h, 20)
+    ema50_4h = calc_ema(close_4h, 50)
+
+    bullish_4h = float(ema20_4h.iloc[-1]) > float(ema50_4h.iloc[-1])
+    bullish_1h = float(ema20_1h.iloc[-1]) > float(ema50_1h.iloc[-1])
+
+    aligned = (bullish_4h == bullish_1h)
+    if not aligned:
+        return None
+
+    direction = "LONG" if bullish_4h else "SHORT"
+
+    score = 0
+    score += 25
+
+    ema50_gap_4h = abs(float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1)
+    score += min(20, ema50_gap_4h * 1000)
+
+    ema20_dist = abs(float(close_1h.iloc[-1]) / float(ema20_1h.iloc[-1]) - 1)
+    if ema20_dist < 0.002:
+        score += 15
+    elif ema20_dist < 0.005:
+        score += 8
+
+    rsi_1h = calc_rsi(close_1h)
+    if direction == "LONG" and 40 < rsi_1h < 65:
+        score += 10
+    elif direction == "SHORT" and 35 < rsi_1h < 60:
+        score += 10
+
+    macd_1h = calc_macd(df_1h)
+    if (direction == "LONG" and macd_1h["histogram"] > 0) or \
+       (direction == "SHORT" and macd_1h["histogram"] < 0):
+        score += 10
+
+    vol = df_1h["volume"]
+    vol_ratio = float(vol.iloc[-1]) / float(vol.iloc[-20:-1].mean()) if len(vol) >= 21 else 1
+    if vol_ratio > 1.2:
+        score += 5
+
+    if "USD" in instrument:
+        base, quote = instrument.split("_")
+        usd_is_base = base == "USD"
+        dxy_long = _dxy_ema_gap > DXY_GATE_THRESHOLD
+        dxy_short = _dxy_ema_gap < -DXY_GATE_THRESHOLD
+
+        if (usd_is_base and direction == "LONG" and dxy_long) or \
+           (usd_is_base and direction == "SHORT" and dxy_short) or \
+           (not usd_is_base and direction == "SHORT" and dxy_long) or \
+           (not usd_is_base and direction == "LONG" and dxy_short):
+            score += 10
+
+    atr = calc_atr(df_1h, 14)
+    atr_pct = atr / float(close_1h.iloc[-1])
+
+    eff_threshold = TREND_THRESHOLD * session["multiplier"] * _market_regime_mult
+    eff_threshold += _adaptive_offsets.get("TREND", 0)
+
+    if score < eff_threshold:
+        return None
+
+    tp_pips = max(15, price_to_pips(instrument, atr * TREND_TP_ATR_MULT))
+    sl_pips = max(8,  price_to_pips(instrument, atr * TREND_SL_ATR_MULT))
+    partial_tp_pips = max(10, price_to_pips(instrument, atr * TREND_PARTIAL_TP_ATR))
+
+    return {
+        "instrument":      instrument,
+        "score":           round(score, 2),
+        "direction":       direction,
+        "rsi":             round(rsi_1h, 2),
+        "vol_ratio":       round(vol_ratio, 2),
+        "atr":             atr,
+        "atr_pct":         round(atr_pct, 6),
+        "spread_pips":     round(spread_pips, 2),
+        "tp_pips":         round(tp_pips, 1),
+        "sl_pips":         round(sl_pips, 1),
+        "partial_tp_pips": round(partial_tp_pips, 1),
+        "trail_pips":      TREND_TRAIL_PIPS,
+        "entry_signal":    "TREND_ALIGNED",
+        "ema50_gap_4h":    round(ema50_gap_4h * 100, 2),
+    }
+
+def score_reversal(instrument: str, session: dict) -> dict | None:
+    spread_pips = get_spread_pips(instrument)
+    if spread_pips > REVERSAL_MAX_SPREAD_PIPS:
+        return None
+
+    if session["aggression"] == "MINIMAL":
+        return None
+
+    df_5m = fetch_candles(instrument, "M5", 60)
+    df_1h = fetch_candles(instrument, "H1", 60)
+
+    if df_5m is None or len(df_5m) < 30:
+        return None
+
+    close = df_5m["close"]
+    rsi = calc_rsi(close)
+
+    is_oversold  = rsi <= REVERSAL_RSI_OVERSOLD
+    is_overbought = rsi >= REVERSAL_RSI_OVERBOUGHT
+    if not (is_oversold or is_overbought):
+        return None
+
+    direction = "LONG" if is_oversold else "SHORT"
+
+    score = 0
+    if is_oversold:
+        score += min(30, (REVERSAL_RSI_OVERSOLD - rsi) * 3)
+    else:
+        score += min(30, (rsi - REVERSAL_RSI_OVERBOUGHT) * 3)
+
+    bb = calc_bollinger_bands(df_5m)
+    price = float(close.iloc[-1])
+    if is_oversold and price <= bb["lower"]:
+        score += 15
+    elif is_overbought and price >= bb["upper"]:
+        score += 15
+
+    rsi_prev = calc_rsi(close.iloc[:-5])
+    if is_oversold and rsi > rsi_prev:
+        score += 10
+    elif is_overbought and rsi < rsi_prev:
+        score += 10
+
+    volume = df_5m["volume"]
+    avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 1
+    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1
+    if vol_ratio > 2.0:
+        score += 10
+
+    if df_1h is not None and len(df_1h) >= 30:
+        low_1h = float(df_1h["low"].iloc[-20:].min())
+        high_1h = float(df_1h["high"].iloc[-20:].max())
+        if is_oversold and abs(price - low_1h) / low_1h < 0.002:
+            score += 10
+        elif is_overbought and abs(price - high_1h) / high_1h < 0.002:
+            score += 10
+
+    atr = calc_atr(df_5m, 14)
+    atr_pct = atr / float(close.iloc[-1])
+
+    eff_threshold = REVERSAL_THRESHOLD * session["multiplier"] * _market_regime_mult
+    eff_threshold += _adaptive_offsets.get("REVERSAL", 0)
+
+    if score < eff_threshold:
+        return None
+
+    tp_pips = max(8,  price_to_pips(instrument, atr * REVERSAL_TP_ATR_MULT))
+    sl_pips = max(5,  price_to_pips(instrument, atr * REVERSAL_SL_ATR_MULT))
+
+    return {
+        "instrument":  instrument,
+        "score":       round(score, 2),
+        "direction":   direction,
+        "rsi":         round(rsi, 2),
+        "vol_ratio":   round(vol_ratio, 2),
+        "atr":         atr,
+        "atr_pct":     round(atr_pct, 6),
+        "spread_pips": round(spread_pips, 2),
+        "tp_pips":     round(tp_pips, 1),
+        "sl_pips":     round(sl_pips, 1),
+        "trail_pips":  REVERSAL_TRAIL_PIPS,
+        "entry_signal": "OVERSOLD_BOUNCE" if is_oversold else "OVERBOUGHT_FADE",
+    }
+
+def score_breakout(instrument: str, session: dict) -> dict | None:
+    spread_pips = get_spread_pips(instrument)
+    if spread_pips > BREAKOUT_MAX_SPREAD_PIPS:
+        return None
+
+    if session["aggression"] in ("MINIMAL", "LOW"):
+        return None
+
+    df_15m = fetch_candles(instrument, "M15", 80)
+    df_1h  = fetch_candles(instrument, "H1", 60)
+
+    if df_15m is None or len(df_15m) < 40:
+        return None
+
+    squeeze = keltner_squeeze(df_15m)
+
+    if not squeeze["in_squeeze"] and squeeze["squeeze_bars"] < 5:
+        return None
+
+    score = 0
+    score += min(25, squeeze["squeeze_bars"] * 3)
+
+    if squeeze["bb_percentile"] < 20:
+        score += 20
+    elif squeeze["bb_percentile"] < 35:
+        score += 10
+
+    volume = df_15m["volume"]
+    recent_vol = float(volume.iloc[-3:].mean())
+    avg_vol = float(volume.iloc[-20:-3].mean()) if len(volume) >= 23 else 1
+    vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1
+    if vol_ratio > 1.3:
+        score += 10
+
+    macd = calc_macd(df_15m)
+    if abs(macd["histogram"]) > abs(float((df_15m["close"].ewm(span=12).mean() -
+                                            df_15m["close"].ewm(span=26).mean() -
+                                            (df_15m["close"].ewm(span=12).mean() -
+                                             df_15m["close"].ewm(span=26).mean()).ewm(span=9).mean()).iloc[-2])):
+        score += 10
+
+    direction = determine_direction(instrument, df_15m, df_1h, strategy="BREAKOUT")
+
+    atr = calc_atr(df_15m, 14)
+    atr_pct = atr / float(df_15m["close"].iloc[-1])
+
+    eff_threshold = BREAKOUT_THRESHOLD * session["multiplier"] * _market_regime_mult
+    eff_threshold += _adaptive_offsets.get("BREAKOUT", 0)
+
+    if score < eff_threshold:
+        return None
+
+    tp_pips = max(15, price_to_pips(instrument, atr * BREAKOUT_TP_ATR_MULT))
+    sl_pips = max(5,  price_to_pips(instrument, atr * BREAKOUT_SL_ATR_MULT))
+
+    return {
+        "instrument":   instrument,
+        "score":        round(score, 2),
+        "direction":    direction,
+        "squeeze_bars": squeeze["squeeze_bars"],
+        "bb_percentile": round(squeeze["bb_percentile"], 1),
+        "vol_ratio":    round(vol_ratio, 2),
+        "atr":          atr,
+        "atr_pct":      round(atr_pct, 6),
+        "spread_pips":  round(spread_pips, 2),
+        "tp_pips":      round(tp_pips, 1),
+        "sl_pips":      round(sl_pips, 1),
+        "trail_pips":   BREAKOUT_TRAIL_PIPS,
+        "entry_signal": "BB_KC_SQUEEZE",
+    }
 
 # ═══════════════════════════════════════════════════════════════
-#  ENTRY & EXIT MANAGEMENT (unchanged)
+#  ENTRY & EXIT MANAGEMENT
 # ═══════════════════════════════════════════════════════════════
 
-# [The functions check_correlation_limit, open_trade_entry, check_exit, close_trade_exit remain unchanged]
-# They already support native trailing stops and rollover protection.
+def check_correlation_limit(instrument: str, direction: str) -> bool:
+    base, quote = instrument.split("_")
+    usd_long = 0
+    usd_short = 0
+    for t in open_trades:
+        t_base, t_quote = t["instrument"].split("_")
+        t_dir = t["direction"]
+        if t_base == "USD":
+            if t_dir == "LONG":
+                usd_long += 1
+            else:
+                usd_short += 1
+        elif t_quote == "USD":
+            if t_dir == "LONG":
+                usd_short += 1
+            else:
+                usd_long += 1
+
+    if quote == "USD":
+        if direction == "LONG":
+            usd_short += 1
+        else:
+            usd_long += 1
+    elif base == "USD":
+        if direction == "LONG":
+            usd_long += 1
+        else:
+            usd_short += 1
+
+    if max(usd_long, usd_short) > MAX_CORRELATED_TRADES:
+        log.info(f"[CORR] Skip {instrument} {direction} — USD exposure limit "
+                 f"(long={usd_long}, short={usd_short})")
+        return False
+    return True
+
+def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
+    instrument = opp["instrument"]
+    direction  = opp["direction"]
+
+    if time.time() < _pair_cooldowns.get(instrument, 0):
+        return None
+
+    if any(t["instrument"] == instrument for t in open_trades):
+        return None
+
+    if not check_correlation_limit(instrument, direction):
+        return None
+
+    kelly_gap = opp["score"] - {"SCALPER": SCALPER_THRESHOLD, "TREND": TREND_THRESHOLD,
+                                 "REVERSAL": REVERSAL_THRESHOLD, "BREAKOUT": BREAKOUT_THRESHOLD}.get(label, 40)
+    kelly_mult = (KELLY_MULT_HIGH_CONF if kelly_gap >= 40
+                  else KELLY_MULT_STANDARD if kelly_gap >= 25
+                  else KELLY_MULT_SOLID if kelly_gap >= 10
+                  else KELLY_MULT_MARGINAL)
+
+    units = calculate_units(instrument, balance, opp["sl_pips"],
+                           MAX_RISK_PER_TRADE, kelly_mult)
+
+    price_data = get_current_price(instrument)
+    entry_price = price_data["ask"] if direction == "LONG" else price_data["bid"]
+
+    if entry_price <= 0:
+        log.error(f"[{label}] No valid price for {instrument}")
+        return None
+
+    ps = pip_size(instrument)
+    if direction == "LONG":
+        tp_price = round(entry_price + opp["tp_pips"] * ps, 5 if "JPY" not in instrument else 3)
+        sl_price = round(entry_price - opp["sl_pips"] * ps, 5 if "JPY" not in instrument else 3)
+    else:
+        tp_price = round(entry_price - opp["tp_pips"] * ps, 5 if "JPY" not in instrument else 3)
+        sl_price = round(entry_price + opp["sl_pips"] * ps, 5 if "JPY" not in instrument else 3)
+
+    trail_pips = opp.get("trail_pips")
+    result = place_order(instrument, units, direction, tp_price, sl_price, trail_pips, label)
+    if not result or not result.get("id"):
+        return None
+
+    actual_entry = result.get("price", entry_price)
+
+    trade = {
+        "id":             result["id"],
+        "label":          label,
+        "instrument":     instrument,
+        "direction":      direction,
+        "entry_price":    actual_entry,
+        "units":          result.get("units", units),
+        "tp_price":       tp_price,
+        "sl_price":       sl_price,
+        "trail_pips":     trail_pips,
+        "tp_pips":        opp["tp_pips"],
+        "sl_pips":        opp["sl_pips"],
+        "highest_price":  actual_entry,
+        "lowest_price":   actual_entry,
+        "last_new_high_at": time.time(),
+        "opened_at":      datetime.now(timezone.utc).isoformat(),
+        "opened_ts":      time.time(),
+        "score":          opp["score"],
+        "rsi":            opp.get("rsi", 50),
+        "entry_signal":   opp.get("entry_signal", "UNKNOWN"),
+        "atr":            opp.get("atr", 0),
+        "atr_pct":        opp.get("atr_pct", 0),
+        "spread_at_entry": opp.get("spread_pips", 0),
+        "session_at_entry": get_current_session()["name"],
+        "kelly_mult":     kelly_mult,
+        "partial_tp_hit": False,
+        "unrealized_pnl": 0,
+    }
+
+    if label == "TREND" and opp.get("partial_tp_pips"):
+        if direction == "LONG":
+            trade["partial_tp_price"] = actual_entry + opp["partial_tp_pips"] * ps
+        else:
+            trade["partial_tp_price"] = actual_entry - opp["partial_tp_pips"] * ps
+
+    _pair_cooldowns[instrument] = time.time() + PAIR_COOLDOWN_SECS
+    save_state()
+
+    session = get_current_session()
+    dir_emoji = "🟢" if direction == "LONG" else "🔴"
+    risk_amount = balance * MAX_RISK_PER_TRADE * kelly_mult
+
+    telegram(
+        f"{dir_emoji} <b>{label} {direction}</b> | {instrument}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Entry: {actual_entry:.5f}\n"
+        f"TP: {tp_price:.5f} (+{opp['tp_pips']:.1f} pips)\n"
+        f"SL: {sl_price:.5f} (-{opp['sl_pips']:.1f} pips)\n"
+        f"Trail: {trail_pips}p" if trail_pips else "No trail" + f"\n"
+        f"Units: {units} | Risk: £{risk_amount:.2f}\n"
+        f"Score: {opp['score']:.0f} | {opp.get('entry_signal', '')}\n"
+        f"Session: {session['name']} | Spread: {opp.get('spread_pips', 0):.1f}p"
+    )
+
+    log.info(f"✅ [{label}] Opened {direction} {instrument} @ {actual_entry} "
+             f"| TP={tp_price} SL={sl_price} | score={opp['score']}")
+    return trade
+
+def check_exit(trade: dict) -> tuple[bool, str]:
+    instrument = trade["instrument"]
+    label      = trade["label"]
+    direction  = trade["direction"]
+
+    price_data = get_current_price(instrument)
+    if direction == "LONG":
+        price = price_data["bid"]
+    else:
+        price = price_data["ask"]
+
+    if price <= 0:
+        return False, ""
+
+    entry = trade["entry_price"]
+    ps = pip_size(instrument)
+
+    if direction == "LONG":
+        pnl_pips = (price - entry) / ps
+        pct = (price - entry) / entry
+    else:
+        pnl_pips = (entry - price) / ps
+        pct = (entry - price) / entry
+
+    held_min = (time.time() - trade.get("opened_ts", time.time())) / 60
+
+    if direction == "LONG" and price > trade.get("highest_price", entry):
+        trade["highest_price"] = price
+        trade["last_new_high_at"] = time.time()
+    elif direction == "SHORT" and price < trade.get("lowest_price", entry):
+        trade["lowest_price"] = price
+        trade["last_new_high_at"] = time.time()
+
+    trade["unrealized_pnl"] = round(pnl_pips, 1)
+
+    # Rollover protection for scalpers
+    if label == "SCALPER" and is_rollover_window():
+        log.info(f"🛡️ [{label}] Rollover exit: {instrument} | {pnl_pips:+.1f}p")
+        return True, "ROLLOVER"
+
+    # Scalper stall detection
+    if label == "SCALPER":
+        if direction == "LONG":
+            peak_profit = (trade.get("highest_price", entry) - entry) / entry
+        else:
+            peak_profit = (entry - trade.get("lowest_price", entry)) / entry
+
+        if pct >= 0 and peak_profit > 0.001:
+            mins_since_high = (time.time() - trade.get("last_new_high_at", time.time())) / 60
+            if direction == "LONG":
+                peak_gain = trade["highest_price"] - entry
+                giveback = (trade["highest_price"] - price) / peak_gain if peak_gain > 0 else 0
+            else:
+                peak_gain = entry - trade["lowest_price"]
+                giveback = (price - trade["lowest_price"]) / peak_gain if peak_gain > 0 else 0
+
+            if mins_since_high >= SCALPER_STALL_MINS and giveback >= SCALPER_STALL_GIVEBACK:
+                log.info(f"🛡️ [{label}] Stall: {instrument} | {pnl_pips:+.1f}p | "
+                         f"peak +{peak_profit*100:.1f}% | giveback {giveback*100:.0f}%")
+                return True, "STALL_EXIT"
+
+            if mins_since_high >= 3 and giveback >= 0.60 and peak_profit > 0.002:
+                log.info(f"🛡️ [{label}] Rapid giveback: {instrument} | {pnl_pips:+.1f}p")
+                return True, "RAPID_GIVEBACK"
+
+        flat_pips = SCALPER_FLAT_RANGE_PIPS
+        if held_min >= SCALPER_FLAT_MINS and abs(pnl_pips) <= flat_pips:
+            log.info(f"😴 [{label}] Flat: {instrument} | {pnl_pips:+.1f}p after {held_min:.0f}min")
+            return True, "FLAT_EXIT"
+
+    # Partial TP for trend/breakout (with floor and native trailing)
+    if label in ("TREND", "BREAKOUT") and not trade.get("partial_tp_hit"):
+        partial_price = trade.get("partial_tp_price")
+        if partial_price:
+            hit = (direction == "LONG" and price >= partial_price) or \
+                  (direction == "SHORT" and price <= partial_price)
+            if hit:
+                log.info(f"🎯 [{label}] Partial TP hit: {instrument} | +{pnl_pips:.1f}p")
+                trade["partial_tp_hit"] = True
+
+                # Move stop loss to breakeven (floor) on remaining position
+                if direction == "LONG":
+                    floor_price = entry + pips_to_price(instrument, 2)
+                else:
+                    floor_price = entry - pips_to_price(instrument, 2)
+
+                modify_trade(trade["id"], sl_price=floor_price, instrument=instrument, label=label)
+                if trade.get("trail_pips"):
+                    modify_trade(trade["id"], trailing_sl_pips=trade["trail_pips"], instrument=instrument, label=label)
+
+                # Close partial position
+                partial_units = abs(trade.get("units", 0)) * TREND_PARTIAL_TP_PCT
+                if partial_units > 0:
+                    close_trade(trade["id"], label, units=partial_units)
+                    trade["units"] = abs(trade["units"]) - partial_units
+                    if trade["direction"] == "SHORT":
+                        trade["units"] = -trade["units"]
+
+                telegram(
+                    f"🎯 <b>{label} Partial TP</b> | {instrument}\n"
+                    f"+{pnl_pips:.1f}p | Floor @ {floor_price:.5f}\n"
+                    f"Trail activated: {trade.get('trail_pips', 'N/A')}p | Remaining: {abs(trade['units']):.0f} units"
+                )
+                return False, ""
+
+    # Timeout
+    max_hours = {"SCALPER": 2, "TREND": TREND_MAX_HOURS,
+                 "REVERSAL": REVERSAL_MAX_HOURS, "BREAKOUT": BREAKOUT_MAX_HOURS}.get(label, 24)
+    if held_min >= max_hours * 60:
+        log.info(f"⏰ [{label}] Timeout: {instrument} | {pnl_pips:+.1f}p after {held_min/60:.1f}h")
+        return True, "TIMEOUT"
+
+    # Session exit (off-hours)
+    session = get_current_session()
+    if session["name"] == "OFF_HOURS" and label == "SCALPER" and held_min > 10:
+        log.info(f"🌙 [{label}] Session exit: {instrument} | off-hours")
+        return True, "SESSION_EXIT"
+
+    return False, ""
+
+def close_trade_exit(trade: dict, reason: str):
+    global _consecutive_losses
+
+    instrument = trade["instrument"]
+    label = trade["label"]
+    direction = trade["direction"]
+
+    price_data = get_current_price(instrument)
+    exit_price = price_data["bid"] if direction == "LONG" else price_data["ask"]
+    ps = pip_size(instrument)
+
+    if direction == "LONG":
+        pnl_pips = (exit_price - trade["entry_price"]) / ps
+    else:
+        pnl_pips = (trade["entry_price"] - exit_price) / ps
+
+    success = close_trade(trade["id"], label)
+    if not success and not PAPER_TRADE:
+        log.error(f"[{label}] Failed to close {instrument} — will retry")
+        return False
+
+    pnl = pnl_pips * pip_value(instrument, trade.get("units", 1))
+    held_min = (time.time() - trade.get("opened_ts", time.time())) / 60
+
+    history_entry = {
+        "instrument":   instrument,
+        "label":        label,
+        "direction":    direction,
+        "entry_price":  trade["entry_price"],
+        "exit_price":   exit_price,
+        "pnl":          round(pnl, 2),
+        "pnl_pips":     round(pnl_pips, 1),
+        "pnl_pct":      round((exit_price / trade["entry_price"] - 1) * 100 *
+                               (1 if direction == "LONG" else -1), 3),
+        "reason":       reason,
+        "held_minutes": round(held_min, 1),
+        "score":        trade.get("score", 0),
+        "entry_signal": trade.get("entry_signal", ""),
+        "session":      trade.get("session_at_entry", ""),
+        "closed_at":    datetime.now(timezone.utc).isoformat(),
+    }
+    trade_history.append(history_entry)
+
+    if pnl > 0:
+        _consecutive_losses = 0
+    else:
+        _consecutive_losses += 1
+
+    emoji = "✅" if pnl > 0 else "❌"
+    dir_arrow = "⬆️" if direction == "LONG" else "⬇️"
+    telegram(
+        f"{emoji} <b>{label} Closed</b> | {instrument} {dir_arrow}\n"
+        f"Entry: {trade['entry_price']:.5f} → Exit: {exit_price:.5f}\n"
+        f"P&L: {pnl:+.2f} ({pnl_pips:+.1f} pips)\n"
+        f"Reason: {reason} | Held: {held_min:.0f}min"
+    )
+
+    save_state()
+    return True
 
 # ═══════════════════════════════════════════════════════════════
-#  ADAPTIVE LEARNING & REBALANCING (unchanged)
+#  ADAPTIVE LEARNING & REBALANCING
 # ═══════════════════════════════════════════════════════════════
 
 def update_adaptive_thresholds():
@@ -1237,7 +1888,7 @@ def update_adaptive_thresholds():
                      f"(WR={wr*100:.0f}% avg={mean_pnl:+.1f}p over {len(recent)})")
 
 # ═══════════════════════════════════════════════════════════════
-#  HEARTBEAT & SUMMARIES (unchanged)
+#  HEARTBEAT & SUMMARIES
 # ═══════════════════════════════════════════════════════════════
 
 def send_heartbeat(balance: float):
@@ -1292,12 +1943,11 @@ def send_daily_summary(balance: float):
     )
 
 # ═══════════════════════════════════════════════════════════════
-#  PRICE STREAMING (unchanged, uses DYNAMIC_PAIRS at start)
+#  PRICE STREAMING
 # ═══════════════════════════════════════════════════════════════
 
 def _start_price_stream():
     def _stream():
-        # Use the dynamic list if available, else static
         pairs_to_stream = DYNAMIC_PAIRS if DYNAMIC_PAIRS else STATIC_ALL_PAIRS
         instruments = ",".join(pairs_to_stream)
         while True:
@@ -1352,7 +2002,6 @@ def run():
 
     load_state()
 
-    # Build initial dynamic watchlist
     log.info("Building initial dynamic watchlist...")
     DYNAMIC_PAIRS = build_dynamic_watchlist()
     if DYNAMIC_PAIRS:
@@ -1401,7 +2050,6 @@ def run():
             if df_eurusd_1h is not None:
                 _market_regime_mult = compute_market_regime(df_eurusd_1h)
 
-            # Refresh dynamic watchlist periodically
             refresh_dynamic_watchlist()
 
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1430,14 +2078,14 @@ def run():
             entries_allowed = (not _paused and not daily_cb and not streak_cb
                               and not session_paused)
 
-            # ── EXIT CHECKS ─────────────────────────────────────
+            # Exit checks
             for trade in open_trades[:]:
                 should_exit, reason = check_exit(trade)
                 if should_exit:
                     if close_trade_exit(trade, reason):
                         open_trades.remove(trade)
 
-            # ── ENTRY SCANS (using dynamic watchlist) ──────────
+            # Entry scans
             if entries_allowed and len(open_trades) < MAX_OPEN_TRADES:
                 skip_scalper = is_rollover_window()
                 active_pairs = session["pairs_allowed"]
