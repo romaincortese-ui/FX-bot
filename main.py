@@ -149,11 +149,13 @@ BREAKOUT_TRAIL_PIPS   = float(os.getenv("BREAKOUT_TRAIL_PIPS", "10"))
 DXY_EMA_PERIOD          = int(os.getenv("DXY_EMA_PERIOD",          "50"))
 DXY_GATE_THRESHOLD      = float(os.getenv("DXY_GATE_THRESHOLD",   "0.005"))
 DXY_PROXY_INSTRUMENT    = os.getenv("DXY_PROXY_INSTRUMENT", "USD_CHF")
+DXY_PROXY_FALLBACKS     = [s.strip() for s in os.getenv("DXY_PROXY_FALLBACKS", "EUR_USD,GBP_USD,USD_JPY").split(",") if s.strip()]
 VIX_HIGH_THRESHOLD      = float(os.getenv("VIX_HIGH_THRESHOLD",   "25"))
 VIX_EXTREME_THRESHOLD   = float(os.getenv("VIX_EXTREME_THRESHOLD","35"))
 VIX_LOW_THRESHOLD       = float(os.getenv("VIX_LOW_THRESHOLD",    "15"))
 VIX_PROXY_PRIMARY       = os.getenv("VIX_PROXY_PRIMARY", "SPX500_USD")
 VIX_PROXY_FALLBACK      = os.getenv("VIX_PROXY_FALLBACK", "USD_JPY")
+VIX_PROXY_FALLBACKS     = [s.strip() for s in os.getenv("VIX_PROXY_FALLBACKS", "USD_JPY,USD_CHF,EUR_USD").split(",") if s.strip()]
 MACRO_PROXY_STALE_SECONDS = int(os.getenv("MACRO_PROXY_STALE_SECONDS", "7200"))
 MACRO_FILTER_FILE        = os.getenv("MACRO_FILTER_FILE", "macro_filter.json")
 
@@ -1125,26 +1127,41 @@ def load_state():
 #  MACRO INTELLIGENCE
 # ═══════════════════════════════════════════════════════════════
 
+def _fetch_candles_with_fallback(instruments, granularity: str, count: int, min_rows: int = 1):
+    for instrument in instruments:
+        df = fetch_candles(instrument, granularity, count)
+        if df is None:
+            log.debug(f"Macro proxy fetch failed for {instrument} {granularity}/{count}")
+            continue
+        if len(df) < min_rows:
+            log.debug(f"Macro proxy fetch returned {len(df)} rows for {instrument} {granularity}/{count}, need {min_rows}")
+            continue
+        return instrument, df
+    return None, None
+
+
 def update_dxy_proxy():
     global _dxy_ema_gap, _dxy_at, _dxy_last_good
     if time.time() - _dxy_at < 1800:
         return
+    instruments = [DXY_PROXY_INSTRUMENT] + [instr for instr in DXY_PROXY_FALLBACKS if instr != DXY_PROXY_INSTRUMENT]
     try:
-        df = fetch_candles(DXY_PROXY_INSTRUMENT, "H1", 100)
-        if df is None or len(df) < DXY_EMA_PERIOD:
-            raise ValueError(f"insufficient candle data ({None if df is None else len(df)})")
+        source, df = _fetch_candles_with_fallback(instruments, "H1", 100, min_rows=DXY_EMA_PERIOD)
+        if df is None:
+            raise ValueError(f"insufficient candle data for DXY proxy list: {instruments}")
         ema = calc_ema(df["close"], DXY_EMA_PERIOD)
         _dxy_ema_gap = float(df["close"].iloc[-1]) / float(ema.iloc[-1]) - 1
         _dxy_last_good = _dxy_ema_gap
         _dxy_at = time.time()
-        log.info(f"📊 [MACRO] DXY proxy ({DXY_PROXY_INSTRUMENT}): EMA gap {_dxy_ema_gap*100:+.2f}%")
+        log.info(f"📊 [MACRO] DXY proxy ({source}): EMA gap {_dxy_ema_gap*100:+.2f}%")
     except Exception as e:
         if _dxy_last_good is None:
-            log.warning(f"⚠️ DXY proxy update failed for {DXY_PROXY_INSTRUMENT}: {e}")
+            log.warning(f"⚠️ DXY proxy update failed for {DXY_PROXY_INSTRUMENT} and fallbacks {DXY_PROXY_FALLBACKS}: {e}")
         else:
             log.warning(f"⚠️ DXY proxy update failed, keeping last known gap {_dxy_last_good*100:+.2f}%: {e}")
             _dxy_ema_gap = _dxy_last_good
         _dxy_at = time.time()
+
 
 def update_vix_level():
     global _vix_level, _vix_at, _vix_last_good
@@ -1163,9 +1180,10 @@ def update_vix_level():
         log.warning(f"⚠️ {VIX_PROXY_PRIMARY} fetch failed: {e}")
 
     if new_level is None:
-        try:
-            df_4h = fetch_candles(VIX_PROXY_FALLBACK, "H4", 60)
-            if df_4h is not None and len(df_4h) >= 40:
+        instruments = [VIX_PROXY_FALLBACK] + [instr for instr in VIX_PROXY_FALLBACKS if instr != VIX_PROXY_FALLBACK]
+        source, df_4h = _fetch_candles_with_fallback(instruments, "H4", 60, min_rows=40)
+        if source is not None:
+            try:
                 atr = calc_atr(df_4h, 14)
                 tr = pd.concat([
                     df_4h["high"] - df_4h["low"],
@@ -1176,9 +1194,11 @@ def update_vix_level():
                 atr_avg = float(atr_series.iloc[-30:-1].mean())
                 vol_ratio = atr / atr_avg if atr_avg > 0 else 1.0
                 new_level = 15 * vol_ratio
-                log.info(f"📊 [MACRO] VIX proxy via {VIX_PROXY_FALLBACK}: {new_level:.1f} (ATR ratio {vol_ratio:.2f})")
-        except Exception as e:
-            log.warning(f"⚠️ {VIX_PROXY_FALLBACK} VIX proxy failed: {e}")
+                log.info(f"📊 [MACRO] VIX proxy via {source}: {new_level:.1f} (ATR ratio {vol_ratio:.2f})")
+            except Exception as e:
+                log.warning(f"⚠️ {source} VIX proxy ATR calculation failed: {e}")
+        else:
+            log.warning(f"⚠️ No fallback VIX proxy available from {instruments}")
 
     if new_level is not None:
         _vix_last_good = new_level
@@ -2221,7 +2241,7 @@ def run():
 
     load_macro_filters()
     load_macro_news()
-    log.info(f"🔎 Macro proxy configuration: DXY={DXY_PROXY_INSTRUMENT}, VIX primary={VIX_PROXY_PRIMARY}, VIX fallback={VIX_PROXY_FALLBACK}")
+    log.info(f"🔎 Macro proxy configuration: DXY={DXY_PROXY_INSTRUMENT} (fallbacks={DXY_PROXY_FALLBACKS}), VIX primary={VIX_PROXY_PRIMARY}, VIX fallback={VIX_PROXY_FALLBACKS}")
     log.info(f"📰 Macro news file: {MACRO_NEWS_FILE}")
 
     while True:
