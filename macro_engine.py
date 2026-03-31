@@ -169,15 +169,15 @@ def load_economic_surprise() -> Dict[str, Optional[float]]:
         }
 
     surprise_series = {
-        "US": "CESIUS",
-        "UK": "CESIGB",
-        "EU": "CESIEU",
-        "JP": "CESIJP",
+        "US": "USEPUINDXD",
+        "UK": "UKEPUINDXM",
+        "EU": "EUEPUINDXM",
+        "JP": "JPNEPUINDXM",
     }
     values = {country: fetch_fred_series(series_id)
               for country, series_id in surprise_series.items()}
     if any(v is not None for v in values.values()):
-        log.info(f"Loaded economic surprise indices: {values}")
+        log.info(f"Loaded economic surprise / policy uncertainty values: {values}")
         return values
 
     log.warning("Economic surprise data unavailable from FRED; using fallback values.")
