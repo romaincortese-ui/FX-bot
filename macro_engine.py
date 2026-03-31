@@ -33,7 +33,12 @@ OANDA_COMMODITY_INSTRUMENTS = {
     "OIL": os.getenv("OANDA_OIL_INSTRUMENT", "BCO_USD"),
     "COPPER": os.getenv("OANDA_COPPER_INSTRUMENT", "XCU_USD"),
 }
-DEFAULT_FX_FACTORY_URL = "https://nfs.forexfactory.com/ff_calendar_thisweek.xml"
+DEFAULT_FX_FACTORY_URLS = [
+    "https://nfs.forexfactory.com/ff_calendar_thisweek.xml",
+    "https://www.forexfactory.com/ff_calendar_thisweek.xml",
+    "https://forexfactory.com/ff_calendar_thisweek.xml",
+]
+DEFAULT_FX_FACTORY_URL = DEFAULT_FX_FACTORY_URLS[0]
 FX_FACTORY_URL = os.getenv("FOREX_FACTORY_URL", DEFAULT_FX_FACTORY_URL)
 NEWS_PAUSE_BEFORE_MINUTES = int(os.getenv("NEWS_PAUSE_BEFORE_MINUTES", "15"))
 
@@ -290,16 +295,28 @@ def extract_forex_factory_events(raw: Any) -> List[dict]:
 
 
 def load_forex_factory_news() -> List[dict]:
-    url = FX_FACTORY_URL
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
     }
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        root = ET.fromstring(response.content)
-    except Exception as e:
-        log.error(f"Failed to fetch or parse Forex Factory XML: {e}")
+    urls = [FX_FACTORY_URL]
+    if FX_FACTORY_URL == DEFAULT_FX_FACTORY_URL:
+        urls.extend(url for url in DEFAULT_FX_FACTORY_URLS if url != FX_FACTORY_URL)
+    else:
+        urls.extend(url for url in DEFAULT_FX_FACTORY_URLS if url != FX_FACTORY_URL)
+
+    root = None
+    for url in urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            log.info(f"Loaded Forex Factory XML from {url}")
+            break
+        except Exception as e:
+            log.warning(f"Failed to fetch or parse Forex Factory XML from {url}: {e}")
+
+    if root is None:
+        log.error("Failed to fetch Forex Factory XML from all candidate URLs.")
         return []
 
     raw_events = []
