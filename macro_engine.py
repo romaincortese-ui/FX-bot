@@ -169,7 +169,7 @@ def fetch_oanda_candles(instrument: str, granularity: str = "D", count: int = 10
                 continue
             mid = c.get("mid", {})
             rows.append({
-                "time":   float(c.get("time", 0)),
+                "time":   c.get("time", ""),   # Keep as string to avoid conversion error
                 "open":   float(mid.get("o", 0)),
                 "high":   float(mid.get("h", 0)),
                 "low":    float(mid.get("l", 0)),
@@ -303,14 +303,18 @@ def get_dxy_gap() -> Optional[float]:
     """Calculate DXY gap as price/EMA50 - 1 using proxy instruments."""
     instruments = [DXY_PROXY_INSTRUMENT] + DXY_PROXY_FALLBACKS
     for instr in instruments:
-        df = fetch_oanda_candles(instr, "H1", 200, price="M")
-        if df is None or len(df) < DXY_EMA_PERIOD:
+        try:
+            df = fetch_oanda_candles(instr, "H1", 200, price="M")
+            if df is None or len(df) < DXY_EMA_PERIOD:
+                continue
+            close = df["close"]
+            ema = calc_ema(close, DXY_EMA_PERIOD)
+            gap = float(close.iloc[-1]) / float(ema.iloc[-1]) - 1
+            log.info(f"📊 DXY proxy ({instr}): gap {gap*100:+.2f}%")
+            return gap
+        except Exception as e:
+            log.warning(f"Error computing DXY proxy for {instr}: {e}")
             continue
-        close = df["close"]
-        ema = calc_ema(close, DXY_EMA_PERIOD)
-        gap = float(close.iloc[-1]) / float(ema.iloc[-1]) - 1
-        log.info(f"📊 DXY proxy ({instr}): gap {gap*100:+.2f}%")
-        return gap
     log.warning("No DXY proxy data available.")
     return None
 
@@ -318,33 +322,40 @@ def get_dxy_gap() -> Optional[float]:
 def get_vix_proxy() -> Optional[float]:
     """Estimate VIX level using volatility ratio of a proxy instrument."""
     # Try primary first
-    df = fetch_oanda_candles(VIX_PROXY_PRIMARY, "D", 200, price="M")
-    if df is not None and len(df) >= 20:
-        atr = calc_atr(df, 14)
-        # Average of recent ATR ratio (simplified: compare to 20-day std)
-        atr_avg = df["close"].rolling(20).std().iloc[-20:-1].mean()
-        vol_ratio = atr / atr_avg if atr_avg > 0 else 1.0
-        vix = 15 * vol_ratio
-        log.info(f"📊 VIX proxy via {VIX_PROXY_PRIMARY}: {vix:.1f} (ATR ratio {vol_ratio:.2f})")
-        return vix
+    try:
+        df = fetch_oanda_candles(VIX_PROXY_PRIMARY, "D", 200, price="M")
+        if df is not None and len(df) >= 20:
+            atr = calc_atr(df, 14)
+            # Average of recent ATR ratio (simplified: compare to 20-day std)
+            atr_avg = df["close"].rolling(20).std().iloc[-20:-1].mean()
+            vol_ratio = atr / atr_avg if atr_avg > 0 else 1.0
+            vix = 15 * vol_ratio
+            log.info(f"📊 VIX proxy via {VIX_PROXY_PRIMARY}: {vix:.1f} (ATR ratio {vol_ratio:.2f})")
+            return vix
+    except Exception as e:
+        log.warning(f"Error computing VIX proxy from {VIX_PROXY_PRIMARY}: {e}")
 
     # Fallback: use 4H candles from fallback instruments
     for instr in VIX_PROXY_FALLBACKS:
-        df = fetch_oanda_candles(instr, "H4", 200, price="M")
-        if df is None or len(df) < 40:
+        try:
+            df = fetch_oanda_candles(instr, "H4", 200, price="M")
+            if df is None or len(df) < 40:
+                continue
+            atr = calc_atr(df, 14)
+            tr = pd.concat([
+                df["high"] - df["low"],
+                (df["high"] - df["close"].shift(1)).abs(),
+                (df["low"] - df["close"].shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_series = tr.ewm(alpha=1/14, adjust=False).mean()
+            atr_avg = float(atr_series.iloc[-30:-1].mean())
+            vol_ratio = atr / atr_avg if atr_avg > 0 else 1.0
+            vix = 15 * vol_ratio
+            log.info(f"📊 VIX proxy via {instr}: {vix:.1f} (ATR ratio {vol_ratio:.2f})")
+            return vix
+        except Exception as e:
+            log.warning(f"Error computing VIX proxy from {instr}: {e}")
             continue
-        atr = calc_atr(df, 14)
-        tr = pd.concat([
-            df["high"] - df["low"],
-            (df["high"] - df["close"].shift(1)).abs(),
-            (df["low"] - df["close"].shift(1)).abs(),
-        ], axis=1).max(axis=1)
-        atr_series = tr.ewm(alpha=1/14, adjust=False).mean()
-        atr_avg = float(atr_series.iloc[-30:-1].mean())
-        vol_ratio = atr / atr_avg if atr_avg > 0 else 1.0
-        vix = 15 * vol_ratio
-        log.info(f"📊 VIX proxy via {instr}: {vix:.1f} (ATR ratio {vol_ratio:.2f})")
-        return vix
 
     log.warning("No VIX proxy data available.")
     return None
