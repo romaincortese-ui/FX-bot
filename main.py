@@ -656,6 +656,8 @@ def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100) ->
         )
         candles = data.get("candles", [])
         if not candles:
+            log.warning(f"⚠️ OANDA candle fetch returned no candles for {instrument} {granularity}/{count}")
+            log.debug(f"OANDA response keys for {instrument}: {list(data.keys())}")
             return None
 
         rows = []
@@ -679,6 +681,9 @@ def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100) ->
 
         df = pd.DataFrame(rows)
         df = df.dropna(subset=["close"])
+
+        if len(df) < 20:
+            log.debug(f"OANDA candle fetch produced only {len(df)} valid rows for {instrument} {granularity}/{count}")
 
         with _kline_cache_lock:
             if len(_kline_cache) >= MAX_KLINE_CACHE:
