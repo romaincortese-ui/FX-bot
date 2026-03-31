@@ -260,7 +260,6 @@ _thread_local        = threading.local()
 _live_prices         = {}
 _price_lock          = threading.Lock()
 
-_pair_cooldowns      = {}
 PAIR_COOLDOWN_SECS   = int(os.getenv("PAIR_COOLDOWN_SECS", "900"))
 
 CORRELATION_GROUPS = {
@@ -1148,98 +1147,8 @@ def load_state():
         log.warning(f"State load failed ({e}) — starting fresh")
 
 # ═══════════════════════════════════════════════════════════════
-#  MACRO INTELLIGENCE
+#  MACRO INTELLIGENCE (now only reads from Redis)
 # ═══════════════════════════════════════════════════════════════
-
-def _fetch_candles_with_fallback(instruments, granularity: str, count: int, min_rows: int = 1, price: str = "M"):
-    for instrument in instruments:
-        df = fetch_candles(instrument, granularity, count, price=price)
-        if df is None:
-            log.debug(f"Macro proxy fetch failed for {instrument} {granularity}/{count} price={price}")
-            continue
-        if len(df) < min_rows:
-            log.debug(f"Macro proxy fetch returned {len(df)} rows for {instrument} {granularity}/{count}, need {min_rows}")
-            continue
-        return instrument, df
-    return None, None
-
-
-def update_dxy_proxy():
-    global _dxy_ema_gap, _dxy_at, _dxy_last_good
-    if time.time() - _dxy_at < 1800:
-        return
-    instruments = [DXY_PROXY_INSTRUMENT] + [instr for instr in DXY_PROXY_FALLBACKS if instr != DXY_PROXY_INSTRUMENT]
-    try:
-        count = 200
-        source, df = _fetch_candles_with_fallback(instruments, "H1", count, min_rows=DXY_EMA_PERIOD, price="M")
-        if df is None:
-            raise ValueError(f"insufficient candle data for DXY proxy list: {instruments}")
-        ema = calc_ema(df["close"], DXY_EMA_PERIOD)
-        _dxy_ema_gap = float(df["close"].iloc[-1]) / float(ema.iloc[-1]) - 1
-        _dxy_last_good = _dxy_ema_gap
-        _dxy_at = time.time()
-        log.info(f"📊 [MACRO] DXY proxy ({source}): EMA gap {_dxy_ema_gap*100:+.2f}%")
-    except Exception as e:
-        if _dxy_last_good is None:
-            log.warning(f"⚠️ DXY proxy update failed for {DXY_PROXY_INSTRUMENT} and fallbacks {DXY_PROXY_FALLBACKS}: {e}")
-        else:
-            log.warning(f"⚠️ DXY proxy update failed, keeping last known gap {_dxy_last_good*100:+.2f}%: {e}")
-            _dxy_ema_gap = _dxy_last_good
-        _dxy_at = time.time()
-
-
-def update_vix_level():
-    global _vix_level, _vix_at, _vix_last_good
-    if time.time() - _vix_at < 1800:
-        return
-    new_level = None
-    try:
-        primary_count = 200
-        df_spx = fetch_candles(VIX_PROXY_PRIMARY, "D", primary_count, price="M")
-        if df_spx is not None and len(df_spx) >= 20:
-            atr = calc_atr(df_spx, 14)
-            atr_avg = df_spx["close"].rolling(20).std().iloc[-20:-1].mean()
-            vol_ratio = atr / (atr_avg if atr_avg > 0 else 1)
-            new_level = 15 * vol_ratio
-            log.info(f"📊 [MACRO] VIX proxy via {VIX_PROXY_PRIMARY}: {new_level:.1f} (ATR ratio {vol_ratio:.2f})")
-    except Exception as e:
-        log.warning(f"⚠️ {VIX_PROXY_PRIMARY} fetch failed: {e}")
-
-    if new_level is None:
-        instruments = [VIX_PROXY_FALLBACK] + [instr for instr in VIX_PROXY_FALLBACKS if instr != VIX_PROXY_FALLBACK]
-        fallback_count = 200
-        source, df_4h = _fetch_candles_with_fallback(instruments, "H4", fallback_count, min_rows=40, price="M")
-        if source is not None:
-            try:
-                atr = calc_atr(df_4h, 14)
-                tr = pd.concat([
-                    df_4h["high"] - df_4h["low"],
-                    (df_4h["high"] - df_4h["close"].shift(1)).abs(),
-                    (df_4h["low"]  - df_4h["close"].shift(1)).abs(),
-                ], axis=1).max(axis=1)
-                atr_series = tr.ewm(alpha=1/14, adjust=False).mean()
-                atr_avg = float(atr_series.iloc[-30:-1].mean())
-                vol_ratio = atr / atr_avg if atr_avg > 0 else 1.0
-                new_level = 15 * vol_ratio
-                log.info(f"📊 [MACRO] VIX proxy via {source}: {new_level:.1f} (ATR ratio {vol_ratio:.2f})")
-            except Exception as e:
-                log.warning(f"⚠️ {source} VIX proxy ATR calculation failed: {e}")
-        else:
-            log.warning(f"⚠️ No fallback VIX proxy available from {instruments}")
-
-    if new_level is not None:
-        _vix_last_good = new_level
-        _vix_level = new_level
-        _vix_at = time.time()
-    else:
-        if _vix_last_good is not None:
-            _vix_level = _vix_last_good
-            log.warning(f"⚠️ VIX proxy update failed — keeping last known value {_vix_last_good:.1f}")
-        else:
-            _vix_level = None
-            log.warning("⚠️ VIX proxy update failed and no prior value exists; macro volatility is unknown")
-        _vix_at = time.time()
-
 
 def _load_macro_state_from_redis() -> dict | None:
     if REDIS_CLIENT is None:
@@ -1259,7 +1168,7 @@ def _load_macro_state_from_redis() -> dict | None:
 
 
 def load_macro_filters() -> None:
-    global macro_filters
+    global macro_filters, _vix_level, _dxy_ema_gap
     try:
         state = _load_macro_state_from_redis()
         if state is not None:
@@ -1267,9 +1176,14 @@ def load_macro_filters() -> None:
             if not isinstance(data, dict):
                 raise ValueError("Redis macro state filters must be a dict")
             macro_filters = {key.upper(): str(value).upper() for key, value in data.items()}
-            log.info(f"📂 Loaded macro filters from Redis key {REDIS_MACRO_STATE_KEY}: {', '.join(sorted(macro_filters.keys()))}")
+            # Read VIX and DXY from the same state
+            _vix_level = state.get("vix_value")
+            _dxy_ema_gap = state.get("dxy_gap")
+            log.info(f"📂 Loaded macro filters from Redis: {', '.join(sorted(macro_filters.keys()))}, "
+                     f"vix={_vix_level}, dxy_gap={_dxy_ema_gap}")
             return
 
+        # Fallback to file (no VIX/DXY)
         if not os.path.exists(MACRO_FILTER_FILE):
             macro_filters = {}
             log.warning(f"⚠️ Macro filter file not found: {MACRO_FILTER_FILE}")
@@ -1323,7 +1237,7 @@ def load_macro_news() -> None:
             if not isinstance(data, list):
                 raise ValueError("Redis macro state news_events must be a list")
             macro_news = data
-            log.info(f"📂 Loaded macro news from Redis key {REDIS_MACRO_STATE_KEY}: {len(macro_news)} events")
+            log.info(f"📂 Loaded macro news from Redis: {len(macro_news)} events")
             return
 
         if not os.path.exists(MACRO_NEWS_FILE):
@@ -1455,7 +1369,7 @@ def compute_market_regime(df: pd.DataFrame) -> float:
     return round(mult, 3)
 
 # ═══════════════════════════════════════════════════════════════
-#  DIRECTION DETERMINATION
+#  DIRECTION DETERMINATION (unchanged)
 # ═══════════════════════════════════════════════════════════════
 
 def determine_direction(instrument: str, df_5m: pd.DataFrame,
@@ -1520,7 +1434,7 @@ def determine_direction(instrument: str, df_5m: pd.DataFrame,
     return "LONG" if signals["long"] >= signals["short"] else "SHORT"
 
 # ═══════════════════════════════════════════════════════════════
-#  SCORING FUNCTIONS
+#  SCORING FUNCTIONS (unchanged)
 # ═══════════════════════════════════════════════════════════════
 
 def score_scalper(instrument: str, session: dict) -> dict | None:
@@ -1870,7 +1784,7 @@ def score_breakout(instrument: str, session: dict) -> dict | None:
     }
 
 # ═══════════════════════════════════════════════════════════════
-#  ENTRY & EXIT MANAGEMENT
+#  ENTRY & EXIT MANAGEMENT (unchanged)
 # ═══════════════════════════════════════════════════════════════
 
 def check_correlation_limit(instrument: str, direction: str) -> bool:
@@ -2362,7 +2276,7 @@ def run():
     if not news_reloaded:
         load_macro_news()
 
-    log.info(f"🔎 Macro proxy configuration: DXY={DXY_PROXY_INSTRUMENT} (fallbacks={DXY_PROXY_FALLBACKS}), VIX primary={VIX_PROXY_PRIMARY}, VIX fallback={VIX_PROXY_FALLBACKS}")
+    log.info(f"🔎 Macro proxy configuration: DXY proxy will be read from Redis, VIX from Redis")
     log.info(f"📰 Macro news file: {MACRO_NEWS_FILE}")
 
     while True:
@@ -2390,8 +2304,7 @@ def run():
                     f"news={'reloaded' if news_updated else 'unchanged'}"
                 )
             update_macro_news_pause()
-            update_dxy_proxy()
-            update_vix_level()
+            # DXY and VIX are already loaded from Redis via load_macro_filters; no need to call proxies
 
             df_eurusd_1h = fetch_candles("EUR_USD", "H1", 100)
             if df_eurusd_1h is not None:
