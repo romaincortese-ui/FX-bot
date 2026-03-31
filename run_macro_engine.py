@@ -39,7 +39,11 @@ def run_macro_engine() -> int:
 
     try:
         filters = macro_engine.generate_macro_filters()
-        news = macro_engine.load_forex_factory_news()
+        news = []
+        if os.getenv("DISABLE_MACRO_NEWS", "False").strip().lower() not in {"1", "true", "yes", "y"}:
+            news = macro_engine.load_forex_factory_news()
+        else:
+            log.warning("Macro news loading disabled by DISABLE_MACRO_NEWS.")
         macro_state = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "filters": filters,

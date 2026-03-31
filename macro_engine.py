@@ -11,6 +11,7 @@ import logging
 import os
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -33,13 +34,12 @@ OANDA_COMMODITY_INSTRUMENTS = {
     "OIL": os.getenv("OANDA_OIL_INSTRUMENT", "BCO_USD"),
     "COPPER": os.getenv("OANDA_COPPER_INSTRUMENT", "XCU_USD"),
 }
-DEFAULT_FX_FACTORY_URLS = [
-    "https://nfs.forexfactory.com/ff_calendar_thisweek.xml",
-    "https://www.forexfactory.com/ff_calendar_thisweek.xml",
-    "https://forexfactory.com/ff_calendar_thisweek.xml",
+DEFAULT_ECONOMIC_CALENDAR_URLS = [
+    "https://www.dailyfx.com/free-ads/economic-calendar-rss",
+    "https://www.investing.com/rss/economic-calendar",
 ]
-DEFAULT_FX_FACTORY_URL = DEFAULT_FX_FACTORY_URLS[0]
-FX_FACTORY_URL = os.getenv("FOREX_FACTORY_URL", DEFAULT_FX_FACTORY_URL)
+DEFAULT_ECONOMIC_CALENDAR_URL = DEFAULT_ECONOMIC_CALENDAR_URLS[0]
+ECONOMIC_CALENDAR_URL = os.getenv("ECONOMIC_CALENDAR_URL", DEFAULT_ECONOMIC_CALENDAR_URL)
 NEWS_PAUSE_BEFORE_MINUTES = int(os.getenv("NEWS_PAUSE_BEFORE_MINUTES", "15"))
 
 LOG_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -49,13 +49,6 @@ logging.basicConfig(
     datefmt=LOG_FORMAT,
 )
 log = logging.getLogger(__name__)
-
-if FX_FACTORY_URL.endswith(".json") or "cdn-nfs.forexfactory.net" in FX_FACTORY_URL:
-    log.warning(
-        "Detected deprecated Forex Factory JSON endpoint in FOREX_FACTORY_URL; switching to official XML feed."
-    )
-    FX_FACTORY_URL = DEFAULT_FX_FACTORY_URL
-
 
 def parse_float_env(name: str) -> Optional[float]:
     value = os.getenv(name)
@@ -296,68 +289,64 @@ def extract_forex_factory_events(raw: Any) -> List[dict]:
 
 def load_forex_factory_news() -> List[dict]:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
     }
-    urls = [FX_FACTORY_URL]
-    if FX_FACTORY_URL == DEFAULT_FX_FACTORY_URL:
-        urls.extend(url for url in DEFAULT_FX_FACTORY_URLS if url != FX_FACTORY_URL)
-    else:
-        urls.extend(url for url in DEFAULT_FX_FACTORY_URLS if url != FX_FACTORY_URL)
+    urls = [ECONOMIC_CALENDAR_URL]
+    urls.extend(url for url in DEFAULT_ECONOMIC_CALENDAR_URLS if url != ECONOMIC_CALENDAR_URL)
 
     root = None
     for url in urls:
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
             root = ET.fromstring(response.content)
-            log.info(f"Loaded Forex Factory XML from {url}")
+            log.info(f"Loaded economic calendar XML from {url}")
             break
         except Exception as e:
-            log.warning(f"Failed to fetch or parse Forex Factory XML from {url}: {e}")
+            log.warning(f"Failed to fetch or parse economic calendar XML from {url}: {e}")
 
     if root is None:
-        log.error("Failed to fetch Forex Factory XML from all candidate URLs.")
+        log.error("Failed to fetch economic calendar XML from all candidate URLs.")
         return []
-
-    raw_events = []
-    for event in root.findall('.//event'):
-        raw_events.append({
-            'title': event.findtext('title', default=''),
-            'country': event.findtext('country', default=''),
-            'date': event.findtext('date', default=''),
-            'time': event.findtext('time', default=''),
-            'impact': event.findtext('impact', default=''),
-            'forecast': event.findtext('forecast', default=''),
-            'previous': event.findtext('previous', default=''),
-            'actual': event.findtext('actual', default=''),
-        })
 
     events: List[dict] = []
     today = datetime.now(timezone.utc).date()
-    for raw in raw_events:
-        if not is_high_impact(raw):
-            continue
-        event_time = parse_forex_event_time(raw)
+    for item in root.findall('.//item'):
+        title = item.findtext('title', default='').strip()
+        link = item.findtext('link', default='').strip()
+        description = item.findtext('description', default='').strip()
+        raw_time = item.findtext('pubDate', default='').strip()
+        try:
+            event_time = parsedate_to_datetime(raw_time).astimezone(timezone.utc)
+        except Exception:
+            event_time = None
+
         if event_time is None or event_time.date() != today:
             continue
+
         pause_start = event_time - timedelta(minutes=NEWS_PAUSE_BEFORE_MINUTES)
         pause_end = event_time + timedelta(minutes=NEWS_PAUSE_BEFORE_MINUTES)
         events.append({
-            "currency": raw.get("country"),
-            "event": raw.get("title"),
-            "impact": raw.get("impact"),
+            "currency": None,
+            "event": title,
+            "impact": None,
             "time": event_time.isoformat(),
-            "forecast": raw.get("forecast"),
-            "previous": raw.get("previous"),
-            "actual": raw.get("actual"),
+            "forecast": None,
+            "previous": None,
+            "actual": None,
+            "link": link,
+            "description": description,
             "pause_start": pause_start.isoformat(),
             "pause_end": pause_end.isoformat(),
         })
 
     if events:
-        log.info(f"Successfully loaded {len(events)} news events from Forex Factory XML.")
+        log.info(f"Successfully loaded {len(events)} news events from economic calendar XML.")
     else:
-        log.info("No high-impact Forex Factory events found for today.")
+        log.info("No economic calendar events found for today.")
     return events
 
 
