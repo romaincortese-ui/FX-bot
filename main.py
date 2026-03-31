@@ -148,9 +148,14 @@ BREAKOUT_TRAIL_PIPS   = float(os.getenv("BREAKOUT_TRAIL_PIPS", "10"))
 # ── Macro intelligence ──────────────────────────────────────
 DXY_EMA_PERIOD          = int(os.getenv("DXY_EMA_PERIOD",          "50"))
 DXY_GATE_THRESHOLD      = float(os.getenv("DXY_GATE_THRESHOLD",   "0.005"))
+DXY_PROXY_INSTRUMENT    = os.getenv("DXY_PROXY_INSTRUMENT", "USD_CHF")
 VIX_HIGH_THRESHOLD      = float(os.getenv("VIX_HIGH_THRESHOLD",   "25"))
 VIX_EXTREME_THRESHOLD   = float(os.getenv("VIX_EXTREME_THRESHOLD","35"))
 VIX_LOW_THRESHOLD       = float(os.getenv("VIX_LOW_THRESHOLD",    "15"))
+VIX_PROXY_PRIMARY       = os.getenv("VIX_PROXY_PRIMARY", "SPX500_USD")
+VIX_PROXY_FALLBACK      = os.getenv("VIX_PROXY_FALLBACK", "USD_JPY")
+MACRO_PROXY_STALE_SECONDS = int(os.getenv("MACRO_PROXY_STALE_SECONDS", "7200"))
+MACRO_FILTER_FILE        = os.getenv("MACRO_FILTER_FILE", "macro_filter.json")
 
 REGIME_HIGH_VOL_ATR_RATIO    = float(os.getenv("REGIME_HIGH_VOL_ATR_RATIO",    "1.80"))
 REGIME_LOW_VOL_ATR_RATIO     = float(os.getenv("REGIME_LOW_VOL_ATR_RATIO",     "0.70"))
@@ -183,6 +188,7 @@ KELLY_MULT_MARGINAL   = float(os.getenv("KELLY_MULT_MARGINAL",   "0.8"))
 SCAN_INTERVAL_BASE   = int(os.getenv("SCAN_INTERVAL_BASE",   "30"))
 SCAN_INTERVAL_ACTIVE = int(os.getenv("SCAN_INTERVAL_ACTIVE", "10"))
 STATE_FILE          = "state.json"
+MACRO_NEWS_FILE     = os.getenv("MACRO_NEWS_FILE", "macro_news.json")
 HTTP_RETRIES        = 3
 HTTP_RETRY_DELAY    = 1.0
 HEARTBEAT_INTERVAL  = int(os.getenv("HEARTBEAT_INTERVAL",  "3600"))
@@ -221,14 +227,22 @@ _consecutive_losses   = 0
 _streak_paused_at     = 0.0
 _session_loss_paused_until = 0.0
 _market_regime_mult  = 1.0
-_dxy_ema_gap         = 0.0
-_vix_level           = 15.0
+_dxy_ema_gap         = None
+_dxy_last_good       = None
+_vix_level           = None
 _vix_at              = 0.0
-_vix_last_good       = 15.0
+_vix_last_good       = None
 _dxy_at              = 0.0
 _scanner_log_buffer  = collections.deque(maxlen=5)
 _kline_cache         = {}
 _kline_cache_lock    = threading.Lock()
+macro_filters        = {}
+_macro_filter_mtime  = 0.0
+macro_news           = []
+_macro_news_mtime    = 0.0
+macro_news_pause_until = 0.0
+
+_pair_cooldowns      = {}
 _thread_local        = threading.local()
 _live_prices         = {}
 _price_lock          = threading.Lock()
@@ -1112,19 +1126,25 @@ def load_state():
 # ═══════════════════════════════════════════════════════════════
 
 def update_dxy_proxy():
-    global _dxy_ema_gap, _dxy_at
+    global _dxy_ema_gap, _dxy_at, _dxy_last_good
     if time.time() - _dxy_at < 1800:
         return
     try:
-        df = fetch_candles("USD_CHF", "H1", 100)
+        df = fetch_candles(DXY_PROXY_INSTRUMENT, "H1", 100)
         if df is None or len(df) < DXY_EMA_PERIOD:
-            return
+            raise ValueError(f"insufficient candle data ({None if df is None else len(df)})")
         ema = calc_ema(df["close"], DXY_EMA_PERIOD)
         _dxy_ema_gap = float(df["close"].iloc[-1]) / float(ema.iloc[-1]) - 1
+        _dxy_last_good = _dxy_ema_gap
         _dxy_at = time.time()
-        log.info(f"📊 [MACRO] DXY proxy (USDCHF): EMA gap {_dxy_ema_gap*100:+.2f}%")
+        log.info(f"📊 [MACRO] DXY proxy ({DXY_PROXY_INSTRUMENT}): EMA gap {_dxy_ema_gap*100:+.2f}%")
     except Exception as e:
-        log.debug(f"DXY proxy update failed: {e}")
+        if _dxy_last_good is None:
+            log.warning(f"⚠️ DXY proxy update failed for {DXY_PROXY_INSTRUMENT}: {e}")
+        else:
+            log.warning(f"⚠️ DXY proxy update failed, keeping last known gap {_dxy_last_good*100:+.2f}%: {e}")
+            _dxy_ema_gap = _dxy_last_good
+        _dxy_at = time.time()
 
 def update_vix_level():
     global _vix_level, _vix_at, _vix_last_good
@@ -1132,19 +1152,19 @@ def update_vix_level():
         return
     new_level = None
     try:
-        df_spx = fetch_candles("SPX500_USD", "D", 30)
+        df_spx = fetch_candles(VIX_PROXY_PRIMARY, "D", 30)
         if df_spx is not None and len(df_spx) >= 20:
             atr = calc_atr(df_spx, 14)
             atr_avg = df_spx["close"].rolling(20).std().iloc[-20:-1].mean()
             vol_ratio = atr / (atr_avg if atr_avg > 0 else 1)
             new_level = 15 * vol_ratio
-            log.info(f"📊 [MACRO] VIX proxy via SPX500_USD: {new_level:.1f} (ATR ratio {vol_ratio:.2f})")
+            log.info(f"📊 [MACRO] VIX proxy via {VIX_PROXY_PRIMARY}: {new_level:.1f} (ATR ratio {vol_ratio:.2f})")
     except Exception as e:
-        log.debug(f"SPX500_USD fetch failed: {e}")
+        log.warning(f"⚠️ {VIX_PROXY_PRIMARY} fetch failed: {e}")
 
     if new_level is None:
         try:
-            df_4h = fetch_candles("USD_JPY", "H4", 60)
+            df_4h = fetch_candles(VIX_PROXY_FALLBACK, "H4", 60)
             if df_4h is not None and len(df_4h) >= 40:
                 atr = calc_atr(df_4h, 14)
                 tr = pd.concat([
@@ -1156,20 +1176,152 @@ def update_vix_level():
                 atr_avg = float(atr_series.iloc[-30:-1].mean())
                 vol_ratio = atr / atr_avg if atr_avg > 0 else 1.0
                 new_level = 15 * vol_ratio
-                log.info(f"📊 [MACRO] VIX proxy via USD/JPY: {new_level:.1f} (ATR ratio {vol_ratio:.2f})")
+                log.info(f"📊 [MACRO] VIX proxy via {VIX_PROXY_FALLBACK}: {new_level:.1f} (ATR ratio {vol_ratio:.2f})")
         except Exception as e:
-            log.debug(f"USD/JPY VIX proxy failed: {e}")
+            log.warning(f"⚠️ {VIX_PROXY_FALLBACK} VIX proxy failed: {e}")
 
     if new_level is not None:
         _vix_last_good = new_level
         _vix_level = new_level
         _vix_at = time.time()
     else:
-        if time.time() - _vix_at > 7200:
-            _vix_level = 15.0
-            log.warning("⚠️ VIX proxy stale >2h — resetting to neutral (15)")
+        if _vix_last_good is not None:
+            _vix_level = _vix_last_good
+            log.warning(f"⚠️ VIX proxy update failed — keeping last known value {_vix_last_good:.1f}")
         else:
-            log.warning("⚠️ VIX proxy update failed — using last known value")
+            _vix_level = None
+            log.warning("⚠️ VIX proxy update failed and no prior value exists; macro volatility is unknown")
+        _vix_at = time.time()
+
+
+def load_macro_filters() -> None:
+    global macro_filters
+    try:
+        if not os.path.exists(MACRO_FILTER_FILE):
+            macro_filters = {}
+            log.warning(f"⚠️ Macro filter file not found: {MACRO_FILTER_FILE}")
+            return
+
+        with open(MACRO_FILTER_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError("macro filter file content must be an object")
+
+        macro_filters = {key.upper(): str(value).upper() for key, value in data.items()}
+        log.info(f"📂 Loaded macro filters from {MACRO_FILTER_FILE}: {', '.join(sorted(macro_filters.keys()))}")
+    except Exception as e:
+        macro_filters = {}
+        log.warning(f"⚠️ Failed to load macro filter file {MACRO_FILTER_FILE}: {e}")
+
+
+def refresh_macro_filters() -> bool:
+    global _macro_filter_mtime
+    try:
+        mtime = os.path.getmtime(MACRO_FILTER_FILE)
+        if mtime != _macro_filter_mtime:
+            _macro_filter_mtime = mtime
+            load_macro_filters()
+            return True
+    except FileNotFoundError:
+        if macro_filters:
+            macro_filters.clear()
+            log.warning(f"⚠️ Macro filter file removed: {MACRO_FILTER_FILE}")
+        _macro_filter_mtime = 0.0
+    return False
+
+
+def load_macro_news() -> None:
+    global macro_news
+    try:
+        if not os.path.exists(MACRO_NEWS_FILE):
+            macro_news = []
+            log.warning(f"⚠️ Macro news file not found: {MACRO_NEWS_FILE}")
+            return
+
+        with open(MACRO_NEWS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError("macro news file content must be an object")
+
+        raw = data.get("news_events")
+        if not isinstance(raw, list):
+            raise ValueError("macro news file must contain a news_events list")
+
+        macro_news = raw
+        log.info(f"📂 Loaded macro news from {MACRO_NEWS_FILE}: {len(macro_news)} events")
+    except Exception as e:
+        macro_news = []
+        log.warning(f"⚠️ Failed to load macro news file {MACRO_NEWS_FILE}: {e}")
+
+
+def refresh_macro_news() -> bool:
+    global _macro_news_mtime
+    try:
+        mtime = os.path.getmtime(MACRO_NEWS_FILE)
+        if mtime != _macro_news_mtime:
+            _macro_news_mtime = mtime
+            load_macro_news()
+            return True
+    except FileNotFoundError:
+        if macro_news:
+            macro_news.clear()
+            log.warning(f"⚠️ Macro news file removed: {MACRO_NEWS_FILE}")
+        _macro_news_mtime = 0.0
+    return False
+
+
+def _parse_macro_news_timestamp(value: str) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
+    text = text.replace(" EST", "-05:00")
+    text = text.replace(" EDT", "-04:00")
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def update_macro_news_pause() -> None:
+    global macro_news_pause_until
+    now = datetime.now(timezone.utc)
+    active_ends = []
+    for event in macro_news:
+        pause_start = event.get("pause_start")
+        pause_end = event.get("pause_end")
+        if not pause_start or not pause_end:
+            continue
+        start_ts = _parse_macro_news_timestamp(pause_start)
+        end_ts = _parse_macro_news_timestamp(pause_end)
+        if start_ts is None or end_ts is None:
+            continue
+        if start_ts <= now < end_ts:
+            active_ends.append(end_ts)
+    if active_ends:
+        macro_news_pause_until = max(active_ends).timestamp()
+    else:
+        macro_news_pause_until = 0.0
+
+
+def apply_macro_directional_bias(instrument: str, signals: dict) -> None:
+    bias = macro_filters.get(instrument.upper())
+    if bias == "LONG_ONLY":
+        signals["long"] += 5
+        log.debug(f"📌 Macro bias LONG_ONLY applied to {instrument}")
+    elif bias == "SHORT_ONLY":
+        signals["short"] += 5
+        log.debug(f"📌 Macro bias SHORT_ONLY applied to {instrument}")
+    elif bias == "NEUTRAL":
+        log.debug(f"📌 Macro bias NEUTRAL applied to {instrument}")
+
 
 def compute_market_regime(df: pd.DataFrame) -> float:
     if df is None or len(df) < 50:
@@ -1193,10 +1345,11 @@ def compute_market_regime(df: pd.DataFrame) -> float:
         mult *= REGIME_LOOSEN_MULT
     if abs(ema_gap) > 0.01:
         mult *= 0.90
-    if _vix_level > VIX_EXTREME_THRESHOLD:
-        mult *= 1.30
-    elif _vix_level > VIX_HIGH_THRESHOLD:
-        mult *= 1.10
+    if _vix_level is not None:
+        if _vix_level > VIX_EXTREME_THRESHOLD:
+            mult *= 1.30
+        elif _vix_level > VIX_HIGH_THRESHOLD:
+            mult *= 1.10
     return round(mult, 3)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1245,7 +1398,7 @@ def determine_direction(instrument: str, df_5m: pd.DataFrame,
             signals["long"] += 4
         else:
             signals["short"] += 4
-    if "USD" in instrument:
+    if _dxy_ema_gap is not None and "USD" in instrument:
         base, quote = instrument.split("_")
         if base == "USD":
             if _dxy_ema_gap > DXY_GATE_THRESHOLD:
@@ -1257,6 +1410,9 @@ def determine_direction(instrument: str, df_5m: pd.DataFrame,
                 signals["short"] += 2
             elif _dxy_ema_gap < -DXY_GATE_THRESHOLD:
                 signals["long"] += 2
+
+    apply_macro_directional_bias(instrument, signals)
+
     if strategy == "REVERSAL":
         signals["long"], signals["short"] = signals["short"], signals["long"]
     return "LONG" if signals["long"] >= signals["short"] else "SHORT"
@@ -1414,7 +1570,7 @@ def score_trend(instrument: str, session: dict) -> dict | None:
     if vol_ratio > 1.2:
         score += 5
 
-    if "USD" in instrument:
+    if _dxy_ema_gap is not None and "USD" in instrument:
         base, quote = instrument.split("_")
         usd_is_base = base == "USD"
         dxy_long = _dxy_ema_gap > DXY_GATE_THRESHOLD
@@ -1987,7 +2143,9 @@ def send_heartbeat(balance: float):
         f"Open: {len(open_trades)} trades{open_str}\n"
         f"Session: {session['name']} ({session['aggression']})\n"
         f"Regime: {regime} ({_market_regime_mult:.2f})\n"
-        f"DXY gap: {_dxy_ema_gap*100:+.2f}% | VIX: {_vix_level:.1f}\n"
+        f"DXY gap: {f'{_dxy_ema_gap*100:+.2f}%' if _dxy_ema_gap is not None else 'unknown'} | "
+        f"VIX: {f'{_vix_level:.1f}' if _vix_level is not None else 'unknown'}\n"
+        f"News pause until: {datetime.fromtimestamp(macro_news_pause_until, timezone.utc).strftime('%H:%M UTC') if macro_news_pause_until else 'none'}\n"
         f"Today: {len([t for t in trade_history if t.get('closed_at', '').startswith(datetime.now(timezone.utc).strftime('%Y-%m-%d'))])} trades"
     )
 
@@ -2061,6 +2219,11 @@ def run():
         f"Open trades restored: {len(open_trades)}"
     )
 
+    load_macro_filters()
+    load_macro_news()
+    log.info(f"🔎 Macro proxy configuration: DXY={DXY_PROXY_INSTRUMENT}, VIX primary={VIX_PROXY_PRIMARY}, VIX fallback={VIX_PROXY_FALLBACK}")
+    log.info(f"📰 Macro news file: {MACRO_NEWS_FILE}")
+
     while True:
         try:
             if is_weekend():
@@ -2078,6 +2241,14 @@ def run():
                 continue
 
             session = get_current_session()
+            filters_updated = refresh_macro_filters()
+            news_updated = refresh_macro_news()
+            if filters_updated or news_updated:
+                log.info(
+                    f"🔄 Macro JSON refresh: filters={'reloaded' if filters_updated else 'unchanged'} "
+                    f"news={'reloaded' if news_updated else 'unchanged'}"
+                )
+            update_macro_news_pause()
             update_dxy_proxy()
             update_vix_level()
 
@@ -2102,6 +2273,9 @@ def run():
                 session_paused = True
                 telegram(f"🛑 <b>Session loss limit</b> | P&L £{today_pnl:.2f}\n"
                          f"Entries paused {SESSION_LOSS_PAUSE_MINS}min.")
+
+            if macro_news_pause_until > time.time():
+                session_paused = True
 
             if streak_cb and not open_trades and _streak_paused_at > 0:
                 if time.time() - _streak_paused_at >= STREAK_AUTO_RESET_MINS * 60:
