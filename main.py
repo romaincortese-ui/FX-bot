@@ -541,7 +541,15 @@ def oanda_get(path: str, params: dict = None) -> dict:
                     continue
             r.raise_for_status()
             return r.json()
+        except requests.HTTPError as e:
+            body = getattr(e.response, 'text', '')[:300] if getattr(e, 'response', None) else ''
+            log.error(f"OANDA GET {path} failed with HTTP {e.response.status_code if getattr(e, 'response', None) else 'unknown'}: {body}")
+            if attempt < HTTP_RETRIES - 1:
+                time.sleep((2 ** attempt) * HTTP_RETRY_DELAY)
+                continue
+            raise
         except (requests.ConnectionError, requests.Timeout) as e:
+            log.error(f"OANDA GET {path} connection failure: {e}")
             if attempt < HTTP_RETRIES - 1:
                 time.sleep((2 ** attempt) * HTTP_RETRY_DELAY)
             else:
@@ -2226,8 +2234,10 @@ def run():
     if not PAPER_TRADE and OANDA_API_KEY:
         _start_price_stream()
 
+    log.info("🔐 Verifying OANDA API credentials...")
     acct = get_account_summary()
     balance = acct.get("balance", 0)
+    log.info(f"✅ OANDA account access verified: {acct.get('currency', 'GBP')} balance {balance:,.2f}")
     telegram(
         f"🚀 <b>FX Bot Started</b>\n"
         f"━━━━━━━━━━━━━━━\n"
