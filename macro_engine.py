@@ -33,7 +33,8 @@ OANDA_COMMODITY_INSTRUMENTS = {
     "OIL": os.getenv("OANDA_OIL_INSTRUMENT", "BCO_USD"),
     "COPPER": os.getenv("OANDA_COPPER_INSTRUMENT", "XCU_USD"),
 }
-FX_FACTORY_URL = os.getenv("FOREX_FACTORY_URL", "https://nfs.forexfactory.com/ff_calendar_thisweek.xml")
+DEFAULT_FX_FACTORY_URL = "https://nfs.forexfactory.com/ff_calendar_thisweek.xml"
+FX_FACTORY_URL = os.getenv("FOREX_FACTORY_URL", DEFAULT_FX_FACTORY_URL)
 NEWS_PAUSE_BEFORE_MINUTES = int(os.getenv("NEWS_PAUSE_BEFORE_MINUTES", "15"))
 
 LOG_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -43,6 +44,12 @@ logging.basicConfig(
     datefmt=LOG_FORMAT,
 )
 log = logging.getLogger(__name__)
+
+if FX_FACTORY_URL.endswith(".json") or "cdn-nfs.forexfactory.net" in FX_FACTORY_URL:
+    log.warning(
+        "Detected deprecated Forex Factory JSON endpoint in FOREX_FACTORY_URL; switching to official XML feed."
+    )
+    FX_FACTORY_URL = DEFAULT_FX_FACTORY_URL
 
 
 def parse_float_env(name: str) -> Optional[float]:
