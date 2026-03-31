@@ -640,8 +640,8 @@ def get_spread_pips(instrument: str) -> float:
     p = get_current_price(instrument)
     return price_to_pips(instrument, p["spread"])
 
-def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100) -> pd.DataFrame | None:
-    cache_key = (instrument, granularity, count)
+def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100, price: str = "M") -> pd.DataFrame | None:
+    cache_key = (instrument, granularity, count, price)
     with _kline_cache_lock:
         cached = _kline_cache.get(cache_key)
         if cached:
@@ -652,11 +652,11 @@ def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100) ->
     try:
         data = oanda_get(
             f"/v3/instruments/{instrument}/candles",
-            {"granularity": granularity, "count": count, "price": "MBA"}
+            {"granularity": granularity, "count": count, "price": price}
         )
         candles = data.get("candles", [])
         if not candles:
-            log.warning(f"⚠️ OANDA candle fetch returned no candles for {instrument} {granularity}/{count}")
+            log.warning(f"⚠️ OANDA candle fetch returned no candles for {instrument} {granularity}/{count} price={price}")
             log.debug(f"OANDA response keys for {instrument}: {list(data.keys())}")
             return None
 
@@ -1140,11 +1140,11 @@ def load_state():
 #  MACRO INTELLIGENCE
 # ═══════════════════════════════════════════════════════════════
 
-def _fetch_candles_with_fallback(instruments, granularity: str, count: int, min_rows: int = 1):
+def _fetch_candles_with_fallback(instruments, granularity: str, count: int, min_rows: int = 1, price: str = "M"):
     for instrument in instruments:
-        df = fetch_candles(instrument, granularity, count)
+        df = fetch_candles(instrument, granularity, count, price=price)
         if df is None:
-            log.debug(f"Macro proxy fetch failed for {instrument} {granularity}/{count}")
+            log.debug(f"Macro proxy fetch failed for {instrument} {granularity}/{count} price={price}")
             continue
         if len(df) < min_rows:
             log.debug(f"Macro proxy fetch returned {len(df)} rows for {instrument} {granularity}/{count}, need {min_rows}")
@@ -1159,7 +1159,8 @@ def update_dxy_proxy():
         return
     instruments = [DXY_PROXY_INSTRUMENT] + [instr for instr in DXY_PROXY_FALLBACKS if instr != DXY_PROXY_INSTRUMENT]
     try:
-        source, df = _fetch_candles_with_fallback(instruments, "H1", 100, min_rows=DXY_EMA_PERIOD)
+        count = max(100, DXY_EMA_PERIOD + 10)
+        source, df = _fetch_candles_with_fallback(instruments, "H1", count, min_rows=DXY_EMA_PERIOD, price="M")
         if df is None:
             raise ValueError(f"insufficient candle data for DXY proxy list: {instruments}")
         ema = calc_ema(df["close"], DXY_EMA_PERIOD)
@@ -1182,7 +1183,8 @@ def update_vix_level():
         return
     new_level = None
     try:
-        df_spx = fetch_candles(VIX_PROXY_PRIMARY, "D", 30)
+        primary_count = max(30, 20 + 10)
+        df_spx = fetch_candles(VIX_PROXY_PRIMARY, "D", primary_count, price="M")
         if df_spx is not None and len(df_spx) >= 20:
             atr = calc_atr(df_spx, 14)
             atr_avg = df_spx["close"].rolling(20).std().iloc[-20:-1].mean()
@@ -1194,7 +1196,8 @@ def update_vix_level():
 
     if new_level is None:
         instruments = [VIX_PROXY_FALLBACK] + [instr for instr in VIX_PROXY_FALLBACKS if instr != VIX_PROXY_FALLBACK]
-        source, df_4h = _fetch_candles_with_fallback(instruments, "H4", 60, min_rows=40)
+        fallback_count = max(60, 40 + 10)
+        source, df_4h = _fetch_candles_with_fallback(instruments, "H4", fallback_count, min_rows=40, price="M")
         if source is not None:
             try:
                 atr = calc_atr(df_4h, 14)
