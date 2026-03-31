@@ -4,12 +4,14 @@ This script executes the macro engine immediately, then sleeps until the next UT
 and runs it again. Use it inside a long-running process or service on your server.
 """
 
-import subprocess
-import sys
 import time
 from datetime import datetime, timedelta, timezone
+import os
+import json
 
 import logging
+import redis
+import macro_engine
 
 LOG_FORMAT = "%Y-%m-%d %H:%M:%S"
 logging.basicConfig(
@@ -19,15 +21,36 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MACRO_ENGINE_SCRIPT = "macro_engine.py"
+REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_MACRO_STATE_KEY = os.getenv("REDIS_MACRO_STATE_KEY", "macro_state")
 
 
 def run_macro_engine() -> int:
-    cmd = [sys.executable, MACRO_ENGINE_SCRIPT]
-    log.info(f"Running macro engine: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    log.info(f"Macro engine exit code: {result.returncode}")
-    return result.returncode
+    log.info(f"Macro engine runner working directory: {os.getcwd()}")
+    if not REDIS_URL:
+        log.error("REDIS_URL is not configured. Cannot save macro state to Redis.")
+        return 1
+
+    try:
+        r = redis.from_url(REDIS_URL)
+    except Exception as e:
+        log.error(f"Failed to connect to Redis: {e}")
+        return 1
+
+    try:
+        filters = macro_engine.generate_macro_filters()
+        news = macro_engine.load_forex_factory_news()
+        macro_state = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "filters": filters,
+            "news_events": news,
+        }
+        r.set(REDIS_MACRO_STATE_KEY, json.dumps(macro_state))
+        log.info(f"Saved macro state to Redis key {REDIS_MACRO_STATE_KEY}")
+        return 0
+    except Exception as e:
+        log.error(f"Failed to generate or save macro state: {e}")
+        return 1
 
 
 def seconds_until_next_midnight_utc() -> float:
