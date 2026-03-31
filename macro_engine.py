@@ -1,6 +1,9 @@
 """
 Daily macro engine for producing a simple macro filter file for the FX bot.
-+ VIX proxy & DXY gap computation, Redis publishing.
+
+This script is intentionally lightweight and configurable by environment variables.
+It can be extended later with real API connectors for FRED, commodity data,
+news surprise feeds, and liquidity spreads.
 """
 
 import json
@@ -12,24 +15,20 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
 import requests
-import pandas as pd
-import numpy as np
 
 try:
     import redis
 except ImportError:
-    redis = None
+    redis = None  # type: ignore
 
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Configuration (environment variables)
-# ──────────────────────────────────────────────────────────────────────────────
-
 MACRO_FILTER_FILE = os.getenv("MACRO_FILTER_FILE", "macro_filter.json")
+REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_MACRO_STATE_KEY = os.getenv("REDIS_MACRO_STATE_KEY", "macro_state")
 MACRO_NEWS_FILE = os.getenv("MACRO_NEWS_FILE", "macro_news.json")
 RATE_SPREAD_THRESHOLD = float(os.getenv("RATE_SPREAD_THRESHOLD", "0.25"))
 COMMODITY_MOMENTUM_THRESHOLD = float(os.getenv("COMMODITY_MOMENTUM_THRESHOLD", "0.03"))
@@ -42,6 +41,11 @@ OANDA_COMMODITY_INSTRUMENTS = {
     "OIL": os.getenv("OANDA_OIL_INSTRUMENT", "BCO_USD"),
     "COPPER": os.getenv("OANDA_COPPER_INSTRUMENT", "XCU_USD"),
 }
+YFINANCE_MARKET_INDICATORS = {
+    "DXY": os.getenv("DXY_TICKER", "DX-Y.NYB"),
+    "VIX": os.getenv("VIX_TICKER", "^VIX"),
+}
+FX_INDEX_MOMENTUM_THRESHOLD = float(os.getenv("FX_INDEX_MOMENTUM_THRESHOLD", "0.01"))
 DEFAULT_ECONOMIC_CALENDAR_URLS = [
     "https://www.dailyfx.com/free-ads/economic-calendar-rss",
     "https://www.investing.com/rss/economic-calendar",
@@ -50,19 +54,6 @@ DEFAULT_ECONOMIC_CALENDAR_URL = DEFAULT_ECONOMIC_CALENDAR_URLS[0]
 ECONOMIC_CALENDAR_URL = os.getenv("ECONOMIC_CALENDAR_URL", DEFAULT_ECONOMIC_CALENDAR_URL)
 NEWS_PAUSE_BEFORE_MINUTES = int(os.getenv("NEWS_PAUSE_BEFORE_MINUTES", "15"))
 
-# Redis
-REDIS_URL = os.getenv("REDIS_URL", "")
-REDIS_MACRO_STATE_KEY = os.getenv("REDIS_MACRO_STATE_KEY", "macro_state")
-
-# DXY proxy
-DXY_PROXY_INSTRUMENT = os.getenv("DXY_PROXY_INSTRUMENT", "USD_CHF")
-DXY_PROXY_FALLBACKS = [s.strip() for s in os.getenv("DXY_PROXY_FALLBACKS", "EUR_USD,GBP_USD,USD_JPY").split(",") if s.strip()]
-DXY_EMA_PERIOD = int(os.getenv("DXY_EMA_PERIOD", "50"))
-
-# VIX proxy
-VIX_PROXY_PRIMARY = os.getenv("VIX_PROXY_PRIMARY", "SPX500_USD")
-VIX_PROXY_FALLBACKS = [s.strip() for s in os.getenv("VIX_PROXY_FALLBACKS", "USD_JPY,USD_CHF,EUR_USD").split(",") if s.strip()]
-
 LOG_FORMAT = "%Y-%m-%d %H:%M:%S"
 logging.basicConfig(
     level=logging.INFO,
@@ -70,11 +61,6 @@ logging.basicConfig(
     datefmt=LOG_FORMAT,
 )
 log = logging.getLogger(__name__)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ──────────────────────────────────────────────────────────────────────────────
 
 def parse_float_env(name: str) -> Optional[float]:
     value = os.getenv(name)
@@ -86,10 +72,6 @@ def parse_float_env(name: str) -> Optional[float]:
         log.warning(f"Invalid numeric environment value for {name}: {value}")
         return None
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FRED data (unchanged)
-# ──────────────────────────────────────────────────────────────────────────────
 
 def fetch_fred_series(series_id: str) -> Optional[float]:
     fred_key = os.getenv("FRED_API_KEY")
@@ -138,21 +120,16 @@ def load_interest_rates() -> Dict[str, Optional[float]]:
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# OANDA data helpers (used for commodity momentum and proxies)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def fetch_oanda_candles(instrument: str, granularity: str = "D", count: int = 100, price: str = "M") -> pd.DataFrame | None:
-    """Fetch candles from OANDA and return a DataFrame."""
+def fetch_oanda_daily_pct_change(instrument: str) -> Optional[float]:
     if not OANDA_API_KEY:
-        log.warning("OANDA_API_KEY not set; cannot fetch candles.")
+        log.warning("OANDA_API_KEY not set; cannot fetch commodity momentum.")
         return None
     url = f"{OANDA_API_URL.rstrip('/')}/v3/instruments/{instrument}/candles"
     headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
     params = {
-        "granularity": granularity,
-        "count": count,
-        "price": price,
+        "granularity": "D",
+        "count": "3",
+        "price": "M",
         "dailyAlignment": "0",
         "alignmentTimezone": "UTC",
     }
@@ -161,40 +138,42 @@ def fetch_oanda_candles(instrument: str, granularity: str = "D", count: int = 10
         response.raise_for_status()
         data = response.json()
         candles = data.get("candles", [])
-        if not candles:
+        closes = []
+        for candle in candles:
+            mid = candle.get("mid")
+            if isinstance(mid, dict):
+                close_price = mid.get("c")
+            else:
+                close_price = candle.get("close", {}).get("c")
+            if close_price is not None:
+                closes.append(float(close_price))
+        if len(closes) < 2:
+            log.warning(f"Not enough close candles for {instrument}")
             return None
-        rows = []
-        for c in candles:
-            if not c.get("complete", True) and granularity != "M1":
-                continue
-            mid = c.get("mid", {})
-            rows.append({
-                "time":   c.get("time", ""),   # Keep as string to avoid conversion error
-                "open":   float(mid.get("o", 0)),
-                "high":   float(mid.get("h", 0)),
-                "low":    float(mid.get("l", 0)),
-                "close":  float(mid.get("c", 0)),
-                "volume": int(c.get("volume", 0)),
-            })
-        if not rows:
-            return None
-        df = pd.DataFrame(rows)
-        df = df.dropna(subset=["close"])
-        return df if len(df) >= 20 else None
+        return closes[-1] / closes[-2] - 1
     except Exception as e:
         log.warning(f"Failed to fetch OANDA candles for {instrument}: {e}")
         return None
 
 
-def fetch_oanda_daily_pct_change(instrument: str) -> Optional[float]:
-    if not OANDA_API_KEY:
-        log.warning("OANDA_API_KEY not set; cannot fetch commodity momentum.")
+def fetch_yfinance_daily_pct_change(ticker: str) -> Optional[float]:
+    try:
+        import yfinance as yf
+    except ImportError:
+        log.warning("yfinance is not installed. Install it with pip install yfinance")
         return None
-    df = fetch_oanda_candles(instrument, "D", 3)
-    if df is None or len(df) < 2:
+
+    try:
+        ticker_data = yf.Ticker(ticker)
+        history = ticker_data.history(period="3d", interval="1d")
+        closes = history["Close"].dropna().tolist()
+        if len(closes) < 2:
+            log.warning(f"Not enough yfinance close data for {ticker}")
+            return None
+        return closes[-1] / closes[-2] - 1
+    except Exception as e:
+        log.warning(f"Failed to fetch yfinance data for {ticker}: {e}")
         return None
-    closes = df["close"].tolist()
-    return closes[-1] / closes[-2] - 1
 
 
 def load_oanda_commodity_momentum() -> Dict[str, Optional[float]]:
@@ -205,21 +184,36 @@ def load_oanda_commodity_momentum() -> Dict[str, Optional[float]]:
     }
 
 
+def load_yfinance_market_momentum() -> Dict[str, Optional[float]]:
+    return {
+        "DXY": fetch_yfinance_daily_pct_change(YFINANCE_MARKET_INDICATORS["DXY"]),
+        "VIX": fetch_yfinance_daily_pct_change(YFINANCE_MARKET_INDICATORS["VIX"]),
+    }
+
+
+def get_dxy_gap() -> Optional[float]:
+    return load_yfinance_market_momentum().get("DXY")
+
+
+def get_vix_proxy() -> Optional[float]:
+    return load_yfinance_market_momentum().get("VIX")
+
+
 def load_commodity_momentum() -> Dict[str, Optional[float]]:
     momentum = load_oanda_commodity_momentum()
-    if any(momentum.get(key) is not None for key in ("OIL", "COPPER")):
-        return momentum
-    log.warning("OANDA commodity momentum unavailable; falling back to environment variables.")
+    market_momentum = load_yfinance_market_momentum()
+    if any(momentum.get(key) is not None for key in ("OIL", "COPPER")) or any(market_momentum.get(key) is not None for key in ("DXY", "VIX")):
+        return {**momentum, **market_momentum}
+
+    log.warning("OANDA commodity and yfinance market momentum unavailable; falling back to environment variables.")
     return {
         "OIL": parse_float_env("OIL_MOMENTUM"),
         "COPPER": parse_float_env("COPPER_MOMENTUM"),
         "DAIRY": parse_float_env("DAIRY_MOMENTUM"),
+        "DXY": parse_float_env("DXY_MOMENTUM"),
+        "VIX": parse_float_env("VIX_MOMENTUM"),
     }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FRED‑based economic surprise and liquidity risk (unchanged)
-# ──────────────────────────────────────────────────────────────────────────────
 
 def load_economic_surprise() -> Dict[str, Optional[float]]:
     if not os.getenv("FRED_API_KEY"):
@@ -275,103 +269,15 @@ def load_liquidity_risk() -> Dict[str, Optional[float]]:
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Technical indicators (needed for VIX/DXY proxy)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def calc_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
-    if df is None or len(df) < period + 1:
-        return 0.0
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift(1)).abs(),
-        (df["low"]  - df["close"].shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
-    return float(atr.iloc[-1])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DXY and VIX proxy computations (using OANDA candles)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_dxy_gap() -> Optional[float]:
-    """Calculate DXY gap as price/EMA50 - 1 using proxy instruments."""
-    instruments = [DXY_PROXY_INSTRUMENT] + DXY_PROXY_FALLBACKS
-    for instr in instruments:
-        try:
-            df = fetch_oanda_candles(instr, "H1", 200, price="M")
-            if df is None or len(df) < DXY_EMA_PERIOD:
-                continue
-            close = df["close"]
-            ema = calc_ema(close, DXY_EMA_PERIOD)
-            gap = float(close.iloc[-1]) / float(ema.iloc[-1]) - 1
-            log.info(f"📊 DXY proxy ({instr}): gap {gap*100:+.2f}%")
-            return gap
-        except Exception as e:
-            log.warning(f"Error computing DXY proxy for {instr}: {e}")
-            continue
-    log.warning("No DXY proxy data available.")
-    return None
-
-
-def get_vix_proxy() -> Optional[float]:
-    """Estimate VIX level using volatility ratio of a proxy instrument."""
-    # Try primary first
-    try:
-        df = fetch_oanda_candles(VIX_PROXY_PRIMARY, "D", 200, price="M")
-        if df is not None and len(df) >= 20:
-            atr = calc_atr(df, 14)
-            # Average of recent ATR ratio (simplified: compare to 20-day std)
-            atr_avg = df["close"].rolling(20).std().iloc[-20:-1].mean()
-            vol_ratio = atr / atr_avg if atr_avg > 0 else 1.0
-            vix = 15 * vol_ratio
-            log.info(f"📊 VIX proxy via {VIX_PROXY_PRIMARY}: {vix:.1f} (ATR ratio {vol_ratio:.2f})")
-            return vix
-    except Exception as e:
-        log.warning(f"Error computing VIX proxy from {VIX_PROXY_PRIMARY}: {e}")
-
-    # Fallback: use 4H candles from fallback instruments
-    for instr in VIX_PROXY_FALLBACKS:
-        try:
-            df = fetch_oanda_candles(instr, "H4", 200, price="M")
-            if df is None or len(df) < 40:
-                continue
-            atr = calc_atr(df, 14)
-            tr = pd.concat([
-                df["high"] - df["low"],
-                (df["high"] - df["close"].shift(1)).abs(),
-                (df["low"] - df["close"].shift(1)).abs(),
-            ], axis=1).max(axis=1)
-            atr_series = tr.ewm(alpha=1/14, adjust=False).mean()
-            atr_avg = float(atr_series.iloc[-30:-1].mean())
-            vol_ratio = atr / atr_avg if atr_avg > 0 else 1.0
-            vix = 15 * vol_ratio
-            log.info(f"📊 VIX proxy via {instr}: {vix:.1f} (ATR ratio {vol_ratio:.2f})")
-            return vix
-        except Exception as e:
-            log.warning(f"Error computing VIX proxy from {instr}: {e}")
-            continue
-
-    log.warning("No VIX proxy data available.")
-    return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# News / economic calendar (unchanged)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _parse_forex_datetime_string(value: str) -> Optional[datetime]:
     if not isinstance(value, str):
         return None
     text = value.strip()
     if not text:
         return None
+    # Normalize explicit UTC designations
     text = text.replace("Z", "+00:00")
+    # Forex Factory can emit EST/EDT-like timestamps; convert these to offsets explicitly
     text = text.replace(" EST", "-05:00")
     text = text.replace(" EDT", "-04:00")
     try:
@@ -495,9 +401,15 @@ def load_forex_factory_news() -> List[dict]:
     return events
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Filter generation (unchanged)
-# ──────────────────────────────────────────────────────────────────────────────
+def fetch_json(url: str, params: Dict[str, str] = None, headers: Dict[str, str] = None) -> Optional[dict]:
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=15)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        log.warning(f"Failed to fetch JSON from {url}: {e}")
+        return None
+
 
 def build_rate_bias(rates: Dict[str, Optional[float]]) -> Dict[str, str]:
     biases = {}
@@ -550,6 +462,54 @@ def build_commodity_bias(momentum: Dict[str, Optional[float]]) -> Dict[str, str]
             biases["NZD_USD"] = "LONG_ONLY"
         elif dairy < -COMMODITY_MOMENTUM_THRESHOLD:
             biases["NZD_USD"] = "SHORT_ONLY"
+
+    return biases
+
+
+def build_market_index_bias(indices: Dict[str, Optional[float]]) -> Dict[str, str]:
+    biases = {}
+    dxy = indices.get("DXY")
+    vix = indices.get("VIX")
+
+    if dxy is not None:
+        if dxy > FX_INDEX_MOMENTUM_THRESHOLD:
+            biases.update({
+                "EUR_USD": "SHORT_ONLY",
+                "GBP_USD": "SHORT_ONLY",
+                "AUD_USD": "SHORT_ONLY",
+                "USD_JPY": "LONG_ONLY",
+                "USD_CHF": "LONG_ONLY",
+                "USD_CAD": "LONG_ONLY",
+            })
+        elif dxy < -FX_INDEX_MOMENTUM_THRESHOLD:
+            biases.update({
+                "EUR_USD": "LONG_ONLY",
+                "GBP_USD": "LONG_ONLY",
+                "AUD_USD": "LONG_ONLY",
+                "USD_JPY": "SHORT_ONLY",
+                "USD_CHF": "SHORT_ONLY",
+                "USD_CAD": "SHORT_ONLY",
+            })
+
+    if vix is not None:
+        if vix > FX_INDEX_MOMENTUM_THRESHOLD:
+            biases.update({
+                "AUD_USD": "SHORT_ONLY",
+                "NZD_USD": "SHORT_ONLY",
+                "GBP_USD": "SHORT_ONLY",
+                "EUR_USD": "SHORT_ONLY",
+                "USD_JPY": "LONG_ONLY",
+                "USD_CHF": "LONG_ONLY",
+            })
+        elif vix < -FX_INDEX_MOMENTUM_THRESHOLD:
+            biases.update({
+                "AUD_USD": "LONG_ONLY",
+                "NZD_USD": "LONG_ONLY",
+                "GBP_USD": "LONG_ONLY",
+                "EUR_USD": "LONG_ONLY",
+                "USD_JPY": "SHORT_ONLY",
+                "USD_CHF": "SHORT_ONLY",
+            })
 
     return biases
 
@@ -622,10 +582,11 @@ def generate_macro_filters() -> Dict[str, str]:
 
     rate_bias = build_rate_bias(rates)
     commodity_bias = build_commodity_bias(momentum)
+    market_bias = build_market_index_bias(momentum)
     esi_bias = build_esi_bias(esi)
     liquidity_bias = build_liquidity_bias(liquidity)
 
-    filters = merge_biases(rate_bias, commodity_bias, esi_bias, liquidity_bias)
+    filters = merge_biases(rate_bias, commodity_bias, market_bias, esi_bias, liquidity_bias)
     if filters:
         log.info(f"Generated macro filter values: {filters}")
     else:
@@ -635,7 +596,7 @@ def generate_macro_filters() -> Dict[str, str]:
 
 def save_macro_filters(filters: Dict[str, str], path: str = MACRO_FILTER_FILE) -> None:
     payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
+        "generated_at": datetime.utcnow().isoformat() + "Z",
         "filters": filters,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -645,7 +606,7 @@ def save_macro_filters(filters: Dict[str, str], path: str = MACRO_FILTER_FILE) -
 
 def save_macro_news(news_events: List[dict], path: str = MACRO_NEWS_FILE) -> None:
     payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
+        "generated_at": datetime.utcnow().isoformat() + "Z",
         "news_events": news_events,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -653,22 +614,28 @@ def save_macro_news(news_events: List[dict], path: str = MACRO_NEWS_FILE) -> Non
     log.info(f"Saved macro news file to {path}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────────
-
 def run() -> None:
     log.info("Starting macro engine")
+
+    # 1. Fetch all data
     filters = generate_macro_filters()
-    save_macro_filters(filters)
     news = load_forex_factory_news()
-    save_macro_news(news)
 
-    # Compute proxy metrics
-    dxy_gap = get_dxy_gap()
-    vix_value = get_vix_proxy()
+    # 2. Fetch VIX/DXY with forced defaults if they return None
+    # This ensures the keys ALWAYS exist in the Redis JSON
+    try:
+        dxy_val = get_dxy_gap()
+        dxy_gap = float(dxy_val) if dxy_val is not None else 0.0
+    except Exception:
+        dxy_gap = 0.0
 
-    # Build combined state for Redis
+    try:
+        vix_val = get_vix_proxy()
+        vix_value = float(vix_val) if vix_val is not None else 15.0
+    except Exception:
+        vix_value = 15.0
+
+    # 3. Build state (Ensure keys match exactly what main.py expects)
     macro_state = {
         "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
         "filters": filters,
@@ -677,20 +644,19 @@ def run() -> None:
         "dxy_gap": dxy_gap,
     }
 
-    # Write to Redis if available
-    if REDIS_URL:
-        try:
-            if redis is None:
-                log.warning("redis module not installed; cannot push to Redis.")
-            else:
-                redis_client = redis.from_url(REDIS_URL)
-                redis_client.set(REDIS_MACRO_STATE_KEY, json.dumps(macro_state))
-                log.info(f"Pushed macro state to Redis key {REDIS_MACRO_STATE_KEY}")
-        except Exception as e:
-            log.warning(f"Failed to push to Redis: {e}")
+    # 4. Push to Redis
+    if REDIS_URL and redis:
+        client = redis.from_url(REDIS_URL)
+        client.set(REDIS_MACRO_STATE_KEY, json.dumps(macro_state))
+        log.info(f"Pushed macro state to Redis with VIX={vix_value} and DXY={dxy_gap}")
     else:
-        log.info("No Redis URL; skipping Redis push.")
+        if not REDIS_URL:
+            log.warning("REDIS_URL not set; skipping Redis push.")
+        elif not redis:
+            log.warning("redis library not installed; skipping Redis push.")
 
+    save_macro_filters(filters)
+    save_macro_news(news)
     log.info("Macro engine finished")
 
 
