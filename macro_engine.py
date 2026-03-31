@@ -9,6 +9,7 @@ news surprise feeds, and liquidity spreads.
 import json
 import logging
 import os
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -32,7 +33,7 @@ OANDA_COMMODITY_INSTRUMENTS = {
     "OIL": os.getenv("OANDA_OIL_INSTRUMENT", "BCO_USD"),
     "COPPER": os.getenv("OANDA_COPPER_INSTRUMENT", "XCU_USD"),
 }
-FX_FACTORY_URL = os.getenv("FOREX_FACTORY_URL", "https://cdn-nfs.forexfactory.net/ff_calendar_thisweek.json")
+FX_FACTORY_URL = os.getenv("FOREX_FACTORY_URL", "https://nfs.forexfactory.com/ff_calendar_thisweek.xml")
 NEWS_PAUSE_BEFORE_MINUTES = int(os.getenv("NEWS_PAUSE_BEFORE_MINUTES", "15"))
 
 LOG_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -282,10 +283,31 @@ def extract_forex_factory_events(raw: Any) -> List[dict]:
 
 
 def load_forex_factory_news() -> List[dict]:
-    data = fetch_json(FX_FACTORY_URL)
-    if not data:
+    url = FX_FACTORY_URL
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+    except Exception as e:
+        log.error(f"Failed to fetch or parse Forex Factory XML: {e}")
         return []
-    raw_events = extract_forex_factory_events(data)
+
+    raw_events = []
+    for event in root.findall('.//event'):
+        raw_events.append({
+            'title': event.findtext('title', default=''),
+            'country': event.findtext('country', default=''),
+            'date': event.findtext('date', default=''),
+            'time': event.findtext('time', default=''),
+            'impact': event.findtext('impact', default=''),
+            'forecast': event.findtext('forecast', default=''),
+            'previous': event.findtext('previous', default=''),
+            'actual': event.findtext('actual', default=''),
+        })
+
     events: List[dict] = []
     today = datetime.now(timezone.utc).date()
     for raw in raw_events:
@@ -297,9 +319,9 @@ def load_forex_factory_news() -> List[dict]:
         pause_start = event_time - timedelta(minutes=NEWS_PAUSE_BEFORE_MINUTES)
         pause_end = event_time + timedelta(minutes=NEWS_PAUSE_BEFORE_MINUTES)
         events.append({
-            "currency": raw.get("currency") or raw.get("country"),
-            "event": raw.get("event") or raw.get("title") or raw.get("headline"),
-            "impact": raw.get("impact") or raw.get("importance"),
+            "currency": raw.get("country"),
+            "event": raw.get("title"),
+            "impact": raw.get("impact"),
             "time": event_time.isoformat(),
             "forecast": raw.get("forecast"),
             "previous": raw.get("previous"),
@@ -307,8 +329,9 @@ def load_forex_factory_news() -> List[dict]:
             "pause_start": pause_start.isoformat(),
             "pause_end": pause_end.isoformat(),
         })
+
     if events:
-        log.info(f"Loaded {len(events)} high-impact Forex Factory events for today.")
+        log.info(f"Successfully loaded {len(events)} news events from Forex Factory XML.")
     else:
         log.info("No high-impact Forex Factory events found for today.")
     return events
