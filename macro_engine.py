@@ -158,6 +158,60 @@ def load_commodity_momentum() -> Dict[str, Optional[float]]:
     }
 
 
+def load_economic_surprise() -> Dict[str, Optional[float]]:
+    if not os.getenv("FRED_API_KEY"):
+        log.warning("FRED_API_KEY not set; using fallback economic surprise values.")
+        return {
+            "US": parse_float_env("US_ECON_SURPRISE"),
+            "UK": parse_float_env("UK_ECON_SURPRISE"),
+            "EU": parse_float_env("EU_ECON_SURPRISE"),
+            "JP": parse_float_env("JP_ECON_SURPRISE"),
+        }
+
+    surprise_series = {
+        "US": "CESIUS",
+        "UK": "CESIGB",
+        "EU": "CESIEU",
+        "JP": "CESIJP",
+    }
+    values = {country: fetch_fred_series(series_id)
+              for country, series_id in surprise_series.items()}
+    if any(v is not None for v in values.values()):
+        log.info(f"Loaded economic surprise indices: {values}")
+        return values
+
+    log.warning("Economic surprise data unavailable from FRED; using fallback values.")
+    return {
+        "US": parse_float_env("US_ECON_SURPRISE"),
+        "UK": parse_float_env("UK_ECON_SURPRISE"),
+        "EU": parse_float_env("EU_ECON_SURPRISE"),
+        "JP": parse_float_env("JP_ECON_SURPRISE"),
+    }
+
+
+def load_liquidity_risk() -> Dict[str, Optional[float]]:
+    if not os.getenv("FRED_API_KEY"):
+        log.warning("FRED_API_KEY not set; using fallback liquidity risk values.")
+        return {
+            "TED_SPREAD": parse_float_env("TED_SPREAD"),
+            "FRA_OIS_SPREAD": parse_float_env("FRA_OIS_SPREAD"),
+        }
+
+    values = {
+        "TED_SPREAD": fetch_fred_series("TEDRATE"),
+        "FRA_OIS_SPREAD": parse_float_env("FRA_OIS_SPREAD"),
+    }
+    if values["TED_SPREAD"] is not None:
+        log.info(f"Loaded liquidity risk values: {values}")
+        return values
+
+    log.warning("Liquidity risk data unavailable from FRED; using fallback values.")
+    return {
+        "TED_SPREAD": parse_float_env("TED_SPREAD"),
+        "FRA_OIS_SPREAD": parse_float_env("FRA_OIS_SPREAD"),
+    }
+
+
 def _parse_forex_datetime_string(value: str) -> Optional[datetime]:
     if not isinstance(value, str):
         return None
