@@ -1007,7 +1007,7 @@ def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100, pr
                 continue
             mid = c.get("mid", {})
             rows.append({
-                "time":   float(c.get("time", 0)),
+                "time":   pd.to_datetime(c.get("time"), utc=True, errors="coerce"),
                 "open":   float(mid.get("o", 0)),
                 "high":   float(mid.get("h", 0)),
                 "low":    float(mid.get("l", 0)),
