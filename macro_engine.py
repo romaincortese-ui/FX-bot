@@ -364,6 +364,25 @@ def extract_forex_factory_events(raw: Any) -> List[dict]:
     return [item for item in events if isinstance(item, dict)]
 
 
+def _parse_calendar_event_datetime(date_text: str, time_text: str) -> Optional[datetime]:
+    if not date_text:
+        return None
+
+    normalized_date = date_text.strip()
+    normalized_time = (time_text or "").strip().lower()
+    if not normalized_time or normalized_time in {"all day", "tentative"}:
+        normalized_time = "12:00am"
+
+    normalized_time = normalized_time.replace(" ", "")
+    combined = f"{normalized_date} {normalized_time}"
+    for fmt in ("%m-%d-%Y %I:%M%p", "%Y-%m-%d %I:%M%p"):
+        try:
+            return datetime.strptime(combined, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
 def load_forex_factory_news() -> List[dict]:
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -398,28 +417,52 @@ def load_forex_factory_news() -> List[dict]:
     now_utc = datetime.now(timezone.utc)
     min_date = (now_utc - timedelta(days=news_lookback_days)).date()
     max_date = now_utc.date()
-    items = root.findall('.//item')
+    if root.tag.lower() == "weeklyevents":
+        items = root.findall('.//event')
+        item_kind = "event"
+    else:
+        items = root.findall('.//item')
+        item_kind = "item"
+
     log.info(
-        f"Economic calendar feed {source_url or '<unknown>'} contains {len(items)} raw RSS items; "
+        f"Economic calendar feed {source_url or '<unknown>'} contains {len(items)} raw {item_kind} nodes; "
         f"filtering for UTC dates {min_date} to {max_date}"
     )
     for item in items:
         title = item.findtext('title', default='').strip()
-        link = item.findtext('link', default='').strip()
         description = item.findtext('description', default='').strip()
-        raw_time = item.findtext('pubDate', default='').strip()
         event_time = None
-        try:
-            event_time = parsedate_to_datetime(raw_time).astimezone(timezone.utc)
-        except Exception:
-            # Try parsing with datetime.fromisoformat as fallback
+        currency = None
+        impact = None
+        forecast = None
+        previous = None
+        actual = None
+
+        if item_kind == "event":
+            currency = item.findtext('country', default='').strip() or None
+            impact = item.findtext('impact', default='').strip() or None
+            forecast = item.findtext('forecast', default='').strip() or None
+            previous = item.findtext('previous', default='').strip() or None
+            actual = item.findtext('actual', default='').strip() or None
+            link = item.findtext('url', default='').strip()
+            event_time = _parse_calendar_event_datetime(
+                item.findtext('date', default='').strip(),
+                item.findtext('time', default='').strip(),
+            )
+        else:
+            link = item.findtext('link', default='').strip()
+            raw_time = item.findtext('pubDate', default='').strip()
             try:
-                event_time = datetime.fromisoformat(raw_time)
-                if event_time.tzinfo is None:
-                    event_time = event_time.replace(tzinfo=timezone.utc)
-                event_time = event_time.astimezone(timezone.utc)
+                event_time = parsedate_to_datetime(raw_time).astimezone(timezone.utc)
             except Exception:
-                event_time = None
+                # Try parsing with datetime.fromisoformat as fallback
+                try:
+                    event_time = datetime.fromisoformat(raw_time)
+                    if event_time.tzinfo is None:
+                        event_time = event_time.replace(tzinfo=timezone.utc)
+                    event_time = event_time.astimezone(timezone.utc)
+                except Exception:
+                    event_time = None
 
         # Accept events within the lookback window
         if event_time is None or not (min_date <= event_time.date() <= max_date):
@@ -428,13 +471,13 @@ def load_forex_factory_news() -> List[dict]:
         pause_start = event_time - timedelta(minutes=NEWS_PAUSE_BEFORE_MINUTES)
         pause_end = event_time + timedelta(minutes=NEWS_PAUSE_BEFORE_MINUTES)
         events.append({
-            "currency": None,
+            "currency": currency,
             "event": title,
-            "impact": None,
+            "impact": impact,
             "time": event_time.isoformat(),
-            "forecast": None,
-            "previous": None,
-            "actual": None,
+            "forecast": forecast,
+            "previous": previous,
+            "actual": actual,
             "link": link,
             "description": description,
             "pause_start": pause_start.isoformat(),
@@ -449,7 +492,7 @@ def load_forex_factory_news() -> List[dict]:
         )
     else:
         log.info(
-            f"No economic calendar events found in lookback window after filtering {len(items)} raw RSS items "
+            f"No economic calendar events found in lookback window after filtering {len(items)} raw {item_kind} nodes "
             f"from {source_url or '<unknown>'}."
         )
     return events
