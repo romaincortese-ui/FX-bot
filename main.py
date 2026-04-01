@@ -904,14 +904,23 @@ def oanda_get(path: str, params: dict = None) -> dict:
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
-            body = getattr(e.response, 'text', '')[:300] if getattr(e, 'response', None) else ''
-            log.error(f"OANDA GET {path} failed with HTTP {e.response.status_code if getattr(e, 'response', None) else 'unknown'}: {body}")
+            response = getattr(e, "response", None)
+            status_code = response.status_code if response is not None else "unknown"
+            body = (getattr(response, "text", "") or "")[:300] if response is not None else ""
+            detail = body or str(e) or e.__class__.__name__
+            log.error(f"OANDA GET {path} failed with HTTP {status_code}: {detail}")
             if attempt < HTTP_RETRIES - 1:
                 time.sleep((2 ** attempt) * HTTP_RETRY_DELAY)
                 continue
             raise
         except (requests.ConnectionError, requests.Timeout) as e:
             log.error(f"OANDA GET {path} connection failure: {e}")
+            if attempt < HTTP_RETRIES - 1:
+                time.sleep((2 ** attempt) * HTTP_RETRY_DELAY)
+            else:
+                raise
+        except requests.RequestException as e:
+            log.error(f"OANDA GET {path} request failure ({e.__class__.__name__}): {e}")
             if attempt < HTTP_RETRIES - 1:
                 time.sleep((2 ** attempt) * HTTP_RETRY_DELAY)
             else:
@@ -951,7 +960,17 @@ def oanda_put(path: str, data: dict) -> dict:
     try:
         r = _get_session().put(url, json=data, timeout=10)
         if r.status_code >= 400:
-            log.error(f"OANDA PUT {path} error {r.status_code}: {r.text[:300]}")
+            try:
+                payload = r.json()
+            except ValueError:
+                payload = {}
+            error_body = _extract_oanda_error_message(payload, r.text[:500])
+            log.error(f"OANDA PUT {path} error {r.status_code}: {error_body}")
+            if payload:
+                payload["error"] = error_body
+                payload["status_code"] = r.status_code
+                return payload
+            return {"error": error_body, "status_code": r.status_code}
         return r.json()
     except Exception as e:
         log.error(f"OANDA PUT {path} failed: {e}")
@@ -1364,8 +1383,9 @@ def close_trade(trade_id: str, label: str = "", units: float = None) -> bool:
     if units:
         body["units"] = str(abs(units))
     result = oanda_put(path, body)
-    if "error" in result:
-        log.error(f"[{label}] Close trade {trade_id} failed: {result['error']}")
+    if "error" in result or result.get("orderRejectTransaction") or result.get("orderCancelTransaction"):
+        reject_message = _extract_oanda_error_message(result, str(result.get("error", "close rejected")))
+        log.error(f"[{label}] Close trade {trade_id} failed: {reject_message}")
         return False
     fill = result.get("orderFillTransaction", {})
     if fill:
@@ -1373,6 +1393,7 @@ def close_trade(trade_id: str, label: str = "", units: float = None) -> bool:
         pnl = float(fill.get("pl", 0))
         log.info(f"[{label}] Trade {trade_id} closed @ {close_price} | P&L: {pnl:.2f}")
         return True
+    log.error(f"[{label}] Close trade {trade_id} returned no fill: {json.dumps(result)[:300]}")
     return False
 
 def modify_trade(trade_id: str, tp_price: float = None, sl_price: float = None,
