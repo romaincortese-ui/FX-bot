@@ -301,7 +301,7 @@ _macro_news_mtime    = 0.0
 macro_news_pause_until = 0.0
 _recent_scan_decisions = []
 _last_scan_cycle_at   = ""
-_last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0}
+_last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0, "active_pairs": [], "tradable_pairs": []}
 _scan_reject_reasons = {}
 _pair_health         = {}
 _last_scan_pool_status = {"mode": "primary", "active": 0, "healthy": 0, "tradable": 0}
@@ -1327,15 +1327,26 @@ def start_scan_cycle() -> None:
     global _recent_scan_decisions, _last_scan_cycle_at, _last_scan_cycle_summary
     _recent_scan_decisions = []
     _last_scan_cycle_at = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    _last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0}
+    _last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0, "active_pairs": [], "tradable_pairs": []}
 
 
-def set_scan_cycle_summary(active_count: int, healthy_count: int, tradable_count: int) -> None:
+def _format_pair_list(pairs: list[str], limit: int = 4) -> str:
+    if not pairs:
+        return "none"
+    shown = ", ".join(pairs[:limit])
+    if len(pairs) > limit:
+        shown += f" (+{len(pairs) - limit})"
+    return shown
+
+
+def set_scan_cycle_summary(active_pairs: list[str], healthy_pairs: list[str], tradable_pairs: list[str]) -> None:
     global _last_scan_cycle_summary
     _last_scan_cycle_summary = {
-        "active": active_count,
-        "healthy": healthy_count,
-        "tradable": tradable_count,
+        "active": len(active_pairs),
+        "healthy": len(healthy_pairs),
+        "tradable": len(tradable_pairs),
+        "active_pairs": list(active_pairs),
+        "tradable_pairs": list(tradable_pairs),
     }
 
 
@@ -1489,6 +1500,8 @@ def _handle_status_command():
         f"healthy {_last_scan_cycle_summary.get('healthy', 0)} | "
         f"tradable {_last_scan_cycle_summary.get('tradable', 0)}"
     )
+    latest_active_pairs_text = _format_pair_list(_last_scan_cycle_summary.get("active_pairs", []))
+    latest_tradable_pairs_text = _format_pair_list(_last_scan_cycle_summary.get("tradable_pairs", []))
     regime = ('🟢 BULL' if _market_regime_mult < 0.95
               else '🔴 BEAR' if _market_regime_mult > 1.10
               else '⚪ NEUTRAL')
@@ -1507,6 +1520,8 @@ def _handle_status_command():
         f"🌐 Global pair issues: {global_health_text}",
         f"🔎 Scan pool: {scan_pool_text}",
         f"🧮 Last scan breadth: {latest_scan_text}",
+        f"📋 Last active pairs: {latest_active_pairs_text}",
+        f"✅ Last tradable pairs: {latest_tradable_pairs_text}",
         f"{status_emoji} Bot: {status_text}",
     ]
     if open_trades:
@@ -1538,6 +1553,7 @@ def _handle_status_command():
                 if health_state != "healthy":
                     health_suffix = f" | {health_state}"
             lines.append(f"{item['emoji']} {item['at']} {label} {instrument} | {item['reason']}{health_suffix}")
+        lines.append("ℹ️ Each line shows the best or first representative rejection for that strategy, not every pair checked.")
     telegram("\n".join(lines))
 
 def _handle_metrics_command():
@@ -3357,7 +3373,7 @@ def run():
                 start_scan_cycle()
                 skip_scalper = is_rollover_window()
                 active_pairs, health_pairs, tradable_pairs, empty_reason = get_effective_scan_pairs(session)
-                set_scan_cycle_summary(len(active_pairs), len(health_pairs), len(tradable_pairs))
+                set_scan_cycle_summary(active_pairs, health_pairs, tradable_pairs)
 
                 scalper_count  = sum(1 for t in open_trades if t["label"] == "SCALPER")
                 trend_count    = sum(1 for t in open_trades if t["label"] == "TREND")
