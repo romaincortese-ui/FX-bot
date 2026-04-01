@@ -1375,9 +1375,9 @@ def place_order(instrument: str, units: float, direction: str,
     mark_pair_failure(instrument, "order returned without fill", "order")
     return {}
 
-def close_trade(trade_id: str, label: str = "", units: float = None) -> bool:
+def close_trade_result(trade_id: str, label: str = "", units: float = None) -> tuple[bool, str | None]:
     if PAPER_TRADE:
-        return True
+        return True, None
     path = f"/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/close"
     body = {}
     if units:
@@ -1386,15 +1386,21 @@ def close_trade(trade_id: str, label: str = "", units: float = None) -> bool:
     if "error" in result or result.get("orderRejectTransaction") or result.get("orderCancelTransaction"):
         reject_message = _extract_oanda_error_message(result, str(result.get("error", "close rejected")))
         log.error(f"[{label}] Close trade {trade_id} failed: {reject_message}")
-        return False
+        return False, reject_message
     fill = result.get("orderFillTransaction", {})
     if fill:
         close_price = float(fill.get("price", 0))
         pnl = float(fill.get("pl", 0))
         log.info(f"[{label}] Trade {trade_id} closed @ {close_price} | P&L: {pnl:.2f}")
-        return True
-    log.error(f"[{label}] Close trade {trade_id} returned no fill: {json.dumps(result)[:300]}")
-    return False
+        return True, None
+    no_fill_message = f"close returned no fill: {json.dumps(result)[:300]}"
+    log.error(f"[{label}] Close trade {trade_id} {no_fill_message}")
+    return False, no_fill_message
+
+
+def close_trade(trade_id: str, label: str = "", units: float = None) -> bool:
+    success, _ = close_trade_result(trade_id, label, units)
+    return success
 
 def modify_trade(trade_id: str, tp_price: float = None, sl_price: float = None,
                  trailing_sl_pips: float = None, instrument: str = "",
@@ -3391,9 +3397,13 @@ def close_trade_exit(trade: dict, reason: str):
     else:
         pnl_pips = (trade["entry_price"] - exit_price) / ps
 
-    success = close_trade(trade["id"], label)
+    success, close_error = close_trade_result(trade["id"], label)
     if not success and not PAPER_TRADE:
-        log.error(f"[{label}] Failed to close {instrument} — will retry")
+        if close_error and "market_halted" in close_error.lower().replace(" ", "_"):
+            log.error(f"[{label}] Failed to close {instrument} — market halted, position remains open")
+        else:
+            suffix = f": {close_error}" if close_error else ""
+            log.error(f"[{label}] Failed to close {instrument} — will retry{suffix}")
         return False
 
     pnl = pnl_pips * pip_value(instrument, trade.get("units", 1))
