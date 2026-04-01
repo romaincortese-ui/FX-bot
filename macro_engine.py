@@ -657,7 +657,7 @@ def generate_macro_filters() -> Dict[str, Any]:
 
 def save_macro_filters(filters: Dict[str, str], path: str = MACRO_FILTER_FILE) -> None:
     payload = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
         "filters": filters,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -667,7 +667,7 @@ def save_macro_filters(filters: Dict[str, str], path: str = MACRO_FILTER_FILE) -
 
 def save_macro_news(news_events: List[dict], path: str = MACRO_NEWS_FILE) -> None:
     payload = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
         "news_events": news_events,
     }
     with open(path, "w", encoding="utf-8") as f:
