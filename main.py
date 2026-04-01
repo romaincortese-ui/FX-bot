@@ -228,6 +228,12 @@ KELLY_MULT_MARGINAL   = float(os.getenv("KELLY_MULT_MARGINAL",   "0.8"))
 
 SCAN_INTERVAL_BASE   = int(os.getenv("SCAN_INTERVAL_BASE",   "30"))
 SCAN_INTERVAL_ACTIVE = int(os.getenv("SCAN_INTERVAL_ACTIVE", "10"))
+PAIR_HEALTH_FAILURE_COOLDOWN_SECS = int(os.getenv("PAIR_HEALTH_FAILURE_COOLDOWN_SECS", "60"))
+PAIR_HEALTH_SUCCESS_COOLDOWN_SECS = int(os.getenv("PAIR_HEALTH_SUCCESS_COOLDOWN_SECS", "30"))
+PAIR_HEALTH_PROBE_INTERVAL_SECS = int(os.getenv("PAIR_HEALTH_PROBE_INTERVAL_SECS", "900"))
+PAIR_HEALTH_RECOVERY_SUCCESSES = int(os.getenv("PAIR_HEALTH_RECOVERY_SUCCESSES", "3"))
+PAIR_HEALTH_BLOCK_BASE_SECS = int(os.getenv("PAIR_HEALTH_BLOCK_BASE_SECS", "1800"))
+PAIR_HEALTH_BLOCK_MAX_SECS = int(os.getenv("PAIR_HEALTH_BLOCK_MAX_SECS", "86400"))
 STATE_FILE          = "state.json"
 MACRO_NEWS_FILE     = os.getenv("MACRO_NEWS_FILE", "macro_news.json")
 REDIS_URL           = os.getenv("REDIS_URL", "")
@@ -295,6 +301,7 @@ _macro_news_mtime    = 0.0
 macro_news_pause_until = 0.0
 _recent_scan_decisions = collections.deque(maxlen=8)
 _scan_reject_reasons = {}
+_pair_health         = {}
 
 _pair_cooldowns      = {}
 _thread_local        = threading.local()
@@ -331,6 +338,211 @@ def pip_value(instrument: str, units: float, account_currency: str = "GBP") -> f
         return abs(units)
     return abs(units) * pip_size(instrument)
 
+
+def _default_pair_health() -> dict:
+    return {
+        "status": "healthy",
+        "health_score": 100.0,
+        "blocked_until": 0.0,
+        "block_level": 0,
+        "next_probe_at": 0.0,
+        "clean_probes": 0,
+        "last_failure_reason": "",
+        "last_failure_at": 0.0,
+        "last_recovery_at": 0.0,
+        "last_quote_ok_at": 0.0,
+        "last_order_ok_at": 0.0,
+        "last_spread_ok_at": 0.0,
+        "last_candle_ok_at": {},
+        "consecutive_quote_failures": 0,
+        "consecutive_order_failures": 0,
+        "consecutive_spread_failures": 0,
+        "consecutive_candle_failures": {},
+        "last_failure_buckets": {},
+        "last_success_buckets": {},
+    }
+
+
+def _ensure_pair_health(instrument: str) -> dict:
+    rec = _pair_health.get(instrument)
+    if rec is None:
+        rec = _default_pair_health()
+        _pair_health[instrument] = rec
+    return rec
+
+
+def _pair_health_block_seconds(block_level: int) -> int:
+    ladder = [
+        PAIR_HEALTH_BLOCK_BASE_SECS,
+        PAIR_HEALTH_BLOCK_BASE_SECS * 4,
+        PAIR_HEALTH_BLOCK_BASE_SECS * 12,
+        PAIR_HEALTH_BLOCK_MAX_SECS,
+    ]
+    idx = max(0, min(block_level - 1, len(ladder) - 1))
+    return min(ladder[idx], PAIR_HEALTH_BLOCK_MAX_SECS)
+
+
+def _can_count_pair_health_event(rec: dict, bucket: str, success: bool) -> bool:
+    now = time.time()
+    store = rec["last_success_buckets"] if success else rec["last_failure_buckets"]
+    cooldown = PAIR_HEALTH_SUCCESS_COOLDOWN_SECS if success else PAIR_HEALTH_FAILURE_COOLDOWN_SECS
+    last_at = float(store.get(bucket, 0.0))
+    if now - last_at < cooldown:
+        return False
+    store[bucket] = now
+    return True
+
+
+def get_pair_health_status(instrument: str) -> str:
+    return _ensure_pair_health(instrument).get("status", "healthy")
+
+
+def get_pair_health_reason(instrument: str) -> str:
+    return str(_ensure_pair_health(instrument).get("last_failure_reason") or "")
+
+
+def mark_pair_failure(instrument: str, reason: str, source: str, severity: str = "soft", timeframe: str = "") -> None:
+    rec = _ensure_pair_health(instrument)
+    bucket = f"{source}:{timeframe or '-'}"
+    if not _can_count_pair_health_event(rec, bucket, success=False):
+        return
+
+    now = time.time()
+    prev_status = rec["status"]
+    rec["last_failure_reason"] = reason
+    rec["last_failure_at"] = now
+    rec["clean_probes"] = 0
+    rec["health_score"] = max(0.0, float(rec.get("health_score", 100.0)) - (25.0 if severity == "hard" else 10.0))
+
+    degrade = False
+    block = False
+
+    if source == "quote":
+        rec["consecutive_quote_failures"] = int(rec.get("consecutive_quote_failures", 0)) + 1
+        degrade = rec["consecutive_quote_failures"] >= 3
+        block = rec["consecutive_quote_failures"] >= 6
+    elif source == "candle":
+        candle_failures = rec.setdefault("consecutive_candle_failures", {})
+        candle_failures[timeframe or "UNKNOWN"] = int(candle_failures.get(timeframe or "UNKNOWN", 0)) + 1
+        current = candle_failures[timeframe or "UNKNOWN"]
+        important = timeframe in {"M15", "H1", "H4"}
+        degrade = current >= (2 if important else 3)
+        block = current >= (4 if important else 6)
+    elif source == "spread":
+        rec["consecutive_spread_failures"] = int(rec.get("consecutive_spread_failures", 0)) + 1
+        degrade = rec["consecutive_spread_failures"] >= 5
+        block = rec["consecutive_spread_failures"] >= 10
+    elif source == "order":
+        rec["consecutive_order_failures"] = int(rec.get("consecutive_order_failures", 0)) + 1
+        hard_terms = ("close-only", "close only", "tradeable", "tradable", "instrument", "liquidity", "market halted")
+        if severity == "hard" or any(term in reason.lower() for term in hard_terms):
+            block = True
+        else:
+            degrade = rec["consecutive_order_failures"] >= 2
+            block = rec["consecutive_order_failures"] >= 4
+
+    if block:
+        rec["status"] = "blocked"
+        rec["block_level"] = int(rec.get("block_level", 0)) + 1
+        rec["blocked_until"] = now + _pair_health_block_seconds(rec["block_level"])
+        rec["next_probe_at"] = rec["blocked_until"]
+    elif degrade and rec["status"] == "healthy":
+        rec["status"] = "degraded"
+        rec["next_probe_at"] = now + PAIR_HEALTH_PROBE_INTERVAL_SECS
+
+    if rec["status"] != prev_status:
+        if rec["status"] == "blocked":
+            until_text = datetime.fromtimestamp(rec["blocked_until"], timezone.utc).strftime("%H:%M UTC")
+            log.warning(f"🧱 Pair blocked: {instrument} | {reason} | until {until_text}")
+        elif rec["status"] == "degraded":
+            log.warning(f"⚠️ Pair degraded: {instrument} | {reason}")
+
+
+def mark_pair_success(instrument: str, source: str, timeframe: str = "") -> None:
+    rec = _ensure_pair_health(instrument)
+    bucket = f"{source}:{timeframe or '-'}"
+    if not _can_count_pair_health_event(rec, bucket, success=True):
+        return
+
+    now = time.time()
+    prev_status = rec["status"]
+
+    if source == "quote":
+        rec["last_quote_ok_at"] = now
+        rec["consecutive_quote_failures"] = 0
+    elif source == "candle":
+        rec.setdefault("last_candle_ok_at", {})[timeframe or "UNKNOWN"] = now
+        rec.setdefault("consecutive_candle_failures", {})[timeframe or "UNKNOWN"] = 0
+    elif source == "order":
+        rec["last_order_ok_at"] = now
+        rec["consecutive_order_failures"] = 0
+    elif source == "spread":
+        rec["last_spread_ok_at"] = now
+        rec["consecutive_spread_failures"] = 0
+
+    rec["health_score"] = min(100.0, float(rec.get("health_score", 100.0)) + 5.0)
+
+    if rec["status"] == "blocked" and now >= float(rec.get("blocked_until", 0.0)):
+        rec["status"] = "degraded"
+        rec["clean_probes"] = 1
+        rec["next_probe_at"] = now + PAIR_HEALTH_PROBE_INTERVAL_SECS
+        rec["last_recovery_at"] = now
+        log.info(f"🛠️ Pair recovery started: {instrument} | moved to degraded")
+    elif rec["status"] == "degraded":
+        rec["clean_probes"] = int(rec.get("clean_probes", 0)) + 1
+        rec["next_probe_at"] = now + PAIR_HEALTH_PROBE_INTERVAL_SECS
+        if rec["clean_probes"] >= PAIR_HEALTH_RECOVERY_SUCCESSES:
+            rec["status"] = "healthy"
+            rec["clean_probes"] = 0
+            rec["next_probe_at"] = 0.0
+            rec["last_recovery_at"] = now
+            rec["last_failure_reason"] = ""
+            rec["block_level"] = max(0, int(rec.get("block_level", 0)) - 1)
+            rec["health_score"] = max(80.0, rec["health_score"])
+            log.info(f"✅ Pair healthy again: {instrument}")
+    else:
+        rec["clean_probes"] = 0
+
+    if prev_status == "blocked" and rec["status"] == "blocked":
+        rec["next_probe_at"] = max(float(rec.get("next_probe_at", 0.0)), float(rec.get("blocked_until", 0.0)))
+
+
+def is_pair_tradeable(instrument: str) -> bool:
+    return get_pair_health_status(instrument) != "blocked"
+
+
+def get_pair_health_buckets(instruments: list[str] | None = None) -> tuple[list[str], list[str]]:
+    universe = instruments or list(_pair_health.keys())
+    degraded = []
+    blocked = []
+    for instrument in universe:
+        status = get_pair_health_status(instrument)
+        if status == "blocked":
+            blocked.append(instrument)
+        elif status == "degraded":
+            degraded.append(instrument)
+    return degraded, blocked
+
+
+def probe_pair_health() -> None:
+    now = time.time()
+    candidates = [
+        instrument for instrument, rec in _pair_health.items()
+        if rec.get("status") in {"degraded", "blocked"} and now >= float(rec.get("next_probe_at", 0.0))
+    ]
+    for instrument in candidates[:6]:
+        price = get_current_price(instrument)
+        if price.get("bid", 0) <= 0 or price.get("ask", 0) <= 0:
+            rec = _ensure_pair_health(instrument)
+            rec["next_probe_at"] = now + PAIR_HEALTH_PROBE_INTERVAL_SECS
+            continue
+        df_m15 = fetch_candles(instrument, "M15", 30)
+        df_h1 = fetch_candles(instrument, "H1", 40)
+        rec = _ensure_pair_health(instrument)
+        rec["next_probe_at"] = now + PAIR_HEALTH_PROBE_INTERVAL_SECS
+        if df_m15 is None or df_h1 is None:
+            continue
+
 # ═══════════════════════════════════════════════════════════════
 #  DYNAMIC PAIR SELECTION
 # ═══════════════════════════════════════════════════════════════
@@ -360,6 +572,7 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
         for inst in instruments:
             if inst.get("type") == "CURRENCY":
                 name = inst["name"].replace("/", "_")
+                _ensure_pair_health(name)
                 fx_pairs.append(name)
 
         if not fx_pairs:
@@ -378,13 +591,21 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
                 inst = price["instrument"]
                 bid = float(price["closeoutBid"])
                 ask = float(price["closeoutAsk"])
+                if bid <= 0 or ask <= 0:
+                    mark_pair_failure(inst, "invalid price in watchlist", "quote")
+                    continue
+                mark_pair_success(inst, "quote")
                 spread = (ask - bid) / pip_size(inst)
                 if spread <= max_spread_pips:
-                    spread_ok.append(inst)
+                    mark_pair_success(inst, "spread")
+                    if is_pair_tradeable(inst):
+                        spread_ok.append(inst)
+                else:
+                    mark_pair_failure(inst, f"spread {spread:.1f} > {max_spread_pips:.1f}", "spread")
 
         if not spread_ok:
             log.warning("No pairs passed spread filter. Using static list.")
-            return STATIC_ALL_PAIRS
+            return [pair for pair in STATIC_ALL_PAIRS if is_pair_tradeable(pair)] or STATIC_ALL_PAIRS
 
         log.info(f"📊 {len(spread_ok)} pairs passed spread filter. Ranking by volatility...")
 
@@ -670,6 +891,8 @@ def get_current_price(instrument: str) -> dict:
     with _price_lock:
         cached = _live_prices.get(instrument)
         if cached and time.time() - cached[2] < 30:
+            if cached[0] > 0 and cached[1] > 0:
+                mark_pair_success(instrument, "quote")
             return {"bid": cached[0], "ask": cached[1], "spread": cached[1] - cached[0]}
 
     try:
@@ -680,11 +903,16 @@ def get_current_price(instrument: str) -> dict:
             p = prices[0]
             bid = float(p["bids"][0]["price"]) if p.get("bids") else 0
             ask = float(p["asks"][0]["price"]) if p.get("asks") else 0
+            if bid <= 0 or ask <= 0:
+                mark_pair_failure(instrument, "missing bid/ask", "quote")
+                return {"bid": 0, "ask": 0, "spread": 999}
             with _price_lock:
                 _live_prices[instrument] = (bid, ask, time.time())
+            mark_pair_success(instrument, "quote")
             return {"bid": bid, "ask": ask, "spread": ask - bid}
     except Exception as e:
         log.debug(f"Price fetch failed for {instrument}: {e}")
+        mark_pair_failure(instrument, str(e), "quote")
     return {"bid": 0, "ask": 0, "spread": 999}
 
 def get_spread_pips(instrument: str) -> float:
@@ -709,6 +937,7 @@ def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100, pr
         if not candles:
             log.warning(f"⚠️ OANDA candle fetch returned no candles for {instrument} {granularity}/{count} price={price}")
             log.debug(f"OANDA response keys for {instrument}: {list(data.keys())}")
+            mark_pair_failure(instrument, f"no candles {granularity}", "candle", timeframe=granularity)
             return None
 
         rows = []
@@ -728,6 +957,7 @@ def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100, pr
             })
 
         if not rows:
+            mark_pair_failure(instrument, f"no valid candle rows {granularity}", "candle", timeframe=granularity)
             return None
 
         df = pd.DataFrame(rows)
@@ -735,6 +965,9 @@ def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100, pr
 
         if len(df) < 20:
             log.debug(f"OANDA candle fetch produced only {len(df)} valid rows for {instrument} {granularity}/{count}")
+            mark_pair_failure(instrument, f"short candle history {granularity} ({len(df)})", "candle", timeframe=granularity)
+        else:
+            mark_pair_success(instrument, "candle", timeframe=granularity)
 
         with _kline_cache_lock:
             if len(_kline_cache) >= MAX_KLINE_CACHE:
@@ -747,6 +980,7 @@ def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100, pr
 
     except Exception as e:
         log.debug(f"Candle fetch error {instrument}/{granularity}: {e}")
+        mark_pair_failure(instrument, str(e), "candle", timeframe=granularity)
         return None
 
 def calculate_units(instrument: str, balance: float, sl_pips: float,
@@ -768,6 +1002,8 @@ def place_order(instrument: str, units: float, direction: str,
     if PAPER_TRADE:
         price = get_current_price(instrument)
         entry = price["ask"] if direction == "LONG" else price["bid"]
+        if entry > 0:
+            mark_pair_success(instrument, "order")
         return {
             "id": f"PAPER_{int(time.time()*1000)}",
             "instrument": instrument,
@@ -813,6 +1049,8 @@ def place_order(instrument: str, units: float, direction: str,
 
     if "error" in result:
         log.error(f"[{label}] Order failed: {result['error']}")
+        hard_failure = result.get("status_code") in {400, 403, 404}
+        mark_pair_failure(instrument, result["error"][:200], "order", severity="hard" if hard_failure else "soft")
         telegram(f"⚠️ <b>{label} Order Failed</b>\n{instrument} {direction}\n{result['error'][:200]}")
         return {}
 
@@ -820,6 +1058,7 @@ def place_order(instrument: str, units: float, direction: str,
     if fill:
         trade_id = fill.get("tradeOpened", {}).get("tradeID") or fill.get("id")
         fill_price = float(fill.get("price", 0))
+        mark_pair_success(instrument, "order")
         log.info(f"[{label}] Order filled: {instrument} @ {fill_price} | trade_id={trade_id}")
         return {
             "id": trade_id,
@@ -832,6 +1071,7 @@ def place_order(instrument: str, units: float, direction: str,
         }
 
     log.warning(f"[{label}] Order response has no fill: {json.dumps(result)[:300]}")
+    mark_pair_failure(instrument, "order returned without fill", "order")
     return {}
 
 def close_trade(trade_id: str, label: str = "", units: float = None) -> bool:
@@ -1111,9 +1351,22 @@ def _handle_status_command():
     acct = get_account_summary()
     session = get_current_session()
     paused_pairs = get_paused_pairs_by_news(session["pairs_allowed"])
+    degraded_pairs, blocked_pairs = get_pair_health_buckets(session["pairs_allowed"])
     paused_text = ", ".join(paused_pairs[:4]) if paused_pairs else "none"
     if len(paused_pairs) > 4:
         paused_text += f" (+{len(paused_pairs) - 4})"
+    pair_health_parts = []
+    if blocked_pairs:
+        blocked_text = ", ".join(blocked_pairs[:3])
+        if len(blocked_pairs) > 3:
+            blocked_text += f" (+{len(blocked_pairs) - 3})"
+        pair_health_parts.append(f"blocked {blocked_text}")
+    if degraded_pairs:
+        degraded_text = ", ".join(degraded_pairs[:3])
+        if len(degraded_pairs) > 3:
+            degraded_text += f" (+{len(degraded_pairs) - 3})"
+        pair_health_parts.append(f"degraded {degraded_text}")
+    pair_health_text = " | ".join(pair_health_parts) if pair_health_parts else "all healthy"
     regime = ('🟢 BULL' if _market_regime_mult < 0.95
               else '🔴 BEAR' if _market_regime_mult > 1.10
               else '⚪ NEUTRAL')
@@ -1128,6 +1381,7 @@ def _handle_status_command():
         f"Regime: {regime} ({_market_regime_mult:.2f})",
         f"Macro: DXY {f'{_dxy_ema_gap*100:+.2f}%' if _dxy_ema_gap is not None else 'unknown'} | VIX {f'{_vix_level:.1f}' if _vix_level is not None else 'unknown'}",
         f"📰 News-paused: {paused_text}",
+        f"🩺 Pair health: {pair_health_text}",
         f"{status_emoji} Bot: {status_text}",
     ]
     if open_trades:
@@ -1215,6 +1469,7 @@ def save_state():
             "adaptive_offsets":      _adaptive_offsets,
             "last_rebalance_count":  _last_rebalance_count,
             "pair_cooldowns":        _pair_cooldowns,
+            "pair_health":           _pair_health,
             "saved_at":              datetime.now(timezone.utc).isoformat(),
         }
         tmp = STATE_FILE + ".tmp"
@@ -1226,7 +1481,7 @@ def save_state():
 
 def load_state():
     global open_trades, trade_history, _consecutive_losses, _streak_paused_at
-    global _paused, _adaptive_offsets, _last_rebalance_count, _pair_cooldowns
+    global _paused, _adaptive_offsets, _last_rebalance_count, _pair_cooldowns, _pair_health
     try:
         if not os.path.exists(STATE_FILE):
             return
@@ -1241,9 +1496,17 @@ def load_state():
         _streak_paused_at   = d.get("streak_paused_at", 0.0)
         _paused             = d.get("paused", False)
         _adaptive_offsets   = d.get("adaptive_offsets",
-                                    {"SCALPER": 0.0, "TREND": 0.0, "REVERSAL": 0.0, "BREAKOUT": 0.0})
+                                    {"SCALPER": 0.0, "TREND": 0.0, "REVERSAL": 0.0, "BREAKOUT": 0.0,
+                                     "CARRY": 0.0, "ASIAN_FADE": 0.0, "POST_NEWS": 0.0, "PULLBACK": 0.0})
         _last_rebalance_count = d.get("last_rebalance_count", 0)
         _pair_cooldowns       = d.get("pair_cooldowns", {})
+        raw_pair_health       = d.get("pair_health", {})
+        _pair_health = {}
+        for instrument, rec in raw_pair_health.items():
+            merged = _default_pair_health()
+            if isinstance(rec, dict):
+                merged.update(rec)
+            _pair_health[instrument] = merged
         log.info(f"📂 State loaded ({age/60:.0f}min old): "
                  f"{len(open_trades)} open, {len(trade_history)} history")
     except Exception as e:
@@ -2410,6 +2673,9 @@ def check_correlation_limit(instrument: str, direction: str) -> bool:
 
 
 def get_entry_block_reason(instrument: str, direction: str) -> str | None:
+    if not is_pair_tradeable(instrument):
+        reason = get_pair_health_reason(instrument)
+        return f"pair blocked{f' ({reason[:40]})' if reason else ''}"
     if time.time() < _pair_cooldowns.get(instrument, 0):
         return "cooldown"
     if any(t["instrument"] == instrument for t in open_trades):
@@ -2914,6 +3180,7 @@ def run():
                 _market_regime_mult = compute_market_regime(df_eurusd_1h)
 
             refresh_dynamic_watchlist()   # This will also restart stream if needed
+            probe_pair_health()
 
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             today_pnl = sum(t.get("pnl", 0) for t in trade_history
@@ -2952,7 +3219,14 @@ def run():
             if entries_allowed and len(open_trades) < MAX_OPEN_TRADES:
                 skip_scalper = is_rollover_window()
                 active_pairs = session["pairs_allowed"]
-                tradable_pairs = [pair for pair in active_pairs if not is_pair_paused_by_news(pair)]
+                health_pairs = [pair for pair in active_pairs if is_pair_tradeable(pair)]
+                tradable_pairs = [pair for pair in health_pairs if not is_pair_paused_by_news(pair)]
+                if not health_pairs:
+                    empty_reason = "pairs blocked"
+                elif not tradable_pairs:
+                    empty_reason = "paused by news"
+                else:
+                    empty_reason = "no setup"
 
                 scalper_count  = sum(1 for t in open_trades if t["label"] == "SCALPER")
                 trend_count    = sum(1 for t in open_trades if t["label"] == "TREND")
@@ -2962,7 +3236,7 @@ def run():
                 if scalper_count < SCALPER_MAX_TRADES and not skip_scalper:
                     best_scalper, reject_pair, reject_reason = _find_best_opportunity("SCALPER", tradable_pairs, session, score_scalper)
                     if not tradable_pairs:
-                        record_scan_decision("SCALPER", "-", "paused by news", "📰")
+                        record_scan_decision("SCALPER", "-", empty_reason, "📰")
                     elif best_scalper:
                         scanner_log(f"📊 [SCALPER] Best: {best_scalper['instrument']} | "
                                     f"Score: {best_scalper['score']:.0f} | "
@@ -2974,12 +3248,12 @@ def run():
                             reason = get_entry_block_reason(best_scalper["instrument"], best_scalper["direction"]) or "entry blocked"
                             record_scan_decision("SCALPER", best_scalper["instrument"], reason, "🚫")
                     else:
-                        record_scan_decision("SCALPER", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
+                        record_scan_decision("SCALPER", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
 
                 if trend_count < TREND_MAX_TRADES and session["aggression"] != "MINIMAL":
                     best_trend, reject_pair, reject_reason = _find_best_opportunity("TREND", tradable_pairs, session, score_trend)
                     if not tradable_pairs:
-                        record_scan_decision("TREND", "-", "paused by news", "📰")
+                        record_scan_decision("TREND", "-", empty_reason, "📰")
                     elif best_trend:
                         scanner_log(f"📈 [TREND] Best: {best_trend['instrument']} | "
                                     f"Score: {best_trend['score']:.0f} | {best_trend['direction']}")
@@ -2990,12 +3264,12 @@ def run():
                             reason = get_entry_block_reason(best_trend["instrument"], best_trend["direction"]) or "entry blocked"
                             record_scan_decision("TREND", best_trend["instrument"], reason, "🚫")
                     else:
-                        record_scan_decision("TREND", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
+                        record_scan_decision("TREND", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
 
                 if reversal_count < REVERSAL_MAX_TRADES:
                     best_reversal, reject_pair, reject_reason = _find_best_opportunity("REVERSAL", tradable_pairs, session, score_reversal)
                     if not tradable_pairs:
-                        record_scan_decision("REVERSAL", "-", "paused by news", "📰")
+                        record_scan_decision("REVERSAL", "-", empty_reason, "📰")
                     elif best_reversal:
                         scanner_log(f"🔄 [REVERSAL] Best: {best_reversal['instrument']} | "
                                     f"Score: {best_reversal['score']:.0f} | {best_reversal['direction']}")
@@ -3006,12 +3280,12 @@ def run():
                             reason = get_entry_block_reason(best_reversal["instrument"], best_reversal["direction"]) or "entry blocked"
                             record_scan_decision("REVERSAL", best_reversal["instrument"], reason, "🚫")
                     else:
-                        record_scan_decision("REVERSAL", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
+                        record_scan_decision("REVERSAL", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
 
                 if breakout_count < BREAKOUT_MAX_TRADES and session["aggression"] in ("HIGH",):
                     best_breakout, reject_pair, reject_reason = _find_best_opportunity("BREAKOUT", tradable_pairs, session, score_breakout)
                     if not tradable_pairs:
-                        record_scan_decision("BREAKOUT", "-", "paused by news", "📰")
+                        record_scan_decision("BREAKOUT", "-", empty_reason, "📰")
                     elif best_breakout:
                         scanner_log(f"💥 [BREAKOUT] Best: {best_breakout['instrument']} | "
                                     f"Score: {best_breakout['score']:.0f} | {best_breakout['direction']}")
@@ -3022,14 +3296,14 @@ def run():
                             reason = get_entry_block_reason(best_breakout["instrument"], best_breakout["direction"]) or "entry blocked"
                             record_scan_decision("BREAKOUT", best_breakout["instrument"], reason, "🚫")
                     else:
-                        record_scan_decision("BREAKOUT", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
+                        record_scan_decision("BREAKOUT", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
 
                 # ── New FX strategies ────────────────────────────
                 carry_count = sum(1 for t in open_trades if t["label"] == "CARRY")
                 if carry_count < CARRY_MAX_TRADES:
                     best_carry, reject_pair, reject_reason = _find_best_opportunity("CARRY", tradable_pairs, session, score_carry)
                     if not tradable_pairs:
-                        record_scan_decision("CARRY", "-", "paused by news", "📰")
+                        record_scan_decision("CARRY", "-", empty_reason, "📰")
                     elif best_carry:
                         scanner_log(f"💰 [CARRY] Best: {best_carry['instrument']} | "
                                     f"Score: {best_carry['score']:.0f} | {best_carry['direction']}")
@@ -3040,13 +3314,13 @@ def run():
                             reason = get_entry_block_reason(best_carry["instrument"], best_carry["direction"]) or "entry blocked"
                             record_scan_decision("CARRY", best_carry["instrument"], reason, "🚫")
                     else:
-                        record_scan_decision("CARRY", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
+                        record_scan_decision("CARRY", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
 
                 asian_fade_count = sum(1 for t in open_trades if t["label"] == "ASIAN_FADE")
                 if asian_fade_count < ASIAN_FADE_MAX_TRADES and session["name"] == "TOKYO":
                     best_asian, reject_pair, reject_reason = _find_best_opportunity("ASIAN_FADE", tradable_pairs, session, score_asian_fade)
                     if not tradable_pairs:
-                        record_scan_decision("ASIAN", "-", "paused by news", "📰")
+                        record_scan_decision("ASIAN", "-", empty_reason, "📰")
                     elif best_asian:
                         scanner_log(f"🌙 [ASIAN_FADE] Best: {best_asian['instrument']} | "
                                     f"Score: {best_asian['score']:.0f} | {best_asian['direction']}")
@@ -3057,13 +3331,13 @@ def run():
                             reason = get_entry_block_reason(best_asian["instrument"], best_asian["direction"]) or "entry blocked"
                             record_scan_decision("ASIAN", best_asian["instrument"], reason, "🚫")
                     else:
-                        record_scan_decision("ASIAN", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
+                        record_scan_decision("ASIAN", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
 
                 post_news_count = sum(1 for t in open_trades if t["label"] == "POST_NEWS")
                 if post_news_count < POST_NEWS_MAX_TRADES:
                     best_pn, reject_pair, reject_reason = _find_best_opportunity("POST_NEWS", tradable_pairs, session, score_post_news)
                     if not tradable_pairs:
-                        record_scan_decision("POST_NEWS", "-", "paused by news", "📰")
+                        record_scan_decision("POST_NEWS", "-", empty_reason, "📰")
                     elif best_pn:
                         scanner_log(f"📰 [POST_NEWS] Best: {best_pn['instrument']} | "
                                     f"Score: {best_pn['score']:.0f} | {best_pn['direction']}")
@@ -3074,13 +3348,13 @@ def run():
                             reason = get_entry_block_reason(best_pn["instrument"], best_pn["direction"]) or "entry blocked"
                             record_scan_decision("POST_NEWS", best_pn["instrument"], reason, "🚫")
                     else:
-                        record_scan_decision("POST_NEWS", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
+                        record_scan_decision("POST_NEWS", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
 
                 pullback_count = sum(1 for t in open_trades if t["label"] == "PULLBACK")
                 if pullback_count < PULLBACK_MAX_TRADES and session["aggression"] != "MINIMAL":
                     best_pb, reject_pair, reject_reason = _find_best_opportunity("PULLBACK", tradable_pairs, session, score_pullback)
                     if not tradable_pairs:
-                        record_scan_decision("PULLBACK", "-", "paused by news", "📰")
+                        record_scan_decision("PULLBACK", "-", empty_reason, "📰")
                     elif best_pb:
                         scanner_log(f"📐 [PULLBACK] Best: {best_pb['instrument']} | "
                                     f"Score: {best_pb['score']:.0f} | {best_pb['direction']}")
@@ -3091,7 +3365,7 @@ def run():
                             reason = get_entry_block_reason(best_pb["instrument"], best_pb["direction"]) or "entry blocked"
                             record_scan_decision("PULLBACK", best_pb["instrument"], reason, "🚫")
                     else:
-                        record_scan_decision("PULLBACK", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
+                        record_scan_decision("PULLBACK", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
 
             if len(trade_history) % 10 == 0 and len(trade_history) > 0:
                 update_adaptive_thresholds()
