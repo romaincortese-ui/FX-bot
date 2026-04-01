@@ -375,12 +375,15 @@ def load_forex_factory_news() -> List[dict]:
     urls.extend(url for url in DEFAULT_ECONOMIC_CALENDAR_URLS if url != ECONOMIC_CALENDAR_URL)
 
     root = None
+    source_url = None
     for url in urls:
         try:
+            log.info(f"Fetching economic calendar feed from {url}")
             response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
             root = ET.fromstring(response.content)
-            log.info(f"Loaded economic calendar XML from {url}")
+            source_url = url
+            log.info(f"Loaded economic calendar XML from {url} (root tag: {root.tag})")
             break
         except Exception as e:
             log.warning(f"Failed to fetch or parse economic calendar XML from {url}: {e}")
@@ -395,7 +398,12 @@ def load_forex_factory_news() -> List[dict]:
     now_utc = datetime.now(timezone.utc)
     min_date = (now_utc - timedelta(days=news_lookback_days)).date()
     max_date = now_utc.date()
-    for item in root.findall('.//item'):
+    items = root.findall('.//item')
+    log.info(
+        f"Economic calendar feed {source_url or '<unknown>'} contains {len(items)} raw RSS items; "
+        f"filtering for UTC dates {min_date} to {max_date}"
+    )
+    for item in items:
         title = item.findtext('title', default='').strip()
         link = item.findtext('link', default='').strip()
         description = item.findtext('description', default='').strip()
@@ -434,9 +442,16 @@ def load_forex_factory_news() -> List[dict]:
         })
 
     if events:
-        log.info(f"Successfully loaded {len(events)} news events from economic calendar XML (lookback {news_lookback_days}d).")
+        sample_titles = ", ".join(event["event"] for event in events[:3])
+        log.info(
+            f"Successfully loaded {len(events)} news events from economic calendar XML "
+            f"(lookback {news_lookback_days}d). Sample: {sample_titles}"
+        )
     else:
-        log.info("No economic calendar events found in lookback window.")
+        log.info(
+            f"No economic calendar events found in lookback window after filtering {len(items)} raw RSS items "
+            f"from {source_url or '<unknown>'}."
+        )
     return events
 
 
@@ -672,7 +687,7 @@ def save_macro_news(news_events: List[dict], path: str = MACRO_NEWS_FILE) -> Non
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-    log.info(f"Saved macro news file to {path}")
+    log.info(f"Saved macro news file to {path} with {len(news_events)} events")
 
 
 def run() -> None:
