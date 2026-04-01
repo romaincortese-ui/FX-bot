@@ -299,7 +299,9 @@ _macro_filter_mtime  = 0.0
 macro_news           = []
 _macro_news_mtime    = 0.0
 macro_news_pause_until = 0.0
-_recent_scan_decisions = collections.deque(maxlen=8)
+_recent_scan_decisions = []
+_last_scan_cycle_at   = ""
+_last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0}
 _scan_reject_reasons = {}
 _pair_health         = {}
 _last_scan_pool_status = {"mode": "primary", "active": 0, "healthy": 0, "tradable": 0}
@@ -1321,7 +1323,34 @@ def scanner_log(msg: str):
     log.info(msg)
 
 
+def start_scan_cycle() -> None:
+    global _recent_scan_decisions, _last_scan_cycle_at, _last_scan_cycle_summary
+    _recent_scan_decisions = []
+    _last_scan_cycle_at = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    _last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0}
+
+
+def set_scan_cycle_summary(active_count: int, healthy_count: int, tradable_count: int) -> None:
+    global _last_scan_cycle_summary
+    _last_scan_cycle_summary = {
+        "active": active_count,
+        "healthy": healthy_count,
+        "tradable": tradable_count,
+    }
+
+
 def record_scan_decision(strategy: str, instrument: str, reason: str, emoji: str) -> None:
+    for idx, item in enumerate(_recent_scan_decisions):
+        if item["strategy"] == strategy:
+            _recent_scan_decisions[idx] = {
+                "at": _last_scan_cycle_at or datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "strategy": strategy,
+                "instrument": instrument,
+                "reason": reason,
+                "emoji": emoji,
+            }
+            return
+
     _recent_scan_decisions.append({
         "at": datetime.now(timezone.utc).strftime("%H:%M:%S"),
         "strategy": strategy,
@@ -1411,6 +1440,7 @@ def _handle_status_command():
     session = get_current_session()
     paused_pairs = get_paused_pairs_by_news(session["pairs_allowed"])
     degraded_pairs, blocked_pairs = get_pair_health_buckets(session["pairs_allowed"])
+    global_degraded_pairs, global_blocked_pairs = get_pair_health_buckets()
     paused_text = ", ".join(paused_pairs[:4]) if paused_pairs else "none"
     if len(paused_pairs) > 4:
         paused_text += f" (+{len(paused_pairs) - 4})"
@@ -1426,6 +1456,18 @@ def _handle_status_command():
             degraded_text += f" (+{len(degraded_pairs) - 3})"
         pair_health_parts.append(f"degraded {degraded_text}")
     pair_health_text = " | ".join(pair_health_parts) if pair_health_parts else "all healthy"
+    global_health_parts = []
+    if global_blocked_pairs:
+        blocked_text = ", ".join(global_blocked_pairs[:3])
+        if len(global_blocked_pairs) > 3:
+            blocked_text += f" (+{len(global_blocked_pairs) - 3})"
+        global_health_parts.append(f"blocked {blocked_text}")
+    if global_degraded_pairs:
+        degraded_text = ", ".join(global_degraded_pairs[:3])
+        if len(global_degraded_pairs) > 3:
+            degraded_text += f" (+{len(global_degraded_pairs) - 3})"
+        global_health_parts.append(f"degraded {degraded_text}")
+    global_health_text = " | ".join(global_health_parts) if global_health_parts else "none"
     scan_mode = _last_scan_pool_status.get("mode", "primary")
     if scan_mode == "fallback":
         scan_pool_text = (
@@ -1442,6 +1484,11 @@ def _handle_status_command():
             f"primary watchlist | active {_last_scan_pool_status.get('active', 0)} | "
             f"healthy {_last_scan_pool_status.get('healthy', 0)} | tradable {_last_scan_pool_status.get('tradable', 0)}"
         )
+    latest_scan_text = (
+        f"active {_last_scan_cycle_summary.get('active', 0)} | "
+        f"healthy {_last_scan_cycle_summary.get('healthy', 0)} | "
+        f"tradable {_last_scan_cycle_summary.get('tradable', 0)}"
+    )
     regime = ('🟢 BULL' if _market_regime_mult < 0.95
               else '🔴 BEAR' if _market_regime_mult > 1.10
               else '⚪ NEUTRAL')
@@ -1455,9 +1502,11 @@ def _handle_status_command():
         f"Open trades: {len(open_trades)}",
         f"Regime: {regime} ({_market_regime_mult:.2f})",
         f"Macro: DXY {f'{_dxy_ema_gap*100:+.2f}%' if _dxy_ema_gap is not None else 'unknown'} | VIX {f'{_vix_level:.1f}' if _vix_level is not None else 'unknown'}",
-        f"📰 News-paused: {paused_text}",
-        f"🩺 Pair health: {pair_health_text}",
+        f"📰 Active news blackouts: {paused_text}",
+        f"🩺 Active pair health: {pair_health_text}",
+        f"🌐 Global pair issues: {global_health_text}",
         f"🔎 Scan pool: {scan_pool_text}",
+        f"🧮 Last scan breadth: {latest_scan_text}",
         f"{status_emoji} Bot: {status_text}",
     ]
     if open_trades:
@@ -1469,7 +1518,7 @@ def _handle_status_command():
             lines.append(f"{direction} {t['instrument']} {t['label']} | {pnl:+.2f}p")
     if _recent_scan_decisions:
         lines.append("")
-        lines.append("🧠 <b>Recent scans</b>")
+        lines.append(f"🧠 <b>Latest scan</b> ({_last_scan_cycle_at or 'n/a'})")
         strategy_labels = {
             "SCALPER": "SCALP",
             "TREND": "TREND",
@@ -1480,9 +1529,15 @@ def _handle_status_command():
             "POST_NEWS": "NEWS",
             "PULLBACK": "PULL",
         }
-        for item in list(_recent_scan_decisions)[-4:]:
+        for item in _recent_scan_decisions:
             label = strategy_labels.get(item['strategy'], item['strategy'])
-            lines.append(f"{item['emoji']} {item['at']} {label} {item['instrument']} | {item['reason']}")
+            instrument = item['instrument']
+            health_suffix = ""
+            if instrument not in {"-", "watchlist"}:
+                health_state = get_pair_health_status(instrument)
+                if health_state != "healthy":
+                    health_suffix = f" | {health_state}"
+            lines.append(f"{item['emoji']} {item['at']} {label} {instrument} | {item['reason']}{health_suffix}")
     telegram("\n".join(lines))
 
 def _handle_metrics_command():
@@ -2045,9 +2100,11 @@ def score_trend(instrument: str, session: dict) -> dict | None:
     df_4h = fetch_candles(instrument, "H4", 60)
 
     if df_1h is None or len(df_1h) < 50:
+        mark_pair_failure(instrument, "insufficient H1 history for trend", "candle", timeframe="H1")
         _set_scan_reject_reason("TREND", instrument, "not enough H1 data")
         return None
     if df_4h is None or len(df_4h) < 30:
+        mark_pair_failure(instrument, "insufficient H4 history for trend", "candle", timeframe="H4")
         _set_scan_reject_reason("TREND", instrument, "not enough H4 data")
         return None
 
@@ -2243,6 +2300,7 @@ def score_breakout(instrument: str, session: dict) -> dict | None:
     df_1h  = fetch_candles(instrument, "H1", 60)
 
     if df_15m is None or len(df_15m) < 40:
+        mark_pair_failure(instrument, "insufficient M15 history for breakout", "candle", timeframe="M15")
         _set_scan_reject_reason("BREAKOUT", instrument, "not enough M15 data")
         return None
 
@@ -2327,6 +2385,7 @@ def score_carry(instrument: str, session: dict) -> dict | None:
 
     df_4h = fetch_candles(instrument, "H4", 60)
     if df_4h is None or len(df_4h) < 30:
+        mark_pair_failure(instrument, "insufficient H4 history for carry", "candle", timeframe="H4")
         _set_scan_reject_reason("CARRY", instrument, "not enough H4 data")
         return None
 
@@ -2497,7 +2556,7 @@ def score_post_news(instrument: str, session: dict) -> dict | None:
     now = datetime.now(timezone.utc)
     matching_events = get_post_news_events_for_instrument(instrument, now)
     if not matching_events:
-        _set_scan_reject_reason("POST_NEWS", instrument, "news window inactive")
+        _set_scan_reject_reason("POST_NEWS", instrument, "no recent high-impact post-news window")
         return None
 
     spread_pips = get_spread_pips(instrument)
@@ -2599,9 +2658,11 @@ def score_pullback(instrument: str, session: dict) -> dict | None:
     df_4h = fetch_candles(instrument, "H4", 60)
 
     if df_1h is None or len(df_1h) < 50:
+        mark_pair_failure(instrument, "insufficient H1 history for pullback", "candle", timeframe="H1")
         _set_scan_reject_reason("PULLBACK", instrument, "not enough H1 data")
         return None
     if df_4h is None or len(df_4h) < 30:
+        mark_pair_failure(instrument, "insufficient H4 history for pullback", "candle", timeframe="H4")
         _set_scan_reject_reason("PULLBACK", instrument, "not enough H4 data")
         return None
 
@@ -3293,8 +3354,10 @@ def run():
 
             # Entry scans
             if entries_allowed and len(open_trades) < MAX_OPEN_TRADES:
+                start_scan_cycle()
                 skip_scalper = is_rollover_window()
                 active_pairs, health_pairs, tradable_pairs, empty_reason = get_effective_scan_pairs(session)
+                set_scan_cycle_summary(len(active_pairs), len(health_pairs), len(tradable_pairs))
 
                 scalper_count  = sum(1 for t in open_trades if t["label"] == "SCALPER")
                 trend_count    = sum(1 for t in open_trades if t["label"] == "TREND")
