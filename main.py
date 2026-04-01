@@ -293,6 +293,8 @@ _macro_filter_mtime  = 0.0
 macro_news           = []
 _macro_news_mtime    = 0.0
 macro_news_pause_until = 0.0
+_recent_scan_decisions = collections.deque(maxlen=8)
+_scan_reject_reasons = {}
 
 _pair_cooldowns      = {}
 _thread_local        = threading.local()
@@ -1019,6 +1021,40 @@ def scanner_log(msg: str):
     _scanner_log_buffer.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}")
     log.info(msg)
 
+
+def record_scan_decision(strategy: str, instrument: str, reason: str, emoji: str) -> None:
+    _recent_scan_decisions.append({
+        "at": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "strategy": strategy,
+        "instrument": instrument,
+        "reason": reason,
+        "emoji": emoji,
+    })
+
+
+def _set_scan_reject_reason(strategy: str, instrument: str, reason: str) -> None:
+    _scan_reject_reasons[(strategy, instrument)] = reason
+
+
+def _pop_scan_reject_reason(strategy: str, instrument: str) -> str | None:
+    return _scan_reject_reasons.pop((strategy, instrument), None)
+
+
+def _find_best_opportunity(strategy: str, pairs: list[str], session: dict, scorer) -> tuple[dict | None, str | None, str | None]:
+    best = None
+    reject_pair = None
+    reject_reason = None
+    for pair in pairs:
+        opp = scorer(pair, session)
+        if opp and (best is None or opp["score"] > best["score"]):
+            best = opp
+            continue
+        reason = _pop_scan_reject_reason(strategy, pair)
+        if reject_reason is None and reason:
+            reject_pair = pair
+            reject_reason = reason
+    return best, reject_pair, reject_reason
+
 _last_telegram_update = 0
 
 def poll_telegram_commands():
@@ -1074,21 +1110,49 @@ def poll_telegram_commands():
 def _handle_status_command():
     acct = get_account_summary()
     session = get_current_session()
+    paused_pairs = get_paused_pairs_by_news(session["pairs_allowed"])
+    paused_text = ", ".join(paused_pairs[:4]) if paused_pairs else "none"
+    if len(paused_pairs) > 4:
+        paused_text += f" (+{len(paused_pairs) - 4})"
+    regime = ('🟢 BULL' if _market_regime_mult < 0.95
+              else '🔴 BEAR' if _market_regime_mult > 1.10
+              else '⚪ NEUTRAL')
+    status_emoji = "⏸️" if _paused else "▶️"
+    status_text = "Paused" if _paused else "Running"
     lines = [
         f"📊 <b>Status</b> | {session['name']}",
         f"━━━━━━━━━━━━━━━",
-        f"Balance: {acct.get('currency', '£')}{acct.get('balance', 0):,.2f}",
-        f"Unrealized: {acct.get('currency', '£')}{acct.get('unrealizedPL', 0):+,.2f}",
+        f"💰 Balance: {acct.get('currency', '£')}{acct.get('balance', 0):,.2f}",
+        f"📉 Unrealized: {acct.get('currency', '£')}{acct.get('unrealizedPL', 0):+,.2f}",
         f"Open trades: {len(open_trades)}",
-        f"Regime: {'🟢 BULL' if _market_regime_mult < 0.95 else '🔴 BEAR' if _market_regime_mult > 1.10 else '⚪ NEUTRAL'} ({_market_regime_mult:.2f})",
-        f"Paused: {'Yes' if _paused else 'No'}",
+        f"Regime: {regime} ({_market_regime_mult:.2f})",
+        f"Macro: DXY {f'{_dxy_ema_gap*100:+.2f}%' if _dxy_ema_gap is not None else 'unknown'} | VIX {f'{_vix_level:.1f}' if _vix_level is not None else 'unknown'}",
+        f"📰 News-paused: {paused_text}",
+        f"{status_emoji} Bot: {status_text}",
     ]
     if open_trades:
         lines.append("")
+        lines.append("📂 <b>Open trades</b>")
         for t in open_trades:
             direction = "🟢" if t.get("direction") == "LONG" else "🔴"
             pnl = t.get("unrealized_pnl", 0)
-            lines.append(f"{direction} {t['instrument']} {t['label']} | {pnl:+.2f}")
+            lines.append(f"{direction} {t['instrument']} {t['label']} | {pnl:+.2f}p")
+    if _recent_scan_decisions:
+        lines.append("")
+        lines.append("🧠 <b>Recent scans</b>")
+        strategy_labels = {
+            "SCALPER": "SCALP",
+            "TREND": "TREND",
+            "REVERSAL": "REV",
+            "BREAKOUT": "BREAK",
+            "CARRY": "CARRY",
+            "ASIAN": "ASIAN",
+            "POST_NEWS": "NEWS",
+            "PULLBACK": "PULL",
+        }
+        for item in list(_recent_scan_decisions)[-4:]:
+            label = strategy_labels.get(item['strategy'], item['strategy'])
+            lines.append(f"{item['emoji']} {item['at']} {label} {item['instrument']} | {item['reason']}")
     telegram("\n".join(lines))
 
 def _handle_metrics_command():
@@ -1540,10 +1604,12 @@ def determine_direction(instrument: str, df_5m: pd.DataFrame,
 def score_scalper(instrument: str, session: dict) -> dict | None:
     spread_pips = get_spread_pips(instrument)
     if spread_pips > SCALPER_MAX_SPREAD_PIPS:
+        _set_scan_reject_reason("SCALPER", instrument, "spread too high")
         return None
 
     df_5m = fetch_candles(instrument, "M5", 60)
     if df_5m is None or len(df_5m) < 30:
+        _set_scan_reject_reason("SCALPER", instrument, "not enough M5 data")
         return None
 
     df_1h = fetch_candles(instrument, "H1", 60)
@@ -1555,6 +1621,7 @@ def score_scalper(instrument: str, session: dict) -> dict | None:
     atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0
 
     if rsi > SCALPER_MAX_RSI or rsi < SCALPER_MIN_RSI:
+        _set_scan_reject_reason("SCALPER", instrument, "RSI out of range")
         return None
 
     ema9  = calc_ema(close, 9)
@@ -1599,6 +1666,7 @@ def score_scalper(instrument: str, session: dict) -> dict | None:
     eff_threshold += _adaptive_offsets.get("SCALPER", 0)
 
     if score < eff_threshold:
+        _set_scan_reject_reason("SCALPER", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
         return None
 
     tp_pips = max(SCALPER_TP_MIN_PIPS, min(SCALPER_TP_MAX_PIPS,
@@ -1630,6 +1698,7 @@ def score_scalper(instrument: str, session: dict) -> dict | None:
 def score_trend(instrument: str, session: dict) -> dict | None:
     spread_pips = get_spread_pips(instrument)
     if spread_pips > TREND_MAX_SPREAD_PIPS:
+        _set_scan_reject_reason("TREND", instrument, "spread too high")
         return None
 
     df_5m = fetch_candles(instrument, "M5", 60)
@@ -1637,8 +1706,10 @@ def score_trend(instrument: str, session: dict) -> dict | None:
     df_4h = fetch_candles(instrument, "H4", 60)
 
     if df_1h is None or len(df_1h) < 50:
+        _set_scan_reject_reason("TREND", instrument, "not enough H1 data")
         return None
     if df_4h is None or len(df_4h) < 30:
+        _set_scan_reject_reason("TREND", instrument, "not enough H4 data")
         return None
 
     close_1h = df_1h["close"]
@@ -1654,6 +1725,7 @@ def score_trend(instrument: str, session: dict) -> dict | None:
 
     aligned = (bullish_4h == bullish_1h)
     if not aligned:
+        _set_scan_reject_reason("TREND", instrument, "H1/H4 trend not aligned")
         return None
 
     direction = "LONG" if bullish_4h else "SHORT"
@@ -1705,6 +1777,7 @@ def score_trend(instrument: str, session: dict) -> dict | None:
     eff_threshold += _adaptive_offsets.get("TREND", 0)
 
     if score < eff_threshold:
+        _set_scan_reject_reason("TREND", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
         return None
 
     tp_pips = max(15, price_to_pips(instrument, atr * TREND_TP_ATR_MULT))
@@ -1731,15 +1804,18 @@ def score_trend(instrument: str, session: dict) -> dict | None:
 def score_reversal(instrument: str, session: dict) -> dict | None:
     spread_pips = get_spread_pips(instrument)
     if spread_pips > REVERSAL_MAX_SPREAD_PIPS:
+        _set_scan_reject_reason("REVERSAL", instrument, "spread too high")
         return None
 
     if session["aggression"] == "MINIMAL":
+        _set_scan_reject_reason("REVERSAL", instrument, "session too quiet")
         return None
 
     df_5m = fetch_candles(instrument, "M5", 60)
     df_1h = fetch_candles(instrument, "H1", 60)
 
     if df_5m is None or len(df_5m) < 30:
+        _set_scan_reject_reason("REVERSAL", instrument, "not enough M5 data")
         return None
 
     close = df_5m["close"]
@@ -1748,6 +1824,7 @@ def score_reversal(instrument: str, session: dict) -> dict | None:
     is_oversold  = rsi <= REVERSAL_RSI_OVERSOLD
     is_overbought = rsi >= REVERSAL_RSI_OVERBOUGHT
     if not (is_oversold or is_overbought):
+        _set_scan_reject_reason("REVERSAL", instrument, "RSI not stretched")
         return None
 
     direction = "LONG" if is_oversold else "SHORT"
@@ -1792,6 +1869,7 @@ def score_reversal(instrument: str, session: dict) -> dict | None:
     eff_threshold += _adaptive_offsets.get("REVERSAL", 0)
 
     if score < eff_threshold:
+        _set_scan_reject_reason("REVERSAL", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
         return None
 
     tp_pips = max(8,  price_to_pips(instrument, atr * REVERSAL_TP_ATR_MULT))
@@ -1815,20 +1893,24 @@ def score_reversal(instrument: str, session: dict) -> dict | None:
 def score_breakout(instrument: str, session: dict) -> dict | None:
     spread_pips = get_spread_pips(instrument)
     if spread_pips > BREAKOUT_MAX_SPREAD_PIPS:
+        _set_scan_reject_reason("BREAKOUT", instrument, "spread too high")
         return None
 
     if session["aggression"] in ("MINIMAL", "LOW"):
+        _set_scan_reject_reason("BREAKOUT", instrument, "session not active enough")
         return None
 
     df_15m = fetch_candles(instrument, "M15", 80)
     df_1h  = fetch_candles(instrument, "H1", 60)
 
     if df_15m is None or len(df_15m) < 40:
+        _set_scan_reject_reason("BREAKOUT", instrument, "not enough M15 data")
         return None
 
     squeeze = keltner_squeeze(df_15m)
 
     if not squeeze["in_squeeze"] and squeeze["squeeze_bars"] < 5:
+        _set_scan_reject_reason("BREAKOUT", instrument, "no squeeze")
         return None
 
     score = 0
@@ -1862,6 +1944,7 @@ def score_breakout(instrument: str, session: dict) -> dict | None:
     eff_threshold += _adaptive_offsets.get("BREAKOUT", 0)
 
     if score < eff_threshold:
+        _set_scan_reject_reason("BREAKOUT", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
         return None
 
     tp_pips = max(15, price_to_pips(instrument, atr * BREAKOUT_TP_ATR_MULT))
@@ -1887,20 +1970,25 @@ def score_breakout(instrument: str, session: dict) -> dict | None:
 def score_carry(instrument: str, session: dict) -> dict | None:
     """Carry trade: long high-yield vs low-yield in quiet markets."""
     if _market_regime_mult > 1.05:
+        _set_scan_reject_reason("CARRY", instrument, "regime too hot")
         return None
     if _vix_level is not None and _vix_level > CARRY_VIX_MAX:
+        _set_scan_reject_reason("CARRY", instrument, "VIX too high")
         return None
 
     bias = macro_filters.get(instrument.upper())
     if bias != "LONG_ONLY":
+        _set_scan_reject_reason("CARRY", instrument, "no long carry bias")
         return None
 
     spread_pips = get_spread_pips(instrument)
     if spread_pips > CARRY_MAX_SPREAD_PIPS:
+        _set_scan_reject_reason("CARRY", instrument, "spread too high")
         return None
 
     df_4h = fetch_candles(instrument, "H4", 60)
     if df_4h is None or len(df_4h) < 30:
+        _set_scan_reject_reason("CARRY", instrument, "not enough H4 data")
         return None
 
     close_4h = df_4h["close"]
@@ -1909,6 +1997,7 @@ def score_carry(instrument: str, session: dict) -> dict | None:
 
     bullish = float(ema20_4h.iloc[-1]) > float(ema50_4h.iloc[-1])
     if not bullish:
+        _set_scan_reject_reason("CARRY", instrument, "4H trend not up")
         return None
 
     score = 0
@@ -1939,6 +2028,7 @@ def score_carry(instrument: str, session: dict) -> dict | None:
     eff_threshold += _adaptive_offsets.get("CARRY", 0)
 
     if score < eff_threshold:
+        _set_scan_reject_reason("CARRY", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
         return None
 
     tp_pips = max(15, price_to_pips(instrument, atr * CARRY_TP_ATR_MULT))
@@ -1962,14 +2052,17 @@ def score_carry(instrument: str, session: dict) -> dict | None:
 def score_asian_fade(instrument: str, session: dict) -> dict | None:
     """Mean-reversion fade at the edges of the developing Asian range."""
     if session["name"] != "TOKYO":
+        _set_scan_reject_reason("ASIAN_FADE", instrument, "Tokyo only")
         return None
 
     spread_pips = get_spread_pips(instrument)
     if spread_pips > ASIAN_FADE_MAX_SPREAD_PIPS:
+        _set_scan_reject_reason("ASIAN_FADE", instrument, "spread too high")
         return None
 
     df_5m = fetch_candles(instrument, "M5", 60)
     if df_5m is None or len(df_5m) < 30:
+        _set_scan_reject_reason("ASIAN_FADE", instrument, "not enough M5 data")
         return None
 
     close = df_5m["close"]
@@ -1978,6 +2071,7 @@ def score_asian_fade(instrument: str, session: dict) -> dict | None:
     is_oversold = rsi <= ASIAN_FADE_RSI_LOW
     is_overbought = rsi >= ASIAN_FADE_RSI_HIGH
     if not (is_oversold or is_overbought):
+        _set_scan_reject_reason("ASIAN_FADE", instrument, "RSI not stretched")
         return None
 
     direction = "LONG" if is_oversold else "SHORT"
@@ -1996,6 +2090,7 @@ def score_asian_fade(instrument: str, session: dict) -> dict | None:
     elif is_overbought and price >= bb["upper"] * 0.999:
         score += 15
     else:
+        _set_scan_reject_reason("ASIAN_FADE", instrument, "not at range edge")
         return None
 
     if is_oversold:
@@ -2029,6 +2124,7 @@ def score_asian_fade(instrument: str, session: dict) -> dict | None:
     eff_threshold += _adaptive_offsets.get("ASIAN_FADE", 0)
 
     if score < eff_threshold:
+        _set_scan_reject_reason("ASIAN_FADE", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
         return None
 
     tp_pips = max(5, min(20, price_to_pips(instrument, atr * ASIAN_FADE_TP_ATR_MULT)))
@@ -2056,19 +2152,23 @@ def score_asian_fade(instrument: str, session: dict) -> dict | None:
 def score_post_news(instrument: str, session: dict) -> dict | None:
     """Momentum breakout in the first minutes after a high-impact news pause."""
     if not macro_news:
+        _set_scan_reject_reason("POST_NEWS", instrument, "no macro news loaded")
         return None
 
     now = datetime.now(timezone.utc)
     matching_events = get_post_news_events_for_instrument(instrument, now)
     if not matching_events:
+        _set_scan_reject_reason("POST_NEWS", instrument, "news window inactive")
         return None
 
     spread_pips = get_spread_pips(instrument)
     if spread_pips > POST_NEWS_MAX_SPREAD_PIPS:
+        _set_scan_reject_reason("POST_NEWS", instrument, "spread too high")
         return None
 
     df_5m = fetch_candles(instrument, "M5", 30)
     if df_5m is None or len(df_5m) < 10:
+        _set_scan_reject_reason("POST_NEWS", instrument, "not enough M5 data")
         return None
 
     close = df_5m["close"]
@@ -2082,6 +2182,7 @@ def score_post_news(instrument: str, session: dict) -> dict | None:
     broke_high = current_close > pre_news_high
     broke_low = current_close < pre_news_low
     if not (broke_high or broke_low):
+        _set_scan_reject_reason("POST_NEWS", instrument, "no breakout yet")
         return None
 
     direction = "LONG" if broke_high else "SHORT"
@@ -2119,6 +2220,7 @@ def score_post_news(instrument: str, session: dict) -> dict | None:
     eff_threshold += _adaptive_offsets.get("POST_NEWS", 0)
 
     if score < eff_threshold:
+        _set_scan_reject_reason("POST_NEWS", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
         return None
 
     tp_pips = max(10, price_to_pips(instrument, atr * POST_NEWS_TP_ATR_MULT))
@@ -2147,17 +2249,21 @@ def score_pullback(instrument: str, session: dict) -> dict | None:
     """Trend continuation: buy the dip / sell the rally in a strong trend."""
     spread_pips = get_spread_pips(instrument)
     if spread_pips > PULLBACK_MAX_SPREAD_PIPS:
+        _set_scan_reject_reason("PULLBACK", instrument, "spread too high")
         return None
 
     if session["aggression"] == "MINIMAL":
+        _set_scan_reject_reason("PULLBACK", instrument, "session too quiet")
         return None
 
     df_1h = fetch_candles(instrument, "H1", 100)
     df_4h = fetch_candles(instrument, "H4", 60)
 
     if df_1h is None or len(df_1h) < 50:
+        _set_scan_reject_reason("PULLBACK", instrument, "not enough H1 data")
         return None
     if df_4h is None or len(df_4h) < 30:
+        _set_scan_reject_reason("PULLBACK", instrument, "not enough H4 data")
         return None
 
     close_4h = df_4h["close"]
@@ -2170,6 +2276,7 @@ def score_pullback(instrument: str, session: dict) -> dict | None:
 
     ema50_gap = abs(float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1)
     if ema50_gap < 0.002:
+        _set_scan_reject_reason("PULLBACK", instrument, "4H trend too weak")
         return None
 
     direction = "LONG" if bullish_4h else "SHORT"
@@ -2183,13 +2290,17 @@ def score_pullback(instrument: str, session: dict) -> dict | None:
 
     if direction == "LONG":
         if current_price > ema20_val:
+            _set_scan_reject_reason("PULLBACK", instrument, "no dip yet")
             return None
         if pullback_depth > 2.0:
+            _set_scan_reject_reason("PULLBACK", instrument, "pullback too deep")
             return None
     else:
         if current_price < ema20_val:
+            _set_scan_reject_reason("PULLBACK", instrument, "no rally yet")
             return None
         if pullback_depth > 2.0:
+            _set_scan_reject_reason("PULLBACK", instrument, "pullback too deep")
             return None
 
     score = 0
@@ -2208,6 +2319,7 @@ def score_pullback(instrument: str, session: dict) -> dict | None:
     elif direction == "SHORT" and rsi_1h > 55:
         score += min(15, (rsi_1h - 55) * 1.5)
     else:
+        _set_scan_reject_reason("PULLBACK", instrument, "RSI not supportive")
         return None
 
     macd_1h = calc_macd(df_1h)
@@ -2226,6 +2338,7 @@ def score_pullback(instrument: str, session: dict) -> dict | None:
     eff_threshold += _adaptive_offsets.get("PULLBACK", 0)
 
     if score < eff_threshold:
+        _set_scan_reject_reason("PULLBACK", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
         return None
 
     tp_pips = max(12, price_to_pips(instrument, atr * PULLBACK_TP_ATR_MULT))
@@ -2254,7 +2367,7 @@ def score_pullback(instrument: str, session: dict) -> dict | None:
 #  ENTRY & EXIT MANAGEMENT (unchanged)
 # ═══════════════════════════════════════════════════════════════
 
-def check_correlation_limit(instrument: str, direction: str) -> bool:
+def _would_breach_correlation_limit(instrument: str, direction: str) -> tuple[bool, int, int]:
     base, quote = instrument.split("_")
     usd_long = 0
     usd_short = 0
@@ -2283,23 +2396,39 @@ def check_correlation_limit(instrument: str, direction: str) -> bool:
         else:
             usd_short += 1
 
-    if max(usd_long, usd_short) > MAX_CORRELATED_TRADES:
+    return max(usd_long, usd_short) > MAX_CORRELATED_TRADES, usd_long, usd_short
+
+
+def check_correlation_limit(instrument: str, direction: str) -> bool:
+    breached, usd_long, usd_short = _would_breach_correlation_limit(instrument, direction)
+
+    if breached:
         log.info(f"[CORR] Skip {instrument} {direction} — USD exposure limit "
                  f"(long={usd_long}, short={usd_short})")
         return False
     return True
 
+
+def get_entry_block_reason(instrument: str, direction: str) -> str | None:
+    if time.time() < _pair_cooldowns.get(instrument, 0):
+        return "cooldown"
+    if any(t["instrument"] == instrument for t in open_trades):
+        return "pair already open"
+    breached, _, _ = _would_breach_correlation_limit(instrument, direction)
+    if breached:
+        return "correlation limit"
+    price_data = get_current_price(instrument)
+    entry_price = price_data["ask"] if direction == "LONG" else price_data["bid"]
+    if entry_price <= 0:
+        return "no live price"
+    return None
+
 def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     instrument = opp["instrument"]
     direction  = opp["direction"]
 
-    if time.time() < _pair_cooldowns.get(instrument, 0):
-        return None
-
-    if any(t["instrument"] == instrument for t in open_trades):
-        return None
-
-    if not check_correlation_limit(instrument, direction):
+    block_reason = get_entry_block_reason(instrument, direction)
+    if block_reason is not None:
         return None
 
     kelly_gap = opp["score"] - {"SCALPER": SCALPER_THRESHOLD, "TREND": TREND_THRESHOLD,
@@ -2831,114 +2960,138 @@ def run():
                 breakout_count = sum(1 for t in open_trades if t["label"] == "BREAKOUT")
 
                 if scalper_count < SCALPER_MAX_TRADES and not skip_scalper:
-                    best_scalper = None
-                    for pair in tradable_pairs:
-                        opp = score_scalper(pair, session)
-                        if opp and (best_scalper is None or opp["score"] > best_scalper["score"]):
-                            best_scalper = opp
-                    if best_scalper:
+                    best_scalper, reject_pair, reject_reason = _find_best_opportunity("SCALPER", tradable_pairs, session, score_scalper)
+                    if not tradable_pairs:
+                        record_scan_decision("SCALPER", "-", "paused by news", "📰")
+                    elif best_scalper:
                         scanner_log(f"📊 [SCALPER] Best: {best_scalper['instrument']} | "
                                     f"Score: {best_scalper['score']:.0f} | "
                                     f"{best_scalper['direction']} | RSI: {best_scalper['rsi']:.0f}")
                         trade = open_trade_entry(best_scalper, "SCALPER", balance)
                         if trade:
                             open_trades.append(trade)
+                        else:
+                            reason = get_entry_block_reason(best_scalper["instrument"], best_scalper["direction"]) or "entry blocked"
+                            record_scan_decision("SCALPER", best_scalper["instrument"], reason, "🚫")
+                    else:
+                        record_scan_decision("SCALPER", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
 
                 if trend_count < TREND_MAX_TRADES and session["aggression"] != "MINIMAL":
-                    best_trend = None
-                    for pair in tradable_pairs:
-                        opp = score_trend(pair, session)
-                        if opp and (best_trend is None or opp["score"] > best_trend["score"]):
-                            best_trend = opp
-                    if best_trend:
+                    best_trend, reject_pair, reject_reason = _find_best_opportunity("TREND", tradable_pairs, session, score_trend)
+                    if not tradable_pairs:
+                        record_scan_decision("TREND", "-", "paused by news", "📰")
+                    elif best_trend:
                         scanner_log(f"📈 [TREND] Best: {best_trend['instrument']} | "
                                     f"Score: {best_trend['score']:.0f} | {best_trend['direction']}")
                         trade = open_trade_entry(best_trend, "TREND", balance)
                         if trade:
                             open_trades.append(trade)
+                        else:
+                            reason = get_entry_block_reason(best_trend["instrument"], best_trend["direction"]) or "entry blocked"
+                            record_scan_decision("TREND", best_trend["instrument"], reason, "🚫")
+                    else:
+                        record_scan_decision("TREND", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
 
                 if reversal_count < REVERSAL_MAX_TRADES:
-                    best_reversal = None
-                    for pair in tradable_pairs:
-                        opp = score_reversal(pair, session)
-                        if opp and (best_reversal is None or opp["score"] > best_reversal["score"]):
-                            best_reversal = opp
-                    if best_reversal:
+                    best_reversal, reject_pair, reject_reason = _find_best_opportunity("REVERSAL", tradable_pairs, session, score_reversal)
+                    if not tradable_pairs:
+                        record_scan_decision("REVERSAL", "-", "paused by news", "📰")
+                    elif best_reversal:
                         scanner_log(f"🔄 [REVERSAL] Best: {best_reversal['instrument']} | "
                                     f"Score: {best_reversal['score']:.0f} | {best_reversal['direction']}")
                         trade = open_trade_entry(best_reversal, "REVERSAL", balance)
                         if trade:
                             open_trades.append(trade)
+                        else:
+                            reason = get_entry_block_reason(best_reversal["instrument"], best_reversal["direction"]) or "entry blocked"
+                            record_scan_decision("REVERSAL", best_reversal["instrument"], reason, "🚫")
+                    else:
+                        record_scan_decision("REVERSAL", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
 
                 if breakout_count < BREAKOUT_MAX_TRADES and session["aggression"] in ("HIGH",):
-                    best_breakout = None
-                    for pair in tradable_pairs:
-                        opp = score_breakout(pair, session)
-                        if opp and (best_breakout is None or opp["score"] > best_breakout["score"]):
-                            best_breakout = opp
-                    if best_breakout:
+                    best_breakout, reject_pair, reject_reason = _find_best_opportunity("BREAKOUT", tradable_pairs, session, score_breakout)
+                    if not tradable_pairs:
+                        record_scan_decision("BREAKOUT", "-", "paused by news", "📰")
+                    elif best_breakout:
                         scanner_log(f"💥 [BREAKOUT] Best: {best_breakout['instrument']} | "
                                     f"Score: {best_breakout['score']:.0f} | {best_breakout['direction']}")
                         trade = open_trade_entry(best_breakout, "BREAKOUT", balance)
                         if trade:
                             open_trades.append(trade)
+                        else:
+                            reason = get_entry_block_reason(best_breakout["instrument"], best_breakout["direction"]) or "entry blocked"
+                            record_scan_decision("BREAKOUT", best_breakout["instrument"], reason, "🚫")
+                    else:
+                        record_scan_decision("BREAKOUT", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
 
                 # ── New FX strategies ────────────────────────────
                 carry_count = sum(1 for t in open_trades if t["label"] == "CARRY")
                 if carry_count < CARRY_MAX_TRADES:
-                    best_carry = None
-                    for pair in tradable_pairs:
-                        opp = score_carry(pair, session)
-                        if opp and (best_carry is None or opp["score"] > best_carry["score"]):
-                            best_carry = opp
-                    if best_carry:
+                    best_carry, reject_pair, reject_reason = _find_best_opportunity("CARRY", tradable_pairs, session, score_carry)
+                    if not tradable_pairs:
+                        record_scan_decision("CARRY", "-", "paused by news", "📰")
+                    elif best_carry:
                         scanner_log(f"💰 [CARRY] Best: {best_carry['instrument']} | "
                                     f"Score: {best_carry['score']:.0f} | {best_carry['direction']}")
                         trade = open_trade_entry(best_carry, "CARRY", balance)
                         if trade:
                             open_trades.append(trade)
+                        else:
+                            reason = get_entry_block_reason(best_carry["instrument"], best_carry["direction"]) or "entry blocked"
+                            record_scan_decision("CARRY", best_carry["instrument"], reason, "🚫")
+                    else:
+                        record_scan_decision("CARRY", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
 
                 asian_fade_count = sum(1 for t in open_trades if t["label"] == "ASIAN_FADE")
                 if asian_fade_count < ASIAN_FADE_MAX_TRADES and session["name"] == "TOKYO":
-                    best_asian = None
-                    for pair in tradable_pairs:
-                        opp = score_asian_fade(pair, session)
-                        if opp and (best_asian is None or opp["score"] > best_asian["score"]):
-                            best_asian = opp
-                    if best_asian:
+                    best_asian, reject_pair, reject_reason = _find_best_opportunity("ASIAN_FADE", tradable_pairs, session, score_asian_fade)
+                    if not tradable_pairs:
+                        record_scan_decision("ASIAN", "-", "paused by news", "📰")
+                    elif best_asian:
                         scanner_log(f"🌙 [ASIAN_FADE] Best: {best_asian['instrument']} | "
                                     f"Score: {best_asian['score']:.0f} | {best_asian['direction']}")
                         trade = open_trade_entry(best_asian, "ASIAN_FADE", balance)
                         if trade:
                             open_trades.append(trade)
+                        else:
+                            reason = get_entry_block_reason(best_asian["instrument"], best_asian["direction"]) or "entry blocked"
+                            record_scan_decision("ASIAN", best_asian["instrument"], reason, "🚫")
+                    else:
+                        record_scan_decision("ASIAN", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
 
                 post_news_count = sum(1 for t in open_trades if t["label"] == "POST_NEWS")
                 if post_news_count < POST_NEWS_MAX_TRADES:
-                    best_pn = None
-                    for pair in tradable_pairs:
-                        opp = score_post_news(pair, session)
-                        if opp and (best_pn is None or opp["score"] > best_pn["score"]):
-                            best_pn = opp
-                    if best_pn:
+                    best_pn, reject_pair, reject_reason = _find_best_opportunity("POST_NEWS", tradable_pairs, session, score_post_news)
+                    if not tradable_pairs:
+                        record_scan_decision("POST_NEWS", "-", "paused by news", "📰")
+                    elif best_pn:
                         scanner_log(f"📰 [POST_NEWS] Best: {best_pn['instrument']} | "
                                     f"Score: {best_pn['score']:.0f} | {best_pn['direction']}")
                         trade = open_trade_entry(best_pn, "POST_NEWS", balance)
                         if trade:
                             open_trades.append(trade)
+                        else:
+                            reason = get_entry_block_reason(best_pn["instrument"], best_pn["direction"]) or "entry blocked"
+                            record_scan_decision("POST_NEWS", best_pn["instrument"], reason, "🚫")
+                    else:
+                        record_scan_decision("POST_NEWS", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
 
                 pullback_count = sum(1 for t in open_trades if t["label"] == "PULLBACK")
                 if pullback_count < PULLBACK_MAX_TRADES and session["aggression"] != "MINIMAL":
-                    best_pb = None
-                    for pair in tradable_pairs:
-                        opp = score_pullback(pair, session)
-                        if opp and (best_pb is None or opp["score"] > best_pb["score"]):
-                            best_pb = opp
-                    if best_pb:
+                    best_pb, reject_pair, reject_reason = _find_best_opportunity("PULLBACK", tradable_pairs, session, score_pullback)
+                    if not tradable_pairs:
+                        record_scan_decision("PULLBACK", "-", "paused by news", "📰")
+                    elif best_pb:
                         scanner_log(f"📐 [PULLBACK] Best: {best_pb['instrument']} | "
                                     f"Score: {best_pb['score']:.0f} | {best_pb['direction']}")
                         trade = open_trade_entry(best_pb, "PULLBACK", balance)
                         if trade:
                             open_trades.append(trade)
+                        else:
+                            reason = get_entry_block_reason(best_pb["instrument"], best_pb["direction"]) or "entry blocked"
+                            record_scan_decision("PULLBACK", best_pb["instrument"], reason, "🚫")
+                    else:
+                        record_scan_decision("PULLBACK", reject_pair or "watchlist", reject_reason or "no setup", "🔍")
 
             if len(trade_history) % 10 == 0 and len(trade_history) > 0:
                 update_adaptive_thresholds()
