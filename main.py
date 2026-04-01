@@ -1482,6 +1482,32 @@ def poll_telegram_commands():
 def _handle_status_command():
     acct = get_account_summary()
     session = get_current_session()
+    live_unrealized = 0.0
+    live_unrealized_pips = 0.0
+    for trade in open_trades:
+        price_data = get_current_price(trade["instrument"])
+        mark_price = price_data["bid"] if trade.get("direction") == "LONG" else price_data["ask"]
+        if mark_price <= 0:
+            continue
+        entry_price = float(trade.get("entry_price", 0))
+        if entry_price <= 0:
+            continue
+        ps = pip_size(trade["instrument"])
+        if trade.get("direction") == "LONG":
+            pnl_pips = (mark_price - entry_price) / ps
+        else:
+            pnl_pips = (entry_price - mark_price) / ps
+        trade["unrealized_pnl"] = round(pnl_pips, 1)
+        live_unrealized_pips += pnl_pips
+        live_unrealized += pnl_pips * pip_value(trade["instrument"], trade.get("units", 1))
+
+    broker_unrealized = float(acct.get("unrealizedPL", 0))
+    currency = acct.get("currency", "GBP")
+    if open_trades:
+        unrealized_text = f"{currency}{broker_unrealized:+,.2f} | live {live_unrealized_pips:+.1f}p"
+    else:
+        unrealized_text = f"{currency}{broker_unrealized:+,.2f}"
+
     paused_pairs = get_paused_pairs_by_news(session["pairs_allowed"])
     degraded_pairs, blocked_pairs = get_pair_health_buckets(session["pairs_allowed"])
     global_degraded_pairs, global_blocked_pairs = get_pair_health_buckets()
@@ -1544,7 +1570,7 @@ def _handle_status_command():
         f"📊 <b>Status</b> | {session['name']}",
         f"━━━━━━━━━━━━━━━",
         f"💰 Balance: {acct.get('currency', '£')}{acct.get('balance', 0):,.2f}",
-        f"📉 Unrealized: {acct.get('currency', '£')}{acct.get('unrealizedPL', 0):+,.2f}",
+        f"📉 Unrealized: {unrealized_text}",
         f"Open trades: {len(open_trades)}",
         f"Regime: {regime} ({_market_regime_mult:.2f})",
         f"Macro: DXY {f'{_dxy_ema_gap*100:+.2f}%' if _dxy_ema_gap is not None else 'unknown'} | VIX {f'{_vix_level:.1f}' if _vix_level is not None else 'unknown'}",
