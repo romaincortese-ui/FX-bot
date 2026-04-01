@@ -711,5 +711,26 @@ def run() -> None:
     log.info("Macro engine finished")
 
 
+def _seconds_until_next_utc_midnight() -> float:
+    now = datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (tomorrow - now).total_seconds()
+
+
+def main() -> None:
+    import time
+
+    while True:
+        try:
+            run()
+        except Exception:
+            log.exception("Macro engine run failed")
+
+        sleep_secs = _seconds_until_next_utc_midnight()
+        sleep_hours = sleep_secs / 3600
+        log.info(f"Sleeping until next UTC midnight ({sleep_hours:.2f}h)")
+        time.sleep(sleep_secs)
+
+
 if __name__ == "__main__":
-    run()
+    main()
