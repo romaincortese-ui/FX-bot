@@ -3235,6 +3235,7 @@ def get_entry_block_reason(instrument: str, direction: str) -> str | None:
 def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     instrument = opp["instrument"]
     direction  = opp["direction"]
+    acct = get_account_summary()
 
     block_reason = get_entry_block_reason(instrument, direction)
     if block_reason is not None:
@@ -3249,7 +3250,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
                   else KELLY_MULT_SOLID if kelly_gap >= 10
                   else KELLY_MULT_MARGINAL)
 
-    account_currency = get_account_currency()
+    account_currency = acct.get("currency", get_account_currency())
     units = calculate_units(instrument, balance, opp["sl_pips"],
                            MAX_RISK_PER_TRADE, kelly_mult, account_currency)
 
@@ -3259,6 +3260,14 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     if entry_price <= 0:
         log.error(f"[{label}] No valid price for {instrument}")
         return None
+
+    if uses_oanda_native_units():
+        budget_preview = estimate_trade_budget(instrument, units, entry_price, account_currency)
+        margin_required = budget_preview.get("margin_account")
+        margin_available = float(acct.get("marginAvailable", 0) or 0)
+        if margin_required is not None and margin_available > 0 and margin_required > margin_available:
+            log.info(f"[{label}] Skip {instrument} {direction} — insufficient margin available ({margin_required:.2f} > {margin_available:.2f} {account_currency})")
+            return None
 
     ps = pip_size(instrument)
     if direction == "LONG":
@@ -3314,7 +3323,6 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     save_state()
 
     session = get_current_session()
-    acct = get_account_summary()
     account_currency = acct.get("currency", account_currency)
     nav_value = float(acct.get("NAV", balance) or balance or 0)
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
