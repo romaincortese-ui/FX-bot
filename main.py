@@ -1654,15 +1654,25 @@ def _find_best_opportunity(strategy: str, pairs: list[str], session: dict, score
     best = None
     reject_pair = None
     reject_reason = None
+    blocked_pair = None
+    blocked_reason = None
     for pair in pairs:
         opp = scorer(pair, session)
-        if opp and (best is None or opp["score"] > best["score"]):
-            best = opp
+        if opp:
+            block_reason = get_entry_block_reason(opp["instrument"], opp["direction"])
+            if block_reason is None:
+                if best is None or opp["score"] > best["score"]:
+                    best = opp
+            elif blocked_reason is None:
+                blocked_pair = opp["instrument"]
+                blocked_reason = block_reason
             continue
         reason = _pop_scan_reject_reason(strategy, pair)
         if reject_reason is None and reason:
             reject_pair = pair
             reject_reason = reason
+    if best is None and blocked_reason is not None:
+        return None, blocked_pair, blocked_reason
     return best, reject_pair, reject_reason
 
 _last_telegram_update = 0
