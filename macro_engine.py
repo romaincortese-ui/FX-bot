@@ -62,6 +62,15 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    yf = None  # type: ignore
+    YFINANCE_AVAILABLE = False
+    log.warning("yfinance is not installed; DXY/VIX momentum will fallback to environment variables when available.")
+
+
 def parse_float_env(name: str) -> Optional[float]:
     value = os.getenv(name)
     if value is None or value.strip() == "":
@@ -157,10 +166,7 @@ def fetch_oanda_daily_pct_change(instrument: str) -> Optional[float]:
 
 
 def fetch_yfinance_daily_pct_change(ticker: str) -> Optional[float]:
-    try:
-        import yfinance as yf
-    except ImportError:
-        log.warning("yfinance is not installed. Install it with pip install yfinance")
+    if not YFINANCE_AVAILABLE or yf is None:
         return None
 
     try:
@@ -364,18 +370,31 @@ def load_forex_factory_news() -> List[dict]:
         return []
 
     events: List[dict] = []
-    today = datetime.now(timezone.utc).date()
+    # Allow a configurable lookback window (in days) for news events
+    news_lookback_days = int(os.getenv("NEWS_LOOKBACK_DAYS", "1"))
+    now_utc = datetime.now(timezone.utc)
+    min_date = (now_utc - timedelta(days=news_lookback_days)).date()
+    max_date = now_utc.date()
     for item in root.findall('.//item'):
         title = item.findtext('title', default='').strip()
         link = item.findtext('link', default='').strip()
         description = item.findtext('description', default='').strip()
         raw_time = item.findtext('pubDate', default='').strip()
+        event_time = None
         try:
             event_time = parsedate_to_datetime(raw_time).astimezone(timezone.utc)
         except Exception:
-            event_time = None
+            # Try parsing with datetime.fromisoformat as fallback
+            try:
+                event_time = datetime.fromisoformat(raw_time)
+                if event_time.tzinfo is None:
+                    event_time = event_time.replace(tzinfo=timezone.utc)
+                event_time = event_time.astimezone(timezone.utc)
+            except Exception:
+                event_time = None
 
-        if event_time is None or event_time.date() != today:
+        # Accept events within the lookback window
+        if event_time is None or not (min_date <= event_time.date() <= max_date):
             continue
 
         pause_start = event_time - timedelta(minutes=NEWS_PAUSE_BEFORE_MINUTES)
@@ -395,9 +414,9 @@ def load_forex_factory_news() -> List[dict]:
         })
 
     if events:
-        log.info(f"Successfully loaded {len(events)} news events from economic calendar XML.")
+        log.info(f"Successfully loaded {len(events)} news events from economic calendar XML (lookback {news_lookback_days}d).")
     else:
-        log.info("No economic calendar events found for today.")
+        log.info("No economic calendar events found in lookback window.")
     return events
 
 
@@ -580,13 +599,20 @@ def generate_macro_filters() -> Dict[str, str]:
     esi = load_economic_surprise()
     liquidity = load_liquidity_risk()
 
-    rate_bias = build_rate_bias(rates)
+    # Biases are merged lowest-to-highest priority. Later sources overwrite earlier
+    # ones for the same symbol.  Order: ESI → Commodities → Market Index → Rates → Liquidity
+    #   - ESI:        noisiest signal, easily overridden
+    #   - Commodities: medium-term, commodity-linked pairs
+    #   - Market Index: DXY/VIX momentum, strong but short-term
+    #   - Rates:       interest-rate differentials, primary FX fundamental driver
+    #   - Liquidity:   safety circuit-breaker, always gets the final say
+    esi_bias = build_esi_bias(esi)
     commodity_bias = build_commodity_bias(momentum)
     market_bias = build_market_index_bias(momentum)
-    esi_bias = build_esi_bias(esi)
+    rate_bias = build_rate_bias(rates)
     liquidity_bias = build_liquidity_bias(liquidity)
 
-    filters = merge_biases(rate_bias, commodity_bias, market_bias, esi_bias, liquidity_bias)
+    filters = merge_biases(esi_bias, commodity_bias, market_bias, rate_bias, liquidity_bias)
     if filters:
         log.info(f"Generated macro filter values: {filters}")
     else:
