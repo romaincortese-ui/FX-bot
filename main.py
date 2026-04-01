@@ -336,10 +336,35 @@ def price_to_pips(instrument: str, price_diff: float) -> float:
 def pips_to_price(instrument: str, pips: float) -> float:
     return pips * pip_size(instrument)
 
+
+def uses_oanda_native_units() -> bool:
+    return bool(OANDA_API_KEY and OANDA_ACCOUNT_ID and not PAPER_TRADE)
+
 def pip_value(instrument: str, units: float, account_currency: str = "GBP") -> float:
-    if ACCOUNT_TYPE == "spread_bet":
+    if ACCOUNT_TYPE == "spread_bet" and not uses_oanda_native_units():
         return abs(units)
     return abs(units) * pip_size(instrument)
+
+
+def _extract_oanda_error_message(payload: dict | None, fallback_text: str = "") -> str:
+    if not isinstance(payload, dict):
+        return fallback_text[:300]
+
+    reject = payload.get("orderRejectTransaction") or payload.get("orderCancelTransaction") or {}
+    fields = [
+        reject.get("rejectReason"),
+        reject.get("reason"),
+        payload.get("errorMessage"),
+        payload.get("message"),
+        fallback_text,
+    ]
+    for field in fields:
+        if field:
+            return str(field)[:300]
+    try:
+        return json.dumps(payload)[:300]
+    except Exception:
+        return fallback_text[:300]
 
 
 def _default_pair_health() -> dict:
@@ -898,8 +923,16 @@ def oanda_post(path: str, data: dict) -> dict:
                 time.sleep((2 ** attempt) * HTTP_RETRY_DELAY)
                 continue
             if r.status_code >= 400:
-                error_body = r.text[:500]
+                try:
+                    payload = r.json()
+                except ValueError:
+                    payload = {}
+                error_body = _extract_oanda_error_message(payload, r.text[:500])
                 log.error(f"OANDA POST {path} error {r.status_code}: {error_body}")
+                if payload:
+                    payload["error"] = error_body
+                    payload["status_code"] = r.status_code
+                    return payload
                 return {"error": error_body, "status_code": r.status_code}
             return r.json()
         except (requests.ConnectionError, requests.Timeout) as e:
@@ -1049,13 +1082,13 @@ def calculate_units(instrument: str, balance: float, sl_pips: float,
     risk_amount = balance * risk_pct * kelly_mult
     if sl_pips <= 0:
         sl_pips = 10
-    if ACCOUNT_TYPE == "spread_bet":
+    if ACCOUNT_TYPE == "spread_bet" and not uses_oanda_native_units():
         stake = risk_amount / sl_pips
         return max(SPREAD_BET_MIN_STAKE, round(stake, 2))
     else:
         pv = pip_size(instrument)
         units = risk_amount / (sl_pips * pv)
-        return round(units)
+        return max(1, int(round(units)))
 
 def place_order(instrument: str, units: float, direction: str,
                 tp_price: float = None, sl_price: float = None,
@@ -1075,9 +1108,8 @@ def place_order(instrument: str, units: float, direction: str,
             "trailing_sl_pips": trailing_sl_pips,
         }
 
-    signed_units = units if direction == "LONG" else -units
-    if ACCOUNT_TYPE == "spread_bet":
-        signed_units = str(signed_units)
+    native_units = max(1, int(round(abs(units))))
+    signed_units = native_units if direction == "LONG" else -native_units
 
     order_body = {
         "order": {
@@ -1108,11 +1140,12 @@ def place_order(instrument: str, units: float, direction: str,
 
     result = oanda_post(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", order_body)
 
-    if "error" in result:
-        log.error(f"[{label}] Order failed: {result['error']}")
+    if "error" in result or result.get("orderRejectTransaction"):
+        reject_message = _extract_oanda_error_message(result, str(result.get("error", "order rejected")))
+        log.error(f"[{label}] Order failed: {reject_message}")
         hard_failure = result.get("status_code") in {400, 403, 404}
-        mark_pair_failure(instrument, result["error"][:200], "order", severity="hard" if hard_failure else "soft")
-        telegram(f"⚠️ <b>{label} Order Failed</b>\n{instrument} {direction}\n{result['error'][:200]}")
+        mark_pair_failure(instrument, reject_message[:200], "order", severity="hard" if hard_failure else "soft")
+        telegram(f"⚠️ <b>{label} Order Failed</b>\n{instrument} {direction}\n{reject_message[:200]}")
         return {}
 
     fill = result.get("orderFillTransaction", {})
