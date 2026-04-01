@@ -2958,6 +2958,9 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     session = get_current_session()
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
     risk_amount = balance * MAX_RISK_PER_TRADE * kelly_mult
+    trail_text = f"{trail_pips}p" if trail_pips else "None"
+    rsi_text = f"{opp.get('rsi', 0):.1f}" if opp.get("rsi") is not None else "n/a"
+    vol_text = f"{opp.get('vol_ratio', 0):.2f}x" if opp.get("vol_ratio") is not None else "n/a"
 
     telegram(
         f"{dir_emoji} <b>{label} {direction}</b> | {instrument}\n"
@@ -2965,10 +2968,11 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         f"Entry: {actual_entry:.5f}\n"
         f"TP: {tp_price:.5f} (+{opp['tp_pips']:.1f} pips)\n"
         f"SL: {sl_price:.5f} (-{opp['sl_pips']:.1f} pips)\n"
-        f"Trail: {trail_pips}p" if trail_pips else "No trail" + f"\n"
+        f"Trail: {trail_text}\n"
         f"Units: {units} | Risk: £{risk_amount:.2f}\n"
-        f"Score: {opp['score']:.0f} | {opp.get('entry_signal', '')}\n"
-        f"Session: {session['name']} | Spread: {opp.get('spread_pips', 0):.1f}p"
+        f"Score: {opp['score']:.0f} | Signal: {opp.get('entry_signal', 'UNKNOWN')}\n"
+        f"RSI: {rsi_text} | Vol: {vol_text} | Spread: {opp.get('spread_pips', 0):.1f}p\n"
+        f"Kelly: {kelly_mult:.2f}x | Session: {session['name']}"
     )
 
     log.info(f"✅ [{label}] Opened {direction} {instrument} @ {actual_entry} "
