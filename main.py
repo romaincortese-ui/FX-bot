@@ -343,7 +343,11 @@ def uses_oanda_native_units() -> bool:
 def pip_value(instrument: str, units: float, account_currency: str = "GBP") -> float:
     if ACCOUNT_TYPE == "spread_bet" and not uses_oanda_native_units():
         return abs(units)
-    return abs(units) * pip_size(instrument)
+    base_currency, quote_currency = instrument.split("_")
+    quote_to_account = estimate_fx_conversion_rate(quote_currency, account_currency)
+    if quote_to_account is None:
+        return abs(units) * pip_size(instrument)
+    return abs(units) * pip_size(instrument) * quote_to_account
 
 
 def _extract_oanda_error_message(payload: dict | None, fallback_text: str = "") -> str:
@@ -994,6 +998,13 @@ def fetch_open_trades_from_oanda() -> list[dict]:
         return []
 
 
+def get_account_currency() -> str:
+    if PAPER_TRADE:
+        return "GBP" if ACCOUNT_TYPE == "spread_bet" else "USD"
+    acct = get_account_summary()
+    return acct.get("currency", "GBP")
+
+
 def _build_trade_from_oanda(raw_trade: dict, existing: dict | None = None) -> dict | None:
     try:
         current_units = float(raw_trade.get("currentUnits", raw_trade.get("initialUnits", 0)))
@@ -1119,6 +1130,72 @@ def get_spread_pips(instrument: str) -> float:
     p = get_current_price(instrument)
     return price_to_pips(instrument, p["spread"])
 
+
+def get_mid_price(instrument: str) -> float | None:
+    price = get_current_price(instrument)
+    bid = float(price.get("bid", 0) or 0)
+    ask = float(price.get("ask", 0) or 0)
+    if bid <= 0 or ask <= 0:
+        return None
+    return (bid + ask) / 2
+
+
+def estimate_fx_conversion_rate(from_currency: str, to_currency: str, visited: set[tuple[str, str]] | None = None) -> float | None:
+    if from_currency == to_currency:
+        return 1.0
+    if visited is None:
+        visited = set()
+    key = (from_currency, to_currency)
+    if key in visited:
+        return None
+    visited.add(key)
+
+    direct_mid = get_mid_price(f"{from_currency}_{to_currency}")
+    if direct_mid is not None:
+        return direct_mid
+
+    inverse_mid = get_mid_price(f"{to_currency}_{from_currency}")
+    if inverse_mid is not None and inverse_mid > 0:
+        return 1.0 / inverse_mid
+
+    for bridge in ("USD", "EUR", "JPY", "GBP", "AUD"):
+        if bridge in {from_currency, to_currency}:
+            continue
+        leg_one = estimate_fx_conversion_rate(from_currency, bridge, visited)
+        if leg_one is None:
+            continue
+        leg_two = estimate_fx_conversion_rate(bridge, to_currency, visited)
+        if leg_two is not None:
+            return leg_one * leg_two
+    return None
+
+
+def estimate_trade_budget(instrument: str, units: float, entry_price: float, account_currency: str) -> dict:
+    base_currency, quote_currency = instrument.split("_")
+    base_units = abs(float(units))
+    quote_notional = base_units * entry_price
+    quote_to_account = estimate_fx_conversion_rate(quote_currency, account_currency)
+    base_to_account = estimate_fx_conversion_rate(base_currency, account_currency)
+
+    notional_account = None
+    if quote_to_account is not None:
+        notional_account = quote_notional * quote_to_account
+    elif base_to_account is not None:
+        notional_account = base_units * base_to_account
+
+    margin_account = None
+    if notional_account is not None and LEVERAGE > 0:
+        margin_account = notional_account / LEVERAGE
+
+    return {
+        "base_currency": base_currency,
+        "quote_currency": quote_currency,
+        "base_units": base_units,
+        "quote_notional": quote_notional,
+        "notional_account": notional_account,
+        "margin_account": margin_account,
+    }
+
 def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100, price: str = "M") -> pd.DataFrame | None:
     cache_key = (instrument, granularity, count, price)
     with _kline_cache_lock:
@@ -1184,7 +1261,8 @@ def fetch_candles(instrument: str, granularity: str = "M5", count: int = 100, pr
         return None
 
 def calculate_units(instrument: str, balance: float, sl_pips: float,
-                    risk_pct: float, kelly_mult: float = 1.0) -> float:
+                    risk_pct: float, kelly_mult: float = 1.0,
+                    account_currency: str | None = None) -> float:
     risk_amount = balance * risk_pct * kelly_mult
     if sl_pips <= 0:
         sl_pips = 10
@@ -1192,8 +1270,11 @@ def calculate_units(instrument: str, balance: float, sl_pips: float,
         stake = risk_amount / sl_pips
         return max(SPREAD_BET_MIN_STAKE, round(stake, 2))
     else:
-        pv = pip_size(instrument)
-        units = risk_amount / (sl_pips * pv)
+        currency = account_currency or get_account_currency()
+        pip_value_per_unit = pip_value(instrument, 1.0, currency)
+        if pip_value_per_unit <= 0:
+            pip_value_per_unit = pip_size(instrument)
+        units = risk_amount / (sl_pips * pip_value_per_unit)
         return max(1, int(round(units)))
 
 def place_order(instrument: str, units: float, direction: str,
@@ -1246,10 +1327,11 @@ def place_order(instrument: str, units: float, direction: str,
 
     result = oanda_post(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", order_body)
 
-    if "error" in result or result.get("orderRejectTransaction"):
+    if "error" in result or result.get("orderRejectTransaction") or result.get("orderCancelTransaction"):
         reject_message = _extract_oanda_error_message(result, str(result.get("error", "order rejected")))
         log.error(f"[{label}] Order failed: {reject_message}")
-        hard_failure = result.get("status_code") in {400, 403, 404}
+        hard_terms = ("market_halted", "market halted", "instrument halted", "close only", "tradeable", "tradable")
+        hard_failure = result.get("status_code") in {400, 403, 404} or any(term in reject_message.lower() for term in hard_terms)
         mark_pair_failure(instrument, reject_message[:200], "order", severity="hard" if hard_failure else "soft")
         telegram(f"⚠️ <b>{label} Order Failed</b>\n{instrument} {direction}\n{reject_message[:200]}")
         return {}
@@ -1564,6 +1646,18 @@ def poll_telegram_commands():
                 _paused = False
                 save_state()
                 telegram("▶️ <b>Bot resumed.</b> Entries enabled.")
+            elif text == "/close":
+                closed_count, failed_count = close_all_open_positions(reason="MANUAL_CLOSE")
+                if closed_count == 0 and failed_count == 0:
+                    telegram("📭 <b>No open positions.</b>")
+                elif failed_count == 0:
+                    telegram(f"🛑 <b>All positions closed.</b> {closed_count} trade(s) closed.")
+                else:
+                    telegram(
+                        f"⚠️ <b>Close all completed with errors.</b>\n"
+                        f"Closed: {closed_count}\n"
+                        f"Failed: {failed_count}"
+                    )
             elif text == "/session":
                 session = get_current_session()
                 telegram(
@@ -1578,6 +1672,7 @@ def poll_telegram_commands():
                     "/status — Open trades & account\n"
                     "/metrics — Win rate, PF, Sharpe\n"
                     "/session — Current trading session\n"
+                    "/close — Close all open positions\n"
                     "/pause — Stop new entries\n"
                     "/resume — Resume entries\n"
                     "/help — This message"
@@ -1615,6 +1710,9 @@ def _handle_status_command():
         unrealized_text = f"{currency}{broker_unrealized:+,.2f} | live {live_unrealized_pips:+.1f}p"
     else:
         unrealized_text = f"{currency}{broker_unrealized:+,.2f}"
+    nav_text = f"{currency}{float(acct.get('NAV', 0)):,.2f}"
+    margin_used_text = f"{currency}{float(acct.get('marginUsed', 0)):,.2f}"
+    margin_available_text = f"{currency}{float(acct.get('marginAvailable', 0)):,.2f}"
 
     paused_pairs = get_paused_pairs_by_news(session["pairs_allowed"])
     degraded_pairs, blocked_pairs = get_pair_health_buckets(session["pairs_allowed"])
@@ -1677,8 +1775,11 @@ def _handle_status_command():
     lines = [
         f"📊 <b>Status</b> | {session['name']}",
         f"━━━━━━━━━━━━━━━",
+        f"NAV: {nav_text}",
         f"💰 Balance: {acct.get('currency', '£')}{acct.get('balance', 0):,.2f}",
         f"📉 Unrealized: {unrealized_text}",
+        f"Margin used: {margin_used_text}",
+        f"Margin available: {margin_available_text}",
         f"Open trades: {len(open_trades)}",
         f"Regime: {regime} ({_market_regime_mult:.2f})",
         f"Macro: DXY {f'{_dxy_ema_gap*100:+.2f}%' if _dxy_ema_gap is not None else 'unknown'} | VIX {f'{_vix_level:.1f}' if _vix_level is not None else 'unknown'}",
@@ -3026,8 +3127,9 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
                   else KELLY_MULT_SOLID if kelly_gap >= 10
                   else KELLY_MULT_MARGINAL)
 
+    account_currency = get_account_currency()
     units = calculate_units(instrument, balance, opp["sl_pips"],
-                           MAX_RISK_PER_TRADE, kelly_mult)
+                           MAX_RISK_PER_TRADE, kelly_mult, account_currency)
 
     price_data = get_current_price(instrument)
     entry_price = price_data["ask"] if direction == "LONG" else price_data["bid"]
@@ -3090,11 +3192,22 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     save_state()
 
     session = get_current_session()
+    acct = get_account_summary()
+    account_currency = acct.get("currency", account_currency)
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
     risk_amount = balance * MAX_RISK_PER_TRADE * kelly_mult
     trail_text = f"{trail_pips}p" if trail_pips else "None"
     rsi_text = f"{opp.get('rsi', 0):.1f}" if opp.get("rsi") is not None else "n/a"
     vol_text = f"{opp.get('vol_ratio', 0):.2f}x" if opp.get("vol_ratio") is not None else "n/a"
+    actual_units = abs(float(result.get("units", units)))
+    base_currency, quote_currency = instrument.split("_")
+    budget = estimate_trade_budget(instrument, actual_units, actual_entry, account_currency)
+    unit_text = f"{actual_units:.0f} {base_currency}"
+    notional_text = f"{budget['base_units']:.0f} {base_currency} (~{budget['quote_notional']:.2f} {quote_currency})"
+    if budget["margin_account"] is not None:
+        margin_text = f"~{account_currency} {budget['margin_account']:.2f}"
+    else:
+        margin_text = "n/a"
 
     telegram(
         f"{dir_emoji} <b>{label} {direction}</b> | {instrument}\n"
@@ -3103,7 +3216,9 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         f"TP: {tp_price:.5f} (+{opp['tp_pips']:.1f} pips)\n"
         f"SL: {sl_price:.5f} (-{opp['sl_pips']:.1f} pips)\n"
         f"Trail: {trail_text}\n"
-        f"Units: {units} | Risk: £{risk_amount:.2f}\n"
+        f"Units: {unit_text} | Risk model: {account_currency} {risk_amount:.2f}\n"
+        f"Notional: {notional_text}\n"
+        f"Budget est. (margin @{LEVERAGE:.0f}x): {margin_text}\n"
         f"Score: {opp['score']:.0f} | Signal: {opp.get('entry_signal', 'UNKNOWN')}\n"
         f"RSI: {rsi_text} | Vol: {vol_text} | Spread: {opp.get('spread_pips', 0):.1f}p\n"
         f"Kelly: {kelly_mult:.2f}x | Session: {session['name']}"
@@ -3292,6 +3407,33 @@ def close_trade_exit(trade: dict, reason: str):
 
     save_state()
     return True
+
+
+def close_all_open_positions(reason: str = "MANUAL_CLOSE") -> tuple[int, int]:
+    global open_trades
+
+    if not PAPER_TRADE and OANDA_API_KEY and OANDA_ACCOUNT_ID:
+        sync_open_trades_with_oanda(reason="close-all")
+
+    if not open_trades:
+        return 0, 0
+
+    closed_count = 0
+    failed_count = 0
+    for trade in open_trades[:]:
+        if close_trade_exit(trade, reason):
+            if trade in open_trades:
+                open_trades.remove(trade)
+            closed_count += 1
+        else:
+            failed_count += 1
+
+    if not PAPER_TRADE and OANDA_API_KEY and OANDA_ACCOUNT_ID:
+        sync_open_trades_with_oanda(reason="close-all-post")
+    else:
+        save_state()
+
+    return closed_count, failed_count
 
 # ═══════════════════════════════════════════════════════════════
 #  ADAPTIVE LEARNING & REBALANCING
