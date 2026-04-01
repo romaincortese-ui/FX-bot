@@ -1345,11 +1345,72 @@ def _parse_macro_news_timestamp(value: str) -> datetime | None:
         return None
 
 
+def _is_high_impact_news_event(event: dict) -> bool:
+    impact = str(event.get("impact") or "").strip().lower()
+    return impact in {"high", "red", "3", "3/3", "3 of 3", "high impact"}
+
+
+def _event_affects_instrument(event: dict, instrument: str) -> bool:
+    if not _is_high_impact_news_event(event):
+        return False
+    currency = str(event.get("currency") or "").strip().upper()
+    if not currency or "_" not in instrument:
+        return False
+    base, quote = instrument.upper().split("_", 1)
+    return currency in {base, quote}
+
+
+def is_pair_paused_by_news(instrument: str, now: datetime | None = None) -> bool:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    for event in macro_news:
+        if not _event_affects_instrument(event, instrument):
+            continue
+        pause_start = event.get("pause_start")
+        pause_end = event.get("pause_end")
+        if not pause_start or not pause_end:
+            continue
+        start_ts = _parse_macro_news_timestamp(pause_start)
+        end_ts = _parse_macro_news_timestamp(pause_end)
+        if start_ts is None or end_ts is None:
+            continue
+        if start_ts <= now < end_ts:
+            return True
+    return False
+
+
+def get_post_news_events_for_instrument(instrument: str, now: datetime | None = None) -> list[dict]:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    matched = []
+    for event in macro_news:
+        if not _event_affects_instrument(event, instrument):
+            continue
+        pause_end_str = event.get("pause_end")
+        if not pause_end_str:
+            continue
+        pause_end = _parse_macro_news_timestamp(pause_end_str)
+        if pause_end is None:
+            continue
+        window_end = pause_end + timedelta(minutes=POST_NEWS_WINDOW_MINS)
+        if pause_end <= now <= window_end:
+            matched.append(event)
+    return matched
+
+
+def get_paused_pairs_by_news(instruments: list[str], now: datetime | None = None) -> list[str]:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return [instrument for instrument in instruments if is_pair_paused_by_news(instrument, now)]
+
+
 def update_macro_news_pause() -> None:
     global macro_news_pause_until
     now = datetime.now(timezone.utc)
     active_ends = []
     for event in macro_news:
+        if not _is_high_impact_news_event(event):
+            continue
         pause_start = event.get("pause_start")
         pause_end = event.get("pause_end")
         if not pause_start or not pause_end:
@@ -1998,20 +2059,8 @@ def score_post_news(instrument: str, session: dict) -> dict | None:
         return None
 
     now = datetime.now(timezone.utc)
-    in_post_news_window = False
-    for event in macro_news:
-        pause_end_str = event.get("pause_end")
-        if not pause_end_str:
-            continue
-        pause_end = _parse_macro_news_timestamp(pause_end_str)
-        if pause_end is None:
-            continue
-        window_end = pause_end + timedelta(minutes=POST_NEWS_WINDOW_MINS)
-        if pause_end <= now <= window_end:
-            in_post_news_window = True
-            break
-
-    if not in_post_news_window:
+    matching_events = get_post_news_events_for_instrument(instrument, now)
+    if not matching_events:
         return None
 
     spread_pips = get_spread_pips(instrument)
@@ -2566,6 +2615,10 @@ def send_heartbeat(balance: float):
         return
     last_heartbeat_at = time.time()
     session = get_current_session()
+    paused_pairs = get_paused_pairs_by_news(session["pairs_allowed"])
+    paused_summary = ", ".join(paused_pairs[:4]) if paused_pairs else "none"
+    if len(paused_pairs) > 4:
+        paused_summary += f" (+{len(paused_pairs) - 4} more)"
     regime = ("🟢 BULL" if _market_regime_mult < 0.95
               else "🔴 BEAR" if _market_regime_mult > 1.10
               else "⚪ NEUTRAL")
@@ -2582,7 +2635,7 @@ def send_heartbeat(balance: float):
         f"Regime: {regime} ({_market_regime_mult:.2f})\n"
         f"DXY gap: {f'{_dxy_ema_gap*100:+.2f}%' if _dxy_ema_gap is not None else 'unknown'} | "
         f"VIX: {f'{_vix_level:.1f}' if _vix_level is not None else 'unknown'}\n"
-        f"News pause until: {datetime.fromtimestamp(macro_news_pause_until, timezone.utc).strftime('%H:%M UTC') if macro_news_pause_until else 'none'}\n"
+        f"News-paused pairs: {paused_summary}\n"
         f"Today: {len([t for t in trade_history if t.get('closed_at', '').startswith(datetime.now(timezone.utc).strftime('%Y-%m-%d'))])} trades"
     )
 
@@ -2749,9 +2802,6 @@ def run():
                 telegram(f"🛑 <b>Session loss limit</b> | P&L £{today_pnl:.2f}\n"
                          f"Entries paused {SESSION_LOSS_PAUSE_MINS}min.")
 
-            if macro_news_pause_until > time.time():
-                session_paused = True
-
             if streak_cb and not open_trades and _streak_paused_at > 0:
                 if time.time() - _streak_paused_at >= STREAK_AUTO_RESET_MINS * 60:
                     _consecutive_losses = 0
@@ -2773,6 +2823,7 @@ def run():
             if entries_allowed and len(open_trades) < MAX_OPEN_TRADES:
                 skip_scalper = is_rollover_window()
                 active_pairs = session["pairs_allowed"]
+                tradable_pairs = [pair for pair in active_pairs if not is_pair_paused_by_news(pair)]
 
                 scalper_count  = sum(1 for t in open_trades if t["label"] == "SCALPER")
                 trend_count    = sum(1 for t in open_trades if t["label"] == "TREND")
@@ -2781,7 +2832,7 @@ def run():
 
                 if scalper_count < SCALPER_MAX_TRADES and not skip_scalper:
                     best_scalper = None
-                    for pair in active_pairs:
+                    for pair in tradable_pairs:
                         opp = score_scalper(pair, session)
                         if opp and (best_scalper is None or opp["score"] > best_scalper["score"]):
                             best_scalper = opp
@@ -2795,7 +2846,7 @@ def run():
 
                 if trend_count < TREND_MAX_TRADES and session["aggression"] != "MINIMAL":
                     best_trend = None
-                    for pair in active_pairs:
+                    for pair in tradable_pairs:
                         opp = score_trend(pair, session)
                         if opp and (best_trend is None or opp["score"] > best_trend["score"]):
                             best_trend = opp
@@ -2808,7 +2859,7 @@ def run():
 
                 if reversal_count < REVERSAL_MAX_TRADES:
                     best_reversal = None
-                    for pair in active_pairs:
+                    for pair in tradable_pairs:
                         opp = score_reversal(pair, session)
                         if opp and (best_reversal is None or opp["score"] > best_reversal["score"]):
                             best_reversal = opp
@@ -2821,7 +2872,7 @@ def run():
 
                 if breakout_count < BREAKOUT_MAX_TRADES and session["aggression"] in ("HIGH",):
                     best_breakout = None
-                    for pair in active_pairs:
+                    for pair in tradable_pairs:
                         opp = score_breakout(pair, session)
                         if opp and (best_breakout is None or opp["score"] > best_breakout["score"]):
                             best_breakout = opp
@@ -2836,7 +2887,7 @@ def run():
                 carry_count = sum(1 for t in open_trades if t["label"] == "CARRY")
                 if carry_count < CARRY_MAX_TRADES:
                     best_carry = None
-                    for pair in active_pairs:
+                    for pair in tradable_pairs:
                         opp = score_carry(pair, session)
                         if opp and (best_carry is None or opp["score"] > best_carry["score"]):
                             best_carry = opp
@@ -2850,7 +2901,7 @@ def run():
                 asian_fade_count = sum(1 for t in open_trades if t["label"] == "ASIAN_FADE")
                 if asian_fade_count < ASIAN_FADE_MAX_TRADES and session["name"] == "TOKYO":
                     best_asian = None
-                    for pair in active_pairs:
+                    for pair in tradable_pairs:
                         opp = score_asian_fade(pair, session)
                         if opp and (best_asian is None or opp["score"] > best_asian["score"]):
                             best_asian = opp
@@ -2864,7 +2915,7 @@ def run():
                 post_news_count = sum(1 for t in open_trades if t["label"] == "POST_NEWS")
                 if post_news_count < POST_NEWS_MAX_TRADES:
                     best_pn = None
-                    for pair in active_pairs:
+                    for pair in tradable_pairs:
                         opp = score_post_news(pair, session)
                         if opp and (best_pn is None or opp["score"] > best_pn["score"]):
                             best_pn = opp
@@ -2878,7 +2929,7 @@ def run():
                 pullback_count = sum(1 for t in open_trades if t["label"] == "PULLBACK")
                 if pullback_count < PULLBACK_MAX_TRADES and session["aggression"] != "MINIMAL":
                     best_pb = None
-                    for pair in active_pairs:
+                    for pair in tradable_pairs:
                         opp = score_pullback(pair, session)
                         if opp and (best_pb is None or opp["score"] > best_pb["score"]):
                             best_pb = opp
