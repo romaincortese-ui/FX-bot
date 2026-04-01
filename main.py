@@ -3194,6 +3194,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     session = get_current_session()
     acct = get_account_summary()
     account_currency = acct.get("currency", account_currency)
+    nav_value = float(acct.get("NAV", balance) or balance or 0)
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
     risk_amount = balance * MAX_RISK_PER_TRADE * kelly_mult
     trail_text = f"{trail_pips}p" if trail_pips else "None"
@@ -3208,6 +3209,10 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         margin_text = f"~{account_currency} {budget['margin_account']:.2f}"
     else:
         margin_text = "n/a"
+    if budget["notional_account"] is not None and nav_value > 0:
+        effective_leverage_text = f"{budget['notional_account'] / nav_value:.2f}x NAV"
+    else:
+        effective_leverage_text = "n/a"
 
     telegram(
         f"{dir_emoji} <b>{label} {direction}</b> | {instrument}\n"
@@ -3219,6 +3224,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         f"Units: {unit_text} | Risk model: {account_currency} {risk_amount:.2f}\n"
         f"Notional: {notional_text}\n"
         f"Budget est. (margin @{LEVERAGE:.0f}x): {margin_text}\n"
+        f"Effective leverage: {effective_leverage_text}\n"
         f"Score: {opp['score']:.0f} | Signal: {opp.get('entry_signal', 'UNKNOWN')}\n"
         f"RSI: {rsi_text} | Vol: {vol_text} | Spread: {opp.get('spread_pips', 0):.1f}p\n"
         f"Kelly: {kelly_mult:.2f}x | Session: {session['name']}"
