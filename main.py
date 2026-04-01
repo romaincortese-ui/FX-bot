@@ -981,6 +981,112 @@ def get_account_summary() -> dict:
         log.error(f"Failed to get account summary: {e}")
         return {"balance": 0, "currency": "GBP"}
 
+
+def fetch_open_trades_from_oanda() -> list[dict]:
+    if PAPER_TRADE or not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
+        return []
+    try:
+        data = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades")
+        trades = data.get("trades", [])
+        return trades if isinstance(trades, list) else []
+    except Exception as e:
+        log.error(f"Failed to fetch open trades from OANDA: {e}")
+        return []
+
+
+def _build_trade_from_oanda(raw_trade: dict, existing: dict | None = None) -> dict | None:
+    try:
+        current_units = float(raw_trade.get("currentUnits", raw_trade.get("initialUnits", 0)))
+        if current_units == 0:
+            return None
+        instrument = raw_trade.get("instrument", "")
+        entry_price = float(raw_trade.get("price", 0))
+        if not instrument or entry_price <= 0:
+            return None
+
+        trade = dict(existing) if existing else {}
+        trade_id = str(raw_trade.get("id", trade.get("id", "")))
+        direction = "LONG" if current_units > 0 else "SHORT"
+        price_precision = 3 if "JPY" in instrument else 5
+
+        trade.update({
+            "id": trade_id,
+            "instrument": instrument,
+            "direction": direction,
+            "entry_price": entry_price,
+            "units": current_units,
+            "opened_at": raw_trade.get("openTime", trade.get("opened_at", datetime.now(timezone.utc).isoformat())),
+            "opened_ts": trade.get("opened_ts", time.time()),
+            "label": trade.get("label", "RESTORED"),
+            "tp_price": trade.get("tp_price"),
+            "sl_price": trade.get("sl_price"),
+            "trail_pips": trade.get("trail_pips"),
+            "tp_pips": trade.get("tp_pips", 0),
+            "sl_pips": trade.get("sl_pips", 0),
+            "score": trade.get("score", 0),
+            "entry_signal": trade.get("entry_signal", "RESTORED"),
+            "session_at_entry": trade.get("session_at_entry", "RESTORED"),
+            "partial_tp_hit": trade.get("partial_tp_hit", False),
+            "highest_price": trade.get("highest_price", entry_price),
+            "lowest_price": trade.get("lowest_price", entry_price),
+            "last_new_high_at": trade.get("last_new_high_at", time.time()),
+            "unrealized_pnl": trade.get("unrealized_pnl", 0),
+        })
+
+        if raw_trade.get("takeProfitOrder") and trade.get("tp_price") is None:
+            tp_raw = raw_trade["takeProfitOrder"].get("price")
+            if tp_raw is not None:
+                trade["tp_price"] = round(float(tp_raw), price_precision)
+        if raw_trade.get("stopLossOrder") and trade.get("sl_price") is None:
+            sl_raw = raw_trade["stopLossOrder"].get("price")
+            if sl_raw is not None:
+                trade["sl_price"] = round(float(sl_raw), price_precision)
+        if raw_trade.get("trailingStopLossOrder") and trade.get("trail_pips") is None:
+            distance_raw = raw_trade["trailingStopLossOrder"].get("distance")
+            if distance_raw is not None:
+                trade["trail_pips"] = round(price_to_pips(instrument, float(distance_raw)), 1)
+
+        if trade.get("tp_price") is not None:
+            trade["tp_pips"] = round(price_to_pips(instrument, abs(float(trade["tp_price"]) - entry_price)), 1)
+        if trade.get("sl_price") is not None:
+            trade["sl_pips"] = round(price_to_pips(instrument, abs(float(trade["sl_price"]) - entry_price)), 1)
+
+        return trade
+    except Exception as e:
+        log.warning(f"Failed to normalize OANDA trade {raw_trade.get('id', '?')}: {e}")
+        return None
+
+
+def sync_open_trades_with_oanda(reason: str = "manual") -> bool:
+    global open_trades
+    if PAPER_TRADE or not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
+        return False
+
+    broker_trades = fetch_open_trades_from_oanda()
+    existing_by_id = {str(t.get("id")): t for t in open_trades if t.get("id")}
+    synced_trades = []
+    for raw_trade in broker_trades:
+        trade_id = str(raw_trade.get("id", ""))
+        normalized = _build_trade_from_oanda(raw_trade, existing_by_id.get(trade_id))
+        if normalized is not None:
+            synced_trades.append(normalized)
+
+    old_ids = set(existing_by_id.keys())
+    new_ids = {str(t.get("id")) for t in synced_trades if t.get("id")}
+    changed = old_ids != new_ids or len(synced_trades) != len(open_trades)
+    if not changed:
+        for synced in synced_trades:
+            existing = existing_by_id.get(str(synced.get("id")))
+            if existing != synced:
+                changed = True
+                break
+
+    if changed:
+        open_trades = synced_trades
+        save_state()
+        log.info(f"🔄 Synced open trades from OANDA ({reason}): {len(open_trades)} open")
+    return changed
+
 def get_current_price(instrument: str) -> dict:
     with _price_lock:
         cached = _live_prices.get(instrument)
@@ -1480,6 +1586,8 @@ def poll_telegram_commands():
         log.debug(f"Telegram poll error: {e}")
 
 def _handle_status_command():
+    if not PAPER_TRADE and OANDA_API_KEY and OANDA_ACCOUNT_ID:
+        sync_open_trades_with_oanda(reason="status")
     acct = get_account_summary()
     session = get_current_session()
     live_unrealized = 0.0
@@ -3295,6 +3403,9 @@ def run():
 
     load_state()
 
+    if not PAPER_TRADE and OANDA_API_KEY and OANDA_ACCOUNT_ID:
+        sync_open_trades_with_oanda(reason="startup")
+
     log.info("Building initial dynamic watchlist...")
     DYNAMIC_PAIRS = build_dynamic_watchlist()
     if DYNAMIC_PAIRS:
@@ -3319,7 +3430,7 @@ def run():
         f"Watchlist: {len(DYNAMIC_PAIRS)} pairs\n"
         f"Session: {get_current_session()['name']}\n"
         f"Strategies: SCALPER, TREND, REVERSAL, BREAKOUT, CARRY, ASIAN_FADE, POST_NEWS, PULLBACK\n"
-        f"Open trades restored: {len(open_trades)}"
+        f"Open trades {'restored from state' if PAPER_TRADE else 'synced from OANDA'}: {len(open_trades)}"
     )
 
     log.info(f"Current working directory: {os.getcwd()}")
