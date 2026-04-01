@@ -384,10 +384,12 @@ def _default_pair_health() -> dict:
         "last_recovery_at": 0.0,
         "last_quote_ok_at": 0.0,
         "last_order_ok_at": 0.0,
+        "last_close_ok_at": 0.0,
         "last_spread_ok_at": 0.0,
         "last_candle_ok_at": {},
         "consecutive_quote_failures": 0,
         "consecutive_order_failures": 0,
+        "consecutive_close_failures": 0,
         "consecutive_spread_failures": 0,
         "consecutive_candle_failures": {},
         "last_failure_buckets": {},
@@ -444,7 +446,8 @@ def mark_pair_failure(instrument: str, reason: str, source: str, severity: str =
     rec["last_failure_reason"] = reason
     rec["last_failure_at"] = now
     rec["clean_probes"] = 0
-    rec["health_score"] = max(0.0, float(rec.get("health_score", 100.0)) - (25.0 if severity == "hard" else 10.0))
+    penalty = 35.0 if source == "close" and severity == "hard" else 25.0 if severity == "hard" else 10.0
+    rec["health_score"] = max(0.0, float(rec.get("health_score", 100.0)) - penalty)
 
     degrade = False
     block = False
@@ -472,10 +475,18 @@ def mark_pair_failure(instrument: str, reason: str, source: str, severity: str =
         else:
             degrade = rec["consecutive_order_failures"] >= 2
             block = rec["consecutive_order_failures"] >= 4
+    elif source == "close":
+        rec["consecutive_close_failures"] = int(rec.get("consecutive_close_failures", 0)) + 1
+        hard_terms = ("market_halted", "market halted", "close-only", "close only", "tradeable", "tradable")
+        if severity == "hard" or any(term in reason.lower() for term in hard_terms):
+            block = True
+        else:
+            degrade = rec["consecutive_close_failures"] >= 1
+            block = rec["consecutive_close_failures"] >= 2
 
     if block:
         rec["status"] = "blocked"
-        rec["block_level"] = int(rec.get("block_level", 0)) + 1
+        rec["block_level"] = int(rec.get("block_level", 0)) + (2 if source == "close" else 1)
         rec["blocked_until"] = now + _pair_health_block_seconds(rec["block_level"])
         rec["next_probe_at"] = rec["blocked_until"]
     elif degrade and rec["status"] == "healthy":
@@ -508,6 +519,9 @@ def mark_pair_success(instrument: str, source: str, timeframe: str = "") -> None
     elif source == "order":
         rec["last_order_ok_at"] = now
         rec["consecutive_order_failures"] = 0
+    elif source == "close":
+        rec["last_close_ok_at"] = now
+        rec["consecutive_close_failures"] = 0
     elif source == "spread":
         rec["last_spread_ok_at"] = now
         rec["consecutive_spread_failures"] = 0
@@ -1375,7 +1389,8 @@ def place_order(instrument: str, units: float, direction: str,
     mark_pair_failure(instrument, "order returned without fill", "order")
     return {}
 
-def close_trade_result(trade_id: str, label: str = "", units: float = None) -> tuple[bool, str | None]:
+def close_trade_result(trade_id: str, label: str = "", units: float = None,
+                       instrument: str = "") -> tuple[bool, str | None]:
     if PAPER_TRADE:
         return True, None
     path = f"/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/close"
@@ -1386,20 +1401,28 @@ def close_trade_result(trade_id: str, label: str = "", units: float = None) -> t
     if "error" in result or result.get("orderRejectTransaction") or result.get("orderCancelTransaction"):
         reject_message = _extract_oanda_error_message(result, str(result.get("error", "close rejected")))
         log.error(f"[{label}] Close trade {trade_id} failed: {reject_message}")
+        if instrument:
+            hard_terms = ("market_halted", "market halted", "close-only", "close only", "tradeable", "tradable")
+            hard_failure = any(term in reject_message.lower() for term in hard_terms) or result.get("status_code") in {400, 403, 404}
+            mark_pair_failure(instrument, reject_message[:200], "close", severity="hard" if hard_failure else "soft")
         return False, reject_message
     fill = result.get("orderFillTransaction", {})
     if fill:
         close_price = float(fill.get("price", 0))
         pnl = float(fill.get("pl", 0))
         log.info(f"[{label}] Trade {trade_id} closed @ {close_price} | P&L: {pnl:.2f}")
+        if instrument:
+            mark_pair_success(instrument, "close")
         return True, None
     no_fill_message = f"close returned no fill: {json.dumps(result)[:300]}"
     log.error(f"[{label}] Close trade {trade_id} {no_fill_message}")
+    if instrument:
+        mark_pair_failure(instrument, no_fill_message[:200], "close")
     return False, no_fill_message
 
 
-def close_trade(trade_id: str, label: str = "", units: float = None) -> bool:
-    success, _ = close_trade_result(trade_id, label, units)
+def close_trade(trade_id: str, label: str = "", units: float = None, instrument: str = "") -> bool:
+    success, _ = close_trade_result(trade_id, label, units, instrument=instrument)
     return success
 
 def modify_trade(trade_id: str, tp_price: float = None, sl_price: float = None,
@@ -3354,7 +3377,7 @@ def check_exit(trade: dict) -> tuple[bool, str]:
                 # Close partial position
                 partial_units = abs(trade.get("units", 0)) * TREND_PARTIAL_TP_PCT
                 if partial_units > 0:
-                    close_trade(trade["id"], label, units=partial_units)
+                    close_trade(trade["id"], label, units=partial_units, instrument=instrument)
                     trade["units"] = abs(trade["units"]) - partial_units
                     if trade["direction"] == "SHORT":
                         trade["units"] = -trade["units"]
@@ -3397,7 +3420,7 @@ def close_trade_exit(trade: dict, reason: str):
     else:
         pnl_pips = (trade["entry_price"] - exit_price) / ps
 
-    success, close_error = close_trade_result(trade["id"], label)
+    success, close_error = close_trade_result(trade["id"], label, instrument=instrument)
     if not success and not PAPER_TRADE:
         if close_error and "market_halted" in close_error.lower().replace(" ", "_"):
             log.error(f"[{label}] Failed to close {instrument} — market halted, position remains open")
