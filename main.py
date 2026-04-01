@@ -302,6 +302,7 @@ macro_news_pause_until = 0.0
 _recent_scan_decisions = collections.deque(maxlen=8)
 _scan_reject_reasons = {}
 _pair_health         = {}
+_last_scan_pool_status = {"mode": "primary", "active": 0, "healthy": 0, "tradable": 0}
 
 _pair_cooldowns      = {}
 _thread_local        = threading.local()
@@ -630,18 +631,76 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
         log.error(f"Dynamic watchlist build failed: {e}")
         return STATIC_ALL_PAIRS
 
-def refresh_dynamic_watchlist():
+def refresh_dynamic_watchlist(force: bool = False):
     global DYNAMIC_PAIRS, LAST_WATCHLIST_UPDATE
-    if time.time() - LAST_WATCHLIST_UPDATE < WATCHLIST_UPDATE_INTERVAL:
-        return
+    if not force and time.time() - LAST_WATCHLIST_UPDATE < WATCHLIST_UPDATE_INTERVAL:
+        return False
     new_list = build_dynamic_watchlist()
     if new_list:
         DYNAMIC_PAIRS = new_list
         LAST_WATCHLIST_UPDATE = time.time()
         log.info(f"✅ Dynamic watchlist updated with {len(DYNAMIC_PAIRS)} pairs.")
         _restart_price_stream()
+        return True
     else:
         log.warning("Dynamic watchlist refresh returned empty – keeping old list.")
+        return False
+
+
+def _session_pairs_from_pool(session_name: str, pair_pool: list[str]) -> list[str]:
+    core_pairs = [p for p in pair_pool if p in ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "NZD_USD"]]
+    if not core_pairs:
+        core_pairs = pair_pool[:6]
+
+    if session_name == "TOKYO":
+        tokyo_pairs = [p for p in pair_pool if "JPY" in p or "AUD" in p or "NZD" in p]
+        return tokyo_pairs or core_pairs
+    if session_name == "OFF_HOURS":
+        return core_pairs
+    return pair_pool
+
+
+def get_effective_scan_pairs(session: dict) -> tuple[list[str], list[str], list[str], str]:
+    global _last_scan_pool_status
+    active_pairs = list(session["pairs_allowed"])
+    health_pairs = [pair for pair in active_pairs if is_pair_tradeable(pair)]
+    fallback_used = False
+    rebuilt_watchlist = False
+
+    if not health_pairs and DYNAMIC_PAIRS:
+        log.warning("🩺 Active dynamic watchlist is fully blocked. Rebuilding watchlist.")
+        if refresh_dynamic_watchlist(force=True):
+            rebuilt_watchlist = True
+            refreshed_session = get_current_session()
+            active_pairs = list(refreshed_session["pairs_allowed"])
+            health_pairs = [pair for pair in active_pairs if is_pair_tradeable(pair)]
+
+    if not health_pairs:
+        fallback_pool = [pair for pair in STATIC_ALL_PAIRS if is_pair_tradeable(pair)]
+        if fallback_pool:
+            fallback_used = True
+            active_pairs = _session_pairs_from_pool(session["name"], fallback_pool)
+            health_pairs = [pair for pair in active_pairs if is_pair_tradeable(pair)]
+
+    tradable_pairs = [pair for pair in health_pairs if not is_pair_paused_by_news(pair)]
+
+    if not health_pairs:
+        empty_reason = "pairs blocked"
+    elif not tradable_pairs:
+        empty_reason = "paused by news"
+    elif fallback_used:
+        empty_reason = "fallback pool active"
+    else:
+        empty_reason = "no setup"
+
+    _last_scan_pool_status = {
+        "mode": "fallback" if fallback_used else "rebuilt" if rebuilt_watchlist else "primary",
+        "active": len(active_pairs),
+        "healthy": len(health_pairs),
+        "tradable": len(tradable_pairs),
+    }
+
+    return active_pairs, health_pairs, tradable_pairs, empty_reason
 
 # ═══════════════════════════════════════════════════════════════
 #  PRICE STREAMING WITH RESTART
@@ -1367,6 +1426,22 @@ def _handle_status_command():
             degraded_text += f" (+{len(degraded_pairs) - 3})"
         pair_health_parts.append(f"degraded {degraded_text}")
     pair_health_text = " | ".join(pair_health_parts) if pair_health_parts else "all healthy"
+    scan_mode = _last_scan_pool_status.get("mode", "primary")
+    if scan_mode == "fallback":
+        scan_pool_text = (
+            f"fallback pool | active {_last_scan_pool_status.get('active', 0)} | "
+            f"healthy {_last_scan_pool_status.get('healthy', 0)} | tradable {_last_scan_pool_status.get('tradable', 0)}"
+        )
+    elif scan_mode == "rebuilt":
+        scan_pool_text = (
+            f"rebuilt watchlist | active {_last_scan_pool_status.get('active', 0)} | "
+            f"healthy {_last_scan_pool_status.get('healthy', 0)} | tradable {_last_scan_pool_status.get('tradable', 0)}"
+        )
+    else:
+        scan_pool_text = (
+            f"primary watchlist | active {_last_scan_pool_status.get('active', 0)} | "
+            f"healthy {_last_scan_pool_status.get('healthy', 0)} | tradable {_last_scan_pool_status.get('tradable', 0)}"
+        )
     regime = ('🟢 BULL' if _market_regime_mult < 0.95
               else '🔴 BEAR' if _market_regime_mult > 1.10
               else '⚪ NEUTRAL')
@@ -1382,6 +1457,7 @@ def _handle_status_command():
         f"Macro: DXY {f'{_dxy_ema_gap*100:+.2f}%' if _dxy_ema_gap is not None else 'unknown'} | VIX {f'{_vix_level:.1f}' if _vix_level is not None else 'unknown'}",
         f"📰 News-paused: {paused_text}",
         f"🩺 Pair health: {pair_health_text}",
+        f"🔎 Scan pool: {scan_pool_text}",
         f"{status_emoji} Bot: {status_text}",
     ]
     if open_trades:
@@ -3218,15 +3294,7 @@ def run():
             # Entry scans
             if entries_allowed and len(open_trades) < MAX_OPEN_TRADES:
                 skip_scalper = is_rollover_window()
-                active_pairs = session["pairs_allowed"]
-                health_pairs = [pair for pair in active_pairs if is_pair_tradeable(pair)]
-                tradable_pairs = [pair for pair in health_pairs if not is_pair_paused_by_news(pair)]
-                if not health_pairs:
-                    empty_reason = "pairs blocked"
-                elif not tradable_pairs:
-                    empty_reason = "paused by news"
-                else:
-                    empty_reason = "no setup"
+                active_pairs, health_pairs, tradable_pairs, empty_reason = get_effective_scan_pairs(session)
 
                 scalper_count  = sum(1 for t in open_trades if t["label"] == "SCALPER")
                 trend_count    = sum(1 for t in open_trades if t["label"] == "TREND")
