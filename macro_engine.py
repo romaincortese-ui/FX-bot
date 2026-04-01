@@ -593,7 +593,7 @@ def merge_biases(*bias_groups: Dict[str, str]) -> Dict[str, str]:
     return merged
 
 
-def generate_macro_filters() -> Dict[str, str]:
+def generate_macro_filters() -> Dict[str, Any]:
     rates = load_interest_rates()
     momentum = load_commodity_momentum()
     esi = load_economic_surprise()
@@ -613,6 +613,21 @@ def generate_macro_filters() -> Dict[str, str]:
     liquidity_bias = build_liquidity_bias(liquidity)
 
     filters = merge_biases(esi_bias, commodity_bias, market_bias, rate_bias, liquidity_bias)
+
+    # Always include VIX and DXY so they appear in any Redis payload built from
+    # generate_macro_filters(), regardless of whether run() is the caller.
+    try:
+        dxy_val = get_dxy_gap()
+        filters["dxy_gap"] = float(dxy_val) if dxy_val is not None else 0.0
+    except Exception:
+        filters["dxy_gap"] = 0.0
+
+    try:
+        vix_val = get_vix_proxy()
+        filters["vix_value"] = float(vix_val) if vix_val is not None else 15.0
+    except Exception:
+        filters["vix_value"] = 15.0
+
     if filters:
         log.info(f"Generated macro filter values: {filters}")
     else:
@@ -643,23 +658,13 @@ def save_macro_news(news_events: List[dict], path: str = MACRO_NEWS_FILE) -> Non
 def run() -> None:
     log.info("Starting macro engine")
 
-    # 1. Fetch all data
+    # 1. Fetch all data (filters now includes vix_value and dxy_gap)
     filters = generate_macro_filters()
     news = load_forex_factory_news()
 
-    # 2. Fetch VIX/DXY with forced defaults if they return None
-    # This ensures the keys ALWAYS exist in the Redis JSON
-    try:
-        dxy_val = get_dxy_gap()
-        dxy_gap = float(dxy_val) if dxy_val is not None else 0.0
-    except Exception:
-        dxy_gap = 0.0
-
-    try:
-        vix_val = get_vix_proxy()
-        vix_value = float(vix_val) if vix_val is not None else 15.0
-    except Exception:
-        vix_value = 15.0
+    # 2. Extract VIX/DXY from filters (they are always present with defaults)
+    vix_value = filters.pop("vix_value", 15.0)
+    dxy_gap = filters.pop("dxy_gap", 0.0)
 
     # 3. Build state (Ensure keys match exactly what main.py expects)
     macro_state = {
