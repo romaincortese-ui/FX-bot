@@ -234,6 +234,8 @@ PAIR_HEALTH_PROBE_INTERVAL_SECS = int(os.getenv("PAIR_HEALTH_PROBE_INTERVAL_SECS
 PAIR_HEALTH_RECOVERY_SUCCESSES = int(os.getenv("PAIR_HEALTH_RECOVERY_SUCCESSES", "3"))
 PAIR_HEALTH_BLOCK_BASE_SECS = int(os.getenv("PAIR_HEALTH_BLOCK_BASE_SECS", "1800"))
 PAIR_HEALTH_BLOCK_MAX_SECS = int(os.getenv("PAIR_HEALTH_BLOCK_MAX_SECS", "86400"))
+CLOSE_RETRY_BASE_SECS = int(os.getenv("CLOSE_RETRY_BASE_SECS", "300"))
+CLOSE_RETRY_MAX_SECS = int(os.getenv("CLOSE_RETRY_MAX_SECS", "7200"))
 STATE_FILE          = "state.json"
 MACRO_NEWS_FILE     = os.getenv("MACRO_NEWS_FILE", "macro_news.json")
 REDIS_URL           = os.getenv("REDIS_URL", "")
@@ -305,6 +307,7 @@ _last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0, "active_pa
 _scan_reject_reasons = {}
 _pair_health         = {}
 _last_scan_pool_status = {"mode": "primary", "active": 0, "healthy": 0, "tradable": 0}
+_pending_close_retries = {}
 
 _pair_cooldowns      = {}
 _thread_local        = threading.local()
@@ -568,6 +571,56 @@ def get_pair_health_buckets(instruments: list[str] | None = None) -> tuple[list[
         elif status == "degraded":
             degraded.append(instrument)
     return degraded, blocked
+
+
+def _next_close_retry_delay(attempts: int) -> int:
+    return min(CLOSE_RETRY_BASE_SECS * max(1, 2 ** max(0, attempts - 1)), CLOSE_RETRY_MAX_SECS)
+
+
+def schedule_close_retry(trade: dict, error_reason: str) -> None:
+    rec = _ensure_pair_health(trade["instrument"])
+    attempts = int(_pending_close_retries.get(str(trade["id"]), {}).get("attempts", 0)) + 1
+    now = time.time()
+    next_retry_at = now + _next_close_retry_delay(attempts)
+    blocked_until = float(rec.get("blocked_until", 0.0))
+    next_probe_at = float(rec.get("next_probe_at", 0.0))
+    next_retry_at = max(next_retry_at, blocked_until, next_probe_at)
+    _pending_close_retries[str(trade["id"])] = {
+        "trade_id": str(trade["id"]),
+        "instrument": trade["instrument"],
+        "label": trade.get("label", "RESTORED"),
+        "attempts": attempts,
+        "reason": error_reason[:200],
+        "next_retry_at": next_retry_at,
+        "scheduled_at": now,
+    }
+    retry_text = datetime.fromtimestamp(next_retry_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    log.warning(f"🕒 Scheduled forced-close retry for {trade['instrument']} at {retry_text} | reason: {error_reason[:120]}")
+
+
+def clear_close_retry(trade_id: str) -> None:
+    _pending_close_retries.pop(str(trade_id), None)
+
+
+def process_pending_close_retries() -> None:
+    if not _pending_close_retries:
+        return
+    open_by_id = {str(t.get("id")): t for t in open_trades if t.get("id")}
+    now = time.time()
+    for trade_id, pending in list(_pending_close_retries.items()):
+        trade = open_by_id.get(trade_id)
+        if trade is None:
+            clear_close_retry(trade_id)
+            continue
+        if now < float(pending.get("next_retry_at", 0.0)):
+            continue
+        log.info(f"🔁 Retrying forced close for {trade['instrument']} ({trade_id})")
+        if close_trade_exit(trade, "FORCED_CLOSE_RETRY"):
+            if trade in open_trades:
+                open_trades.remove(trade)
+            clear_close_retry(trade_id)
+        else:
+            schedule_close_retry(trade, get_pair_health_reason(trade["instrument"]) or pending.get("reason", "close retry failed"))
 
 
 def probe_pair_health() -> None:
@@ -1804,6 +1857,12 @@ def _handle_status_command():
             degraded_text += f" (+{len(global_degraded_pairs) - 3})"
         global_health_parts.append(f"degraded {degraded_text}")
     global_health_text = " | ".join(global_health_parts) if global_health_parts else "none"
+    if _pending_close_retries:
+        next_retry = min(_pending_close_retries.values(), key=lambda item: float(item.get("next_retry_at", 0.0)))
+        next_retry_at = datetime.fromtimestamp(float(next_retry.get("next_retry_at", 0.0)), timezone.utc).strftime("%H:%M UTC")
+        forced_close_text = f"{next_retry.get('instrument', '?')} @ {next_retry_at}"
+    else:
+        forced_close_text = "none"
     scan_mode = _last_scan_pool_status.get("mode", "primary")
     if scan_mode == "fallback":
         scan_pool_text = (
@@ -1846,6 +1905,7 @@ def _handle_status_command():
         f"📰 Active news blackouts: {paused_text}",
         f"🩺 Active pair health: {pair_health_text}",
         f"🌐 Global pair issues: {global_health_text}",
+        f"⏳ Forced close retry: {forced_close_text}",
         f"🔎 Scan pool: {scan_pool_text}",
         f"🧮 Last scan breadth: {latest_scan_text}",
         f"📋 Last active pairs: {latest_active_pairs_text}",
@@ -1945,6 +2005,7 @@ def save_state():
             "last_rebalance_count":  _last_rebalance_count,
             "pair_cooldowns":        _pair_cooldowns,
             "pair_health":           _pair_health,
+            "pending_close_retries": _pending_close_retries,
             "saved_at":              datetime.now(timezone.utc).isoformat(),
         }
         tmp = STATE_FILE + ".tmp"
@@ -1956,7 +2017,7 @@ def save_state():
 
 def load_state():
     global open_trades, trade_history, _consecutive_losses, _streak_paused_at
-    global _paused, _adaptive_offsets, _last_rebalance_count, _pair_cooldowns, _pair_health
+    global _paused, _adaptive_offsets, _last_rebalance_count, _pair_cooldowns, _pair_health, _pending_close_retries
     try:
         if not os.path.exists(STATE_FILE):
             return
@@ -1975,6 +2036,7 @@ def load_state():
                                      "CARRY": 0.0, "ASIAN_FADE": 0.0, "POST_NEWS": 0.0, "PULLBACK": 0.0})
         _last_rebalance_count = d.get("last_rebalance_count", 0)
         _pair_cooldowns       = d.get("pair_cooldowns", {})
+        _pending_close_retries = d.get("pending_close_retries", {}) if isinstance(d.get("pending_close_retries", {}), dict) else {}
         raw_pair_health       = d.get("pair_health", {})
         _pair_health = {}
         for instrument, rec in raw_pair_health.items():
@@ -3433,6 +3495,7 @@ def close_trade_exit(trade: dict, reason: str):
     success, close_error = close_trade_result(trade["id"], label, instrument=instrument)
     if not success and not PAPER_TRADE:
         if close_error and "market_halted" in close_error.lower().replace(" ", "_"):
+            schedule_close_retry(trade, close_error)
             log.error(f"[{label}] Failed to close {instrument} — market halted, position remains open")
         else:
             suffix = f": {close_error}" if close_error else ""
@@ -3475,6 +3538,7 @@ def close_trade_exit(trade: dict, reason: str):
         f"Reason: {reason} | Held: {held_min:.0f}min"
     )
 
+    clear_close_retry(trade["id"])
     save_state()
     return True
 
@@ -3720,6 +3784,7 @@ def run():
 
             refresh_dynamic_watchlist()   # This will also restart stream if needed
             probe_pair_health()
+            process_pending_close_retries()
 
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             today_pnl = sum(t.get("pnl", 0) for t in trade_history
