@@ -45,8 +45,14 @@ YFINANCE_MARKET_INDICATORS = {
     "DXY": os.getenv("DXY_TICKER", "DX-Y.NYB"),
     "VIX": os.getenv("VIX_TICKER", "^VIX"),
 }
+YFINANCE_COMMODITY_TICKERS = {
+    "OIL": os.getenv("YFINANCE_OIL_TICKER", "CL=F"),
+    "COPPER": os.getenv("YFINANCE_COPPER_TICKER", "HG=F"),
+}
 FX_INDEX_MOMENTUM_THRESHOLD = float(os.getenv("FX_INDEX_MOMENTUM_THRESHOLD", "0.01"))
 DEFAULT_ECONOMIC_CALENDAR_URLS = [
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+    "https://www.forexfactory.com/ffcal_week_this.xml",
     "https://www.dailyfx.com/free-ads/economic-calendar-rss",
     "https://www.investing.com/rss/economic-calendar",
 ]
@@ -182,10 +188,24 @@ def fetch_yfinance_daily_pct_change(ticker: str) -> Optional[float]:
         return None
 
 
+def _fetch_commodity_pct_change(name: str) -> Optional[float]:
+    """Try OANDA first for a commodity, fall back to yfinance."""
+    oanda_instrument = OANDA_COMMODITY_INSTRUMENTS.get(name)
+    if oanda_instrument:
+        value = fetch_oanda_daily_pct_change(oanda_instrument)
+        if value is not None:
+            return value
+        log.info(f"OANDA unavailable for {name}; trying yfinance fallback.")
+    yf_ticker = YFINANCE_COMMODITY_TICKERS.get(name)
+    if yf_ticker:
+        return fetch_yfinance_daily_pct_change(yf_ticker)
+    return None
+
+
 def load_oanda_commodity_momentum() -> Dict[str, Optional[float]]:
     return {
-        "OIL": fetch_oanda_daily_pct_change(OANDA_COMMODITY_INSTRUMENTS["OIL"]),
-        "COPPER": fetch_oanda_daily_pct_change(OANDA_COMMODITY_INSTRUMENTS["COPPER"]),
+        "OIL": _fetch_commodity_pct_change("OIL"),
+        "COPPER": _fetch_commodity_pct_change("COPPER"),
         "DAIRY": parse_float_env("DAIRY_MOMENTUM"),
     }
 
