@@ -19,6 +19,7 @@ class StrategyScoringContext:
     apply_macro_directional_bias: Callable[[str, dict], None] | None
     macro_filters: Mapping[str, str]
     macro_news: Sequence[dict]
+    is_pair_paused_by_news: Callable[[str, datetime | None], bool]
     market_regime_mult: float
     adaptive_offsets: Mapping[str, float]
     dxy_ema_gap: float | None
@@ -28,7 +29,55 @@ class StrategyScoringContext:
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
 
+def _macro_bias_for_instrument(ctx: StrategyScoringContext, instrument: str) -> str:
+    return str(ctx.macro_filters.get(instrument.upper(), "NEUTRAL") or "NEUTRAL").upper()
+
+
+def _macro_bias_conflicts_direction(direction: str, bias: str) -> bool:
+    return (direction == "LONG" and bias == "SHORT_ONLY") or (direction == "SHORT" and bias == "LONG_ONLY")
+
+
+def _macro_bias_aligns_direction(direction: str, bias: str) -> bool:
+    return (direction == "LONG" and bias == "LONG_ONLY") or (direction == "SHORT" and bias == "SHORT_ONLY")
+
+
+def _strategy_blocked_by_news_pause(strategy: str, is_paused: bool) -> bool:
+    return is_paused and strategy != "CARRY"
+
+
+def _apply_directional_macro_gate(strategy: str, instrument: str, direction: str, ctx: StrategyScoringContext, require_alignment: bool = False) -> tuple[bool, str]:
+    bias = _macro_bias_for_instrument(ctx, instrument)
+    if _macro_bias_conflicts_direction(direction, bias):
+        ctx.reject(strategy, instrument, "macro bias conflict")
+        return False, bias
+    if require_alignment and not _macro_bias_aligns_direction(direction, bias):
+        ctx.reject(strategy, instrument, "macro alignment required")
+        return False, bias
+    return True, bias
+
+
+def _apply_target_adjustments(tp_pips: float, sl_pips: float, direction: str, bias: str, vix_level: float | None) -> tuple[float, float, float]:
+    macro_confidence = 1.0 if _macro_bias_aligns_direction(direction, bias) else 0.0
+    if macro_confidence > 0:
+        tp_pips *= 1.3
+        sl_pips *= 0.9
+    if vix_level is not None and vix_level > 22:
+        tp_pips *= 0.8
+        sl_pips *= 0.8
+    return tp_pips, sl_pips, macro_confidence
+
+
+def _reject_if_news_paused(strategy: str, instrument: str, ctx: StrategyScoringContext) -> bool:
+    now = ctx.now_provider()
+    if _strategy_blocked_by_news_pause(strategy, ctx.is_pair_paused_by_news(instrument, now)):
+        ctx.reject(strategy, instrument, "pre-news risk window")
+        return True
+    return False
+
+
 def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if _reject_if_news_paused("SCALPER", instrument, ctx):
+        return None
     spread_pips = ctx.get_spread_pips(instrument)
     if spread_pips > settings["SCALPER_MAX_SPREAD_PIPS"]:
         ctx.reject("SCALPER", instrument, "spread too high")
@@ -82,6 +131,9 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
     )
     if direction == "SHORT" and not (crossed_down_now or float(ema9.iloc[-1]) < float(ema21.iloc[-1])):
         score *= 0.5
+    macro_ok, bias = _apply_directional_macro_gate("SCALPER", instrument, direction, ctx)
+    if not macro_ok:
+        return None
 
     eff_threshold = settings["SCALPER_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("SCALPER", 0)
@@ -91,6 +143,7 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
 
     tp_pips = max(settings["SCALPER_TP_MIN_PIPS"], min(settings["SCALPER_TP_MAX_PIPS"], price_to_pips(instrument, atr * settings["SCALPER_TP_ATR_MULT"])))
     sl_pips = max(settings["SCALPER_SL_MIN_PIPS"], min(settings["SCALPER_SL_MAX_PIPS"], price_to_pips(instrument, atr * settings["SCALPER_SL_ATR_MULT"])))
+    tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.5:
         tp_pips = sl_pips * 1.5
     return {
@@ -106,6 +159,8 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
         "tp_pips": round(tp_pips, 1),
         "sl_pips": round(sl_pips, 1),
         "trail_pips": settings["SCALPER_TRAIL_PIPS"],
+        "macro_confidence": macro_confidence,
+        "regime_multiplier": ctx.market_regime_mult,
         "crossed_now": crossed_now or crossed_down_now,
         "entry_signal": "CROSSOVER" if crossed else ("VOL_SPIKE" if vol_ratio > 2 else "TREND"),
         "macd": macd,
@@ -113,6 +168,8 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
 
 
 def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if _reject_if_news_paused("TREND", instrument, ctx):
+        return None
     spread_pips = ctx.get_spread_pips(instrument)
     if spread_pips > settings["TREND_MAX_SPREAD_PIPS"]:
         ctx.reject("TREND", instrument, "spread too high")
@@ -164,6 +221,9 @@ def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
             score += 10
     atr = calc_atr(df_1h, 14)
     atr_pct = atr / float(close_1h.iloc[-1])
+    macro_ok, bias = _apply_directional_macro_gate("TREND", instrument, direction, ctx)
+    if not macro_ok:
+        return None
     eff_threshold = settings["TREND_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("TREND", 0)
     if score < eff_threshold:
@@ -171,11 +231,14 @@ def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
         return None
     tp_pips = max(15, price_to_pips(instrument, atr * settings["TREND_TP_ATR_MULT"]))
     sl_pips = max(8, price_to_pips(instrument, atr * settings["TREND_SL_ATR_MULT"]))
+    tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     partial_tp_pips = max(10, price_to_pips(instrument, atr * settings["TREND_PARTIAL_TP_ATR"]))
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "partial_tp_pips": round(partial_tp_pips, 1), "trail_pips": settings["TREND_TRAIL_PIPS"], "entry_signal": "TREND_ALIGNED", "ema50_gap_4h": round(ema50_gap_4h * 100, 2)}
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "partial_tp_pips": round(partial_tp_pips, 1), "trail_pips": settings["TREND_TRAIL_PIPS"], "entry_signal": "TREND_ALIGNED", "ema50_gap_4h": round(ema50_gap_4h * 100, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
 
 
 def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if _reject_if_news_paused("REVERSAL", instrument, ctx):
+        return None
     spread_pips = ctx.get_spread_pips(instrument)
     if spread_pips > settings["REVERSAL_MAX_SPREAD_PIPS"]:
         ctx.reject("REVERSAL", instrument, "spread too high")
@@ -218,6 +281,9 @@ def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategySco
             score += 10
     atr = calc_atr(df_5m, 14)
     atr_pct = atr / float(close.iloc[-1])
+    macro_ok, bias = _apply_directional_macro_gate("REVERSAL", instrument, direction, ctx)
+    if not macro_ok:
+        return None
     eff_threshold = settings["REVERSAL_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("REVERSAL", 0)
     if score < eff_threshold:
@@ -225,10 +291,13 @@ def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategySco
         return None
     tp_pips = max(8, price_to_pips(instrument, atr * settings["REVERSAL_TP_ATR_MULT"]))
     sl_pips = max(5, price_to_pips(instrument, atr * settings["REVERSAL_SL_ATR_MULT"]))
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["REVERSAL_TRAIL_PIPS"], "entry_signal": "OVERSOLD_BOUNCE" if is_oversold else "OVERBOUGHT_FADE"}
+    tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["REVERSAL_TRAIL_PIPS"], "entry_signal": "OVERSOLD_BOUNCE" if is_oversold else "OVERBOUGHT_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
 
 
 def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if _reject_if_news_paused("BREAKOUT", instrument, ctx):
+        return None
     spread_pips = ctx.get_spread_pips(instrument)
     if spread_pips > settings["BREAKOUT_MAX_SPREAD_PIPS"]:
         ctx.reject("BREAKOUT", instrument, "spread too high")
@@ -261,6 +330,9 @@ def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     direction = ctx.determine_direction(instrument, df_15m, df_1h, strategy="BREAKOUT", dxy_ema_gap=ctx.dxy_ema_gap, dxy_gate_threshold=ctx.dxy_gate_threshold, apply_macro_directional_bias=ctx.apply_macro_directional_bias)
     atr = calc_atr(df_15m, 14)
     atr_pct = atr / float(df_15m["close"].iloc[-1])
+    macro_ok, bias = _apply_directional_macro_gate("BREAKOUT", instrument, direction, ctx)
+    if not macro_ok:
+        return None
     eff_threshold = settings["BREAKOUT_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("BREAKOUT", 0)
     if score < eff_threshold:
@@ -268,10 +340,13 @@ def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategySco
         return None
     tp_pips = max(15, price_to_pips(instrument, atr * settings["BREAKOUT_TP_ATR_MULT"]))
     sl_pips = max(5, price_to_pips(instrument, atr * settings["BREAKOUT_SL_ATR_MULT"]))
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "squeeze_bars": squeeze["squeeze_bars"], "bb_percentile": round(squeeze["bb_percentile"], 1), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["BREAKOUT_TRAIL_PIPS"], "entry_signal": "BB_KC_SQUEEZE"}
+    tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "squeeze_bars": squeeze["squeeze_bars"], "bb_percentile": round(squeeze["bb_percentile"], 1), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["BREAKOUT_TRAIL_PIPS"], "entry_signal": "BB_KC_SQUEEZE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
 
 
 def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if _reject_if_news_paused("CARRY", instrument, ctx):
+        return None
     if ctx.market_regime_mult > 1.05:
         ctx.reject("CARRY", instrument, "regime too hot")
         return None
@@ -309,6 +384,11 @@ def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
     macd_4h = calc_macd(df_4h)
     if macd_4h["histogram"] > 0:
         score += 10
+    momentum_5d = float(close_4h.iloc[-1]) / float(close_4h.iloc[-30]) - 1 if len(close_4h) >= 30 else 0.0
+    if momentum_5d <= 0:
+        ctx.reject("CARRY", instrument, "5D momentum not supportive")
+        return None
+    score += 8 if momentum_5d > 0.01 else 4
     if ctx.vix_level is not None and ctx.vix_level < ctx.vix_low_threshold:
         score += 5
     eff_threshold = settings["CARRY_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
@@ -318,10 +398,13 @@ def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
         return None
     tp_pips = max(15, price_to_pips(instrument, atr * settings["CARRY_TP_ATR_MULT"]))
     sl_pips = max(10, price_to_pips(instrument, atr * settings["CARRY_SL_ATR_MULT"]))
-    return {"instrument": instrument, "score": round(score, 2), "direction": "LONG", "rsi": round(rsi_4h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["CARRY_TRAIL_PIPS"], "entry_signal": "CARRY_YIELD"}
+    tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, "LONG", "LONG_ONLY", ctx.vix_level)
+    return {"instrument": instrument, "score": round(score, 2), "direction": "LONG", "rsi": round(rsi_4h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["CARRY_TRAIL_PIPS"], "entry_signal": "CARRY_YIELD", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "momentum_5d": round(momentum_5d, 4)}
 
 
 def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if _reject_if_news_paused("ASIAN_FADE", instrument, ctx):
+        return None
     if session["name"] != "TOKYO":
         ctx.reject("ASIAN_FADE", instrument, "Tokyo only")
         return None
@@ -367,6 +450,9 @@ def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyS
     if (is_oversold and rsi > rsi_prev) or (is_overbought and rsi < rsi_prev):
         score += 5
     atr_pct = atr / float(close.iloc[-1])
+    macro_ok, bias = _apply_directional_macro_gate("ASIAN_FADE", instrument, direction, ctx)
+    if not macro_ok:
+        return None
     eff_threshold = settings["ASIAN_FADE_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("ASIAN_FADE", 0)
     if score < eff_threshold:
@@ -374,9 +460,10 @@ def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyS
         return None
     tp_pips = max(5, min(20, price_to_pips(instrument, atr * settings["ASIAN_FADE_TP_ATR_MULT"])))
     sl_pips = max(4, min(15, price_to_pips(instrument, atr * settings["ASIAN_FADE_SL_ATR_MULT"])))
+    tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.2:
         tp_pips = sl_pips * 1.2
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["ASIAN_FADE_TRAIL_PIPS"], "entry_signal": "ASIAN_RANGE_FADE"}
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["ASIAN_FADE_TRAIL_PIPS"], "entry_signal": "ASIAN_RANGE_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
 
 
 def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -408,6 +495,9 @@ def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategySc
         ctx.reject("POST_NEWS", instrument, "no breakout yet")
         return None
     direction = "LONG" if broke_high else "SHORT"
+    macro_ok, bias = _apply_directional_macro_gate("POST_NEWS", instrument, direction, ctx)
+    if not macro_ok:
+        return None
     score = 25
     breakout_size = abs(current_close - (pre_news_high if broke_high else pre_news_low))
     score += 15 if breakout_size > atr * 0.5 else 8 if breakout_size > atr * 0.25 else 0
@@ -428,12 +518,15 @@ def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategySc
         return None
     tp_pips = max(10, price_to_pips(instrument, atr * settings["POST_NEWS_TP_ATR_MULT"]))
     sl_pips = max(5, price_to_pips(instrument, atr * settings["POST_NEWS_SL_ATR_MULT"]))
+    tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.5:
         tp_pips = sl_pips * 1.5
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["POST_NEWS_TRAIL_PIPS"], "entry_signal": "POST_NEWS_BREAKOUT"}
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["POST_NEWS_TRAIL_PIPS"], "entry_signal": "POST_NEWS_BREAKOUT", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
 
 
 def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if _reject_if_news_paused("PULLBACK", instrument, ctx):
+        return None
     spread_pips = ctx.get_spread_pips(instrument)
     if spread_pips > settings["PULLBACK_MAX_SPREAD_PIPS"]:
         ctx.reject("PULLBACK", instrument, "spread too high")
@@ -494,8 +587,10 @@ def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     macd_1h = calc_macd(df_1h)
     if (direction == "LONG" and macd_1h["histogram"] > 0) or (direction == "SHORT" and macd_1h["histogram"] < 0):
         score += 10
-    bias = ctx.macro_filters.get(instrument.upper())
-    if (direction == "LONG" and bias == "LONG_ONLY") or (direction == "SHORT" and bias == "SHORT_ONLY"):
+    macro_ok, bias = _apply_directional_macro_gate("PULLBACK", instrument, direction, ctx, require_alignment=True)
+    if not macro_ok:
+        return None
+    if _macro_bias_aligns_direction(direction, bias):
         score += 10
     atr_pct = atr / float(close_1h.iloc[-1])
     eff_threshold = settings["PULLBACK_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
@@ -505,6 +600,7 @@ def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategySco
         return None
     tp_pips = max(12, price_to_pips(instrument, atr * settings["PULLBACK_TP_ATR_MULT"]))
     sl_pips = max(6, price_to_pips(instrument, atr * settings["PULLBACK_SL_ATR_MULT"]))
+    tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.5:
         tp_pips = sl_pips * 1.5
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["PULLBACK_TRAIL_PIPS"], "entry_signal": "PULLBACK_REENTRY", "pullback_depth": round(pullback_depth, 2)}
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["PULLBACK_TRAIL_PIPS"], "entry_signal": "PULLBACK_REENTRY", "pullback_depth": round(pullback_depth, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}

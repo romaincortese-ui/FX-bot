@@ -59,6 +59,19 @@ from fxbot.strategies import score_reversal as core_score_reversal
 from fxbot.strategies import score_scalper as core_score_scalper
 from fxbot.strategies import score_trend as core_score_trend
 
+
+def _parse_pair_env(var_name: str, default: str) -> list[str]:
+    raw = os.getenv(var_name, default)
+    pairs = []
+    seen = set()
+    for item in raw.split(","):
+        pair = item.strip().upper().replace("/", "_")
+        if not pair or pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    return pairs
+
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
@@ -81,8 +94,8 @@ PAPER_TRADE   = os.getenv("PAPER_TRADE", "False").lower() == "true"
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
 
 # ── Static fallback pairs (used if dynamic fails) ────────────
-STATIC_CORE_PAIRS = os.getenv("CORE_PAIRS", "EUR_USD,GBP_USD,USD_JPY").split(",")
-STATIC_EXTENDED_PAIRS = os.getenv("EXTENDED_PAIRS", "AUD_USD,USD_CAD,EUR_GBP,USD_CHF,NZD_USD").split(",")
+STATIC_CORE_PAIRS = _parse_pair_env("CORE_PAIRS", "EUR_USD,GBP_USD,USD_JPY")
+STATIC_EXTENDED_PAIRS = _parse_pair_env("EXTENDED_PAIRS", "AUD_USD,USD_CAD,EUR_GBP,USD_CHF,NZD_USD")
 STATIC_ALL_PAIRS = STATIC_CORE_PAIRS + STATIC_EXTENDED_PAIRS
 
 # ── Dynamic watchlist settings ────────────────────────────────
@@ -91,6 +104,9 @@ LAST_WATCHLIST_UPDATE = 0
 WATCHLIST_UPDATE_INTERVAL = int(os.getenv("WATCHLIST_UPDATE_INTERVAL", "14400"))  # 4 hours
 MAX_WATCHLIST_SIZE = int(os.getenv("MAX_WATCHLIST_SIZE", "8"))
 MAX_SPREAD_FILTER_PIPS = float(os.getenv("MAX_SPREAD_FILTER_PIPS", "1.5"))
+SUPPORTED_PAIR_CACHE_SECS = int(os.getenv("SUPPORTED_PAIR_CACHE_SECS", "21600"))
+NEWS_WINDOW_RISK_MULT = float(os.getenv("NEWS_WINDOW_RISK_MULT", "0.5"))
+DXY_REGIME_THRESHOLD = float(os.getenv("DXY_REGIME_THRESHOLD", "0.008"))
 
 # ── Spread betting min stake ──────────────────────────────────
 SPREAD_BET_MIN_STAKE = float(os.getenv("SPREAD_BET_MIN_STAKE", "0.10"))
@@ -351,6 +367,9 @@ _pair_cooldowns      = {}
 _thread_local        = threading.local()
 _live_prices         = {}
 _price_lock          = threading.Lock()
+_supported_currency_pairs_cache = set()
+_supported_currency_pairs_cache_at = 0.0
+_unsupported_instruments = set()
 
 PAIR_COOLDOWN_SECS   = int(os.getenv("PAIR_COOLDOWN_SECS", "900"))
 
@@ -414,6 +433,30 @@ def _extract_oanda_error_message(payload: dict | None, fallback_text: str = "") 
         return fallback_text[:300]
 
 
+def _normalize_broker_reason(reason: str) -> str:
+    return str(reason or "").strip().lower().replace("-", " ").replace("_", " ")
+
+
+def _is_market_halted_reason(reason: str) -> bool:
+    normalized = _normalize_broker_reason(reason)
+    halt_terms = (
+        "market halted",
+        "instrument halted",
+        "market closed",
+        "trading halted",
+        "close only",
+        "close only mode",
+        "halted",
+    )
+    return any(term in normalized for term in halt_terms)
+
+
+def _is_hard_broker_rejection(reason: str, status_code: int | None) -> bool:
+    normalized = _normalize_broker_reason(reason)
+    hard_terms = ("market halted", "instrument halted", "close only", "tradeable", "tradable")
+    return status_code in {400, 403, 404} or any(term in normalized for term in hard_terms)
+
+
 def _default_pair_health() -> dict:
     return default_pair_health()
 
@@ -424,6 +467,85 @@ def _ensure_pair_health(instrument: str) -> dict:
         rec = _default_pair_health()
         _pair_health[instrument] = rec
     return rec
+
+
+def _normalize_instrument_name(instrument: str) -> str:
+    return str(instrument or "").strip().upper().replace("/", "_")
+
+
+def _extract_invalid_instrument_text(detail: str) -> str:
+    match = re.search(r"Invalid Instrument\s+([A-Z_]+)", detail or "", re.IGNORECASE)
+    return _normalize_instrument_name(match.group(1)) if match else ""
+
+
+def _mark_unsupported_instrument(instrument: str, reason: str) -> None:
+    normalized = _normalize_instrument_name(instrument)
+    if not normalized:
+        return
+    _unsupported_instruments.add(normalized)
+    _supported_currency_pairs_cache.discard(normalized)
+    mark_pair_failure(normalized, reason, "instrument", severity="hard")
+    log.warning(f"Dropping unsupported OANDA instrument {normalized}: {reason}")
+
+
+def get_supported_currency_pairs(force: bool = False) -> set[str]:
+    global _supported_currency_pairs_cache, _supported_currency_pairs_cache_at
+
+    if PAPER_TRADE or not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
+        return set(STATIC_ALL_PAIRS)
+
+    now = time.time()
+    if (
+        _supported_currency_pairs_cache
+        and not force
+        and now - _supported_currency_pairs_cache_at < SUPPORTED_PAIR_CACHE_SECS
+    ):
+        return set(_supported_currency_pairs_cache)
+
+    try:
+        resp = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/instruments")
+        supported = set()
+        for inst in resp.get("instruments", []):
+            if inst.get("type") != "CURRENCY":
+                continue
+            name = _normalize_instrument_name(inst.get("name", ""))
+            if not name or name in _unsupported_instruments:
+                continue
+            supported.add(name)
+            _ensure_pair_health(name)
+        if supported:
+            _supported_currency_pairs_cache = supported
+            _supported_currency_pairs_cache_at = now
+        return set(_supported_currency_pairs_cache)
+    except Exception as e:
+        log.warning(f"Falling back to cached supported pairs: {e}")
+        return set(_supported_currency_pairs_cache) or set(STATIC_ALL_PAIRS)
+
+
+def filter_supported_pairs(pairs: list[str], context: str = "pair list") -> list[str]:
+    supported = None
+    if not PAPER_TRADE and OANDA_API_KEY and OANDA_ACCOUNT_ID:
+        supported = get_supported_currency_pairs()
+
+    cleaned = []
+    dropped = []
+    seen = set()
+    for raw_pair in pairs:
+        pair = _normalize_instrument_name(raw_pair)
+        if not pair or pair in seen:
+            continue
+        seen.add(pair)
+        if pair in _unsupported_instruments:
+            dropped.append(pair)
+            continue
+        if supported is not None and pair not in supported:
+            dropped.append(pair)
+            continue
+        cleaned.append(pair)
+
+    if dropped:
+        log.warning(f"Dropped unsupported instruments from {context}: {sorted(set(dropped))}")
+    return cleaned
 
 
 def _pair_health_block_seconds(block_level: int) -> int:
@@ -511,6 +633,9 @@ def mark_pair_success(instrument: str, source: str, timeframe: str = "") -> None
 
 
 def is_pair_tradeable(instrument: str) -> bool:
+    instrument = _normalize_instrument_name(instrument)
+    if not instrument or instrument in _unsupported_instruments:
+        return False
     return get_pair_health_status(instrument) != "blocked"
 
 
@@ -612,24 +737,55 @@ def get_daily_atr(pair: str) -> tuple[float, float]:
     atr_pct = (atr / current_price) * 100
     return atr, atr_pct
 
+
+def _extract_invalid_instrument_from_http_error(exc: requests.HTTPError) -> str:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return ""
+    detail = (getattr(response, "text", "") or "")[:500]
+    return _extract_invalid_instrument_text(detail)
+
+
+def _fetch_pricing_chunk(chunk: list[str]) -> list[dict]:
+    cleaned_chunk = filter_supported_pairs(chunk, "pricing request")
+    if not cleaned_chunk:
+        return []
+
+    try:
+        prices = oanda_get(
+            f"/v3/accounts/{OANDA_ACCOUNT_ID}/pricing",
+            {"instruments": ",".join(cleaned_chunk)},
+        )
+        return prices.get("prices", [])
+    except requests.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code != 400:
+            raise
+
+        invalid = _extract_invalid_instrument_from_http_error(exc)
+        if invalid and invalid in cleaned_chunk:
+            _mark_unsupported_instrument(invalid, "pricing endpoint rejected instrument")
+            return _fetch_pricing_chunk([pair for pair in cleaned_chunk if pair != invalid])
+
+        if len(cleaned_chunk) == 1:
+            _mark_unsupported_instrument(cleaned_chunk[0], "pricing request failed")
+            return []
+
+        midpoint = len(cleaned_chunk) // 2
+        return _fetch_pricing_chunk(cleaned_chunk[:midpoint]) + _fetch_pricing_chunk(cleaned_chunk[midpoint:])
+
 def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: float = MAX_SPREAD_FILTER_PIPS) -> list:
     """Fetch all currency pairs, filter by spread, rank by ATR%, return top N."""
     if PAPER_TRADE or not OANDA_API_KEY:
         log.warning("Dynamic watchlist skipped (paper trade or no API key). Using static list.")
-        return STATIC_ALL_PAIRS
+        return filter_supported_pairs(STATIC_ALL_PAIRS, "static watchlist") or STATIC_ALL_PAIRS
 
     try:
-        resp = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/instruments")
-        instruments = resp.get("instruments", [])
-        fx_pairs = []
-        for inst in instruments:
-            if inst.get("type") == "CURRENCY":
-                name = inst["name"].replace("/", "_")
-                _ensure_pair_health(name)
-                fx_pairs.append(name)
+        fx_pairs = sorted(get_supported_currency_pairs(force=True))
 
         if not fx_pairs:
-            return STATIC_ALL_PAIRS
+            return filter_supported_pairs(STATIC_ALL_PAIRS, "static watchlist") or STATIC_ALL_PAIRS
 
         log.info(f"📊 Found {len(fx_pairs)} currency pairs. Checking spreads...")
 
@@ -638,9 +794,7 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
         spread_ok = []
         for i in range(0, len(fx_pairs), chunk_size):
             chunk = fx_pairs[i:i+chunk_size]
-            prices = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/pricing",
-                               {"instruments": ",".join(chunk)})
-            for price in prices.get("prices", []):
+            for price in _fetch_pricing_chunk(chunk):
                 inst = price["instrument"]
                 bid = float(price["closeoutBid"])
                 ask = float(price["closeoutAsk"])
@@ -658,7 +812,8 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
 
         if not spread_ok:
             log.warning("No pairs passed spread filter. Using static list.")
-            return [pair for pair in STATIC_ALL_PAIRS if is_pair_tradeable(pair)] or STATIC_ALL_PAIRS
+            fallback_pairs = [pair for pair in STATIC_ALL_PAIRS if is_pair_tradeable(pair)]
+            return filter_supported_pairs(fallback_pairs, "static fallback") or fallback_pairs or STATIC_ALL_PAIRS
 
         log.info(f"📊 {len(spread_ok)} pairs passed spread filter. Ranking by volatility...")
 
@@ -677,17 +832,17 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
         sorted_pairs = sorted(pair_volatility.items(), key=lambda x: x[1], reverse=True)
         top_pairs = [p for p, _ in sorted_pairs[:top_n]]
         log.info(f"🔄 Dynamic watchlist built: {top_pairs}")
-        return top_pairs
+        return filter_supported_pairs(top_pairs, "dynamic watchlist") or top_pairs
 
     except Exception as e:
         log.error(f"Dynamic watchlist build failed: {e}")
-        return STATIC_ALL_PAIRS
+        return filter_supported_pairs(STATIC_ALL_PAIRS, "static watchlist") or STATIC_ALL_PAIRS
 
 def refresh_dynamic_watchlist(force: bool = False):
     global DYNAMIC_PAIRS, LAST_WATCHLIST_UPDATE
     if not force and time.time() - LAST_WATCHLIST_UPDATE < WATCHLIST_UPDATE_INTERVAL:
         return False
-    new_list = build_dynamic_watchlist()
+    new_list = filter_supported_pairs(build_dynamic_watchlist(), "dynamic watchlist refresh")
     if new_list:
         DYNAMIC_PAIRS = new_list
         LAST_WATCHLIST_UPDATE = time.time()
@@ -734,12 +889,10 @@ def get_effective_scan_pairs(session: dict) -> tuple[list[str], list[str], list[
             active_pairs = _session_pairs_from_pool(session["name"], fallback_pool)
             health_pairs = [pair for pair in active_pairs if is_pair_tradeable(pair)]
 
-    tradable_pairs = [pair for pair in health_pairs if not is_pair_paused_by_news(pair)]
+    tradable_pairs = list(health_pairs)
 
     if not health_pairs:
         empty_reason = "pairs blocked"
-    elif not tradable_pairs:
-        empty_reason = "paused by news"
     elif fallback_used:
         empty_reason = "fallback pool active"
     else:
@@ -810,8 +963,9 @@ def _start_price_stream(pairs=None):
         pairs = DYNAMIC_PAIRS if DYNAMIC_PAIRS else STATIC_ALL_PAIRS
     # Always include pairs with open trades
     open_trade_pairs = list({t["instrument"] for t in open_trades})
-    all_pairs = list(set(pairs + open_trade_pairs))
+    all_pairs = filter_supported_pairs(list(set(pairs + open_trade_pairs)), "price stream")
     if not all_pairs:
+        log.warning("Skipping price stream start because no supported instruments remain.")
         return
 
     log.info(f"Starting price stream with {len(all_pairs)} pairs: {all_pairs[:5]}...")
@@ -1369,11 +1523,22 @@ def place_order(instrument: str, units: float, direction: str,
 
     if "error" in result or result.get("orderRejectTransaction") or result.get("orderCancelTransaction"):
         reject_message = _extract_oanda_error_message(result, str(result.get("error", "order rejected")))
-        log.error(f"[{label}] Order failed: {reject_message}")
-        hard_terms = ("market_halted", "market halted", "instrument halted", "close only", "tradeable", "tradable")
-        hard_failure = result.get("status_code") in {400, 403, 404} or any(term in reject_message.lower() for term in hard_terms)
+        status_code = result.get("status_code")
+        hard_failure = _is_hard_broker_rejection(reject_message, status_code)
+        halted_market = _is_market_halted_reason(reject_message)
+        if halted_market:
+            log.warning(f"[{label}] Market halted for {instrument}: {reject_message}")
+        else:
+            log.error(f"[{label}] Order failed: {reject_message}")
         mark_pair_failure(instrument, reject_message[:200], "order", severity="hard" if hard_failure else "soft")
-        telegram(f"⚠️ <b>{label} Order Failed</b>\n{instrument} {direction}\n{reject_message[:200]}")
+        if halted_market:
+            telegram(
+                f"⏸️ <b>{label} Entry Paused</b>\n"
+                f"{instrument} {direction}\n"
+                f"Market halted at broker. Pair temporarily blocked."
+            )
+        else:
+            telegram(f"⚠️ <b>{label} Order Failed</b>\n{instrument} {direction}\n{reject_message[:200]}")
         return {}
 
     fill = result.get("orderFillTransaction", {})
@@ -1409,8 +1574,7 @@ def close_trade_result(trade_id: str, label: str = "", units: float = None,
         reject_message = _extract_oanda_error_message(result, str(result.get("error", "close rejected")))
         log.error(f"[{label}] Close trade {trade_id} failed: {reject_message}")
         if instrument:
-            hard_terms = ("market_halted", "market halted", "close-only", "close only", "tradeable", "tradable")
-            hard_failure = any(term in reject_message.lower() for term in hard_terms) or result.get("status_code") in {400, 403, 404}
+            hard_failure = _is_hard_broker_rejection(reject_message, result.get("status_code"))
             mark_pair_failure(instrument, reject_message[:200], "close", severity="hard" if hard_failure else "soft")
         return False, reject_message
     fill = result.get("orderFillTransaction", {})
@@ -2196,18 +2360,21 @@ def compute_market_regime(df: pd.DataFrame) -> float:
     atr_ratio = float(atr_series.iloc[-1]) / float(atr_series.iloc[-41:-1].mean()) if len(atr_series) > 40 else 1.0
     ema50 = calc_ema(close, 50)
     ema_gap = float(close.iloc[-1]) / float(ema50.iloc[-1]) - 1
-    mult = 1.0
+    regime_atr_mult = 1.0
     if atr_ratio > REGIME_HIGH_VOL_ATR_RATIO:
-        mult *= REGIME_TIGHTEN_MULT
+        regime_atr_mult *= REGIME_TIGHTEN_MULT
     elif atr_ratio < REGIME_LOW_VOL_ATR_RATIO:
-        mult *= REGIME_LOOSEN_MULT
+        regime_atr_mult *= REGIME_LOOSEN_MULT
     if abs(ema_gap) > 0.01:
-        mult *= 0.90
+        regime_atr_mult *= 0.90
+    vix_regime = 1.0
     if _vix_level is not None:
-        if _vix_level > VIX_EXTREME_THRESHOLD:
-            mult *= 1.30
-        elif _vix_level > VIX_HIGH_THRESHOLD:
-            mult *= 1.10
+        if _vix_level > VIX_HIGH_THRESHOLD:
+            vix_regime = 1.30
+        elif _vix_level < VIX_LOW_THRESHOLD:
+            vix_regime = 0.75
+    dxy_regime = 1.20 if abs(_dxy_ema_gap or 0.0) > DXY_REGIME_THRESHOLD else 1.0
+    mult = regime_atr_mult * vix_regime * dxy_regime
     return round(mult, 3)
 
 
@@ -2222,6 +2389,7 @@ def _build_strategy_scoring_context() -> StrategyScoringContext:
         apply_macro_directional_bias=apply_macro_directional_bias,
         macro_filters=macro_filters,
         macro_news=macro_news,
+        is_pair_paused_by_news=is_pair_paused_by_news,
         market_regime_mult=_market_regime_mult,
         adaptive_offsets=_adaptive_offsets,
         dxy_ema_gap=_dxy_ema_gap,
@@ -2302,6 +2470,8 @@ def check_correlation_limit(instrument: str, direction: str) -> bool:
 def get_entry_block_reason(instrument: str, direction: str) -> str | None:
     if not is_pair_tradeable(instrument):
         reason = get_pair_health_reason(instrument)
+        if _is_market_halted_reason(reason):
+            return "market halted"
         return f"pair blocked{f' ({reason[:40]})' if reason else ''}"
     if time.time() < _pair_cooldowns.get(instrument, 0):
         return "cooldown"
@@ -2316,12 +2486,27 @@ def get_entry_block_reason(instrument: str, direction: str) -> str | None:
         return "no live price"
     return None
 
+
+def get_strategy_entry_block_reason(strategy: str, instrument: str, direction: str) -> str | None:
+    block_reason = get_entry_block_reason(instrument, direction)
+    if block_reason is not None:
+        return block_reason
+    if is_pair_paused_by_news(instrument) and strategy != "CARRY":
+        return "pre-news risk window"
+    return None
+
+
+def get_entry_risk_multiplier(strategy: str, instrument: str) -> float:
+    if is_pair_paused_by_news(instrument):
+        return NEWS_WINDOW_RISK_MULT
+    return 1.0
+
 def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     instrument = opp["instrument"]
     direction  = opp["direction"]
     acct = get_account_summary()
 
-    block_reason = get_entry_block_reason(instrument, direction)
+    block_reason = get_strategy_entry_block_reason(label, instrument, direction)
     if block_reason is not None:
         return None
 
@@ -2333,10 +2518,12 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
                   else KELLY_MULT_STANDARD if kelly_gap >= 25
                   else KELLY_MULT_SOLID if kelly_gap >= 10
                   else KELLY_MULT_MARGINAL)
+    risk_mult = get_entry_risk_multiplier(label, instrument)
+    effective_kelly_mult = kelly_mult * risk_mult
 
     account_currency = acct.get("currency", get_account_currency())
     units = calculate_units(instrument, balance, opp["sl_pips"],
-                           MAX_RISK_PER_TRADE, kelly_mult, account_currency)
+                           MAX_RISK_PER_TRADE, effective_kelly_mult, account_currency)
 
     price_data = get_current_price(instrument)
     entry_price = price_data["ask"] if direction == "LONG" else price_data["bid"]
@@ -2392,7 +2579,8 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         "atr_pct":        opp.get("atr_pct", 0),
         "spread_at_entry": opp.get("spread_pips", 0),
         "session_at_entry": get_current_session()["name"],
-        "kelly_mult":     kelly_mult,
+        "kelly_mult":     effective_kelly_mult,
+        "news_risk_mult": risk_mult,
         "partial_tp_hit": False,
         "unrealized_pnl": 0,
     }
@@ -2410,7 +2598,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     account_currency = acct.get("currency", account_currency)
     nav_value = float(acct.get("NAV", balance) or balance or 0)
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
-    risk_amount = balance * MAX_RISK_PER_TRADE * kelly_mult
+    risk_amount = balance * MAX_RISK_PER_TRADE * effective_kelly_mult
     trail_text = f"{trail_pips}p" if trail_pips else "None"
     rsi_text = f"{opp.get('rsi', 0):.1f}" if opp.get("rsi") is not None else "n/a"
     vol_text = f"{opp.get('vol_ratio', 0):.2f}x" if opp.get("vol_ratio") is not None else "n/a"
@@ -2441,7 +2629,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         f"Effective leverage: {effective_leverage_text}\n"
         f"Score: {opp['score']:.0f} | Signal: {opp.get('entry_signal', 'UNKNOWN')}\n"
         f"RSI: {rsi_text} | Vol: {vol_text} | Spread: {opp.get('spread_pips', 0):.1f}p\n"
-        f"Kelly: {kelly_mult:.2f}x | Session: {session['name']}"
+        f"Kelly: {effective_kelly_mult:.2f}x | Session: {session['name']}"
     )
 
     log.info(f"✅ [{label}] Opened {direction} {instrument} @ {actual_entry} "
@@ -2935,7 +3123,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_entry_block_reason(best_scalper["instrument"], best_scalper["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("SCALPER", best_scalper["instrument"], best_scalper["direction"]) or "entry blocked"
                             record_scan_decision("SCALPER", best_scalper["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("SCALPER", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -2951,7 +3139,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_entry_block_reason(best_trend["instrument"], best_trend["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("TREND", best_trend["instrument"], best_trend["direction"]) or "entry blocked"
                             record_scan_decision("TREND", best_trend["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("TREND", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -2967,7 +3155,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_entry_block_reason(best_reversal["instrument"], best_reversal["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("REVERSAL", best_reversal["instrument"], best_reversal["direction"]) or "entry blocked"
                             record_scan_decision("REVERSAL", best_reversal["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("REVERSAL", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -2983,7 +3171,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_entry_block_reason(best_breakout["instrument"], best_breakout["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("BREAKOUT", best_breakout["instrument"], best_breakout["direction"]) or "entry blocked"
                             record_scan_decision("BREAKOUT", best_breakout["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("BREAKOUT", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3001,7 +3189,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_entry_block_reason(best_carry["instrument"], best_carry["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("CARRY", best_carry["instrument"], best_carry["direction"]) or "entry blocked"
                             record_scan_decision("CARRY", best_carry["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("CARRY", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3018,7 +3206,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_entry_block_reason(best_asian["instrument"], best_asian["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("ASIAN_FADE", best_asian["instrument"], best_asian["direction"]) or "entry blocked"
                             record_scan_decision("ASIAN", best_asian["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("ASIAN", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3035,7 +3223,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_entry_block_reason(best_pn["instrument"], best_pn["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("POST_NEWS", best_pn["instrument"], best_pn["direction"]) or "entry blocked"
                             record_scan_decision("POST_NEWS", best_pn["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("POST_NEWS", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3052,7 +3240,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_entry_block_reason(best_pb["instrument"], best_pb["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("PULLBACK", best_pb["instrument"], best_pb["direction"]) or "entry blocked"
                             record_scan_decision("PULLBACK", best_pb["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("PULLBACK", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
