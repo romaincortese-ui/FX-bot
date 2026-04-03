@@ -21,6 +21,7 @@ The live bot still uses `main.py` as the orchestrator, but its core reusable log
 
 - `main.py`: live OANDA FX bot runtime
 - `macro_engine.py`: macro and news state builder
+- `backtest/`: integrated backtest engine, simulator, reporter, and CLI
 - `fxbot/`: shared modules extracted from the monolith
 - `fxbot/strategies/`: extracted direction and scoring layer for strategies
 - `tests/`: unit tests for extracted core logic
@@ -73,6 +74,41 @@ python macro_engine.py
 ```bash
 python main.py
 ```
+
+## Backtesting
+
+The repository now includes a lightweight backtester that reuses the existing scoring and direction logic instead of requiring a second strategy implementation.
+
+Files:
+
+- `backtest/config.py`: backtest runtime settings and strategy thresholds
+- `backtest/data.py`: cached historical candle loader for OANDA
+- `backtest/macro_sim.py`: macro/news replay from daily snapshots or static files
+- `backtest/simulator.py`: fills, slippage, spread, TP/SL, timeout, and partial TP simulation
+- `backtest/engine.py`: bar-by-bar strategy evaluation using the shared `StrategyScoringContext`
+- `backtest/reporter.py`: summary metrics and artifact export
+- `backtest/run_backtest.py`: CLI entrypoint
+
+Example:
+
+```bash
+python -m backtest.run_backtest --start 2023-01-01T00:00:00Z --end 2023-06-01T00:00:00Z --instruments EUR_USD,GBP_USD,USD_JPY --granularity M15
+```
+
+Useful environment variables:
+
+- `BACKTEST_START`, `BACKTEST_END`
+- `BACKTEST_INSTRUMENTS`
+- `BACKTEST_GRANULARITY`
+- `BACKTEST_CACHE_DIR`
+- `BACKTEST_MACRO_STATE_DIR`
+- `BACKTEST_OUTPUT_DIR`
+
+Artifacts are written to the configured output directory as:
+
+- `equity_curve.csv`
+- `trade_journal.csv`
+- `summary.json`
 
 ## GitHub setup
 
