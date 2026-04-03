@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from backtest.config import BacktestConfig
 from backtest.data import HistoricalDataProvider
 from backtest.engine import BacktestEngine
+from backtest.macro_sim import generate_daily_macro_snapshots
 from backtest.macro_sim import MacroReplay
 from backtest.reporter import build_backtest_report, export_backtest_artifacts
 from fxbot.config import env_str
@@ -42,6 +43,19 @@ def main() -> None:
         oanda_api_url=env_str("OANDA_API_URL", "https://api-fxpractice.oanda.com"),
         cache_dir=config.cache_dir,
     )
+    if config.generate_macro_states:
+        generate_daily_macro_snapshots(
+            config.start,
+            config.end,
+            config.macro_state_dir,
+            rates_file=config.macro_rates_file,
+            momentum_file=config.macro_momentum_file,
+            esi_file=config.macro_esi_file,
+            liquidity_file=config.macro_liquidity_file,
+            news_file=config.macro_news_file,
+            dxy_history_file=config.dxy_history_file,
+            vix_history_file=config.vix_history_file,
+        )
     macro_replay = MacroReplay.from_directory(config.macro_state_dir, config.start, config.end)
     engine = BacktestEngine(config, provider, macro_replay)
     equity_curve, trades = engine.run()

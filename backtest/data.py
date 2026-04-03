@@ -34,6 +34,7 @@ class HistoricalDataProvider:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
+        self._spread_profile_cache: dict[tuple[str, str], dict[str, float]] = {}
         if self.oanda_api_key:
             self.session.headers.update({"Authorization": f"Bearer {self.oanda_api_key}"})
 
@@ -91,12 +92,31 @@ class HistoricalDataProvider:
             rows = []
             for candle in candles:
                 mid = candle.get("mid", {})
+                bid = candle.get("bid", {})
+                ask = candle.get("ask", {})
+                open_price = float(mid.get("o", 0) or 0)
+                high_price = float(mid.get("h", 0) or 0)
+                low_price = float(mid.get("l", 0) or 0)
+                close_price = float(mid.get("c", 0) or 0)
+                if not mid and bid and ask:
+                    open_price = (float(bid.get("o", 0) or 0) + float(ask.get("o", 0) or 0)) / 2.0
+                    high_price = (float(bid.get("h", 0) or 0) + float(ask.get("h", 0) or 0)) / 2.0
+                    low_price = (float(bid.get("l", 0) or 0) + float(ask.get("l", 0) or 0)) / 2.0
+                    close_price = (float(bid.get("c", 0) or 0) + float(ask.get("c", 0) or 0)) / 2.0
                 rows.append({
                     "time": pd.to_datetime(candle.get("time"), utc=True, errors="coerce"),
-                    "open": float(mid.get("o", 0) or 0),
-                    "high": float(mid.get("h", 0) or 0),
-                    "low": float(mid.get("l", 0) or 0),
-                    "close": float(mid.get("c", 0) or 0),
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "close": close_price,
+                    "bid_open": float(bid.get("o", 0) or 0),
+                    "bid_high": float(bid.get("h", 0) or 0),
+                    "bid_low": float(bid.get("l", 0) or 0),
+                    "bid_close": float(bid.get("c", 0) or 0),
+                    "ask_open": float(ask.get("o", 0) or 0),
+                    "ask_high": float(ask.get("h", 0) or 0),
+                    "ask_low": float(ask.get("l", 0) or 0),
+                    "ask_close": float(ask.get("c", 0) or 0),
                     "volume": int(candle.get("volume", 0) or 0),
                     "complete": bool(candle.get("complete", True)),
                 })
@@ -122,6 +142,47 @@ class HistoricalDataProvider:
             return None
         sliced = df[df.index < _to_utc(end)].tail(bars)
         return sliced if not sliced.empty else None
+
+    def get_pair_spread_profile(self, instrument: str, granularity: str, start: datetime, end: datetime) -> dict[str, float]:
+        key = (instrument, granularity)
+        if key in self._spread_profile_cache:
+            return dict(self._spread_profile_cache[key])
+        df = self.get_candles(instrument, granularity, start, end, price="BA")
+        if df is None or df.empty or "bid_close" not in df.columns or "ask_close" not in df.columns:
+            profile = {"default": 0.8}
+            self._spread_profile_cache[key] = profile
+            return dict(profile)
+        valid = df[(df["bid_close"] > 0) & (df["ask_close"] > 0)].copy()
+        if valid.empty:
+            profile = {"default": 0.8}
+            self._spread_profile_cache[key] = profile
+            return dict(profile)
+        pip_divisor = 0.01 if "JPY" in instrument else 0.0001
+        valid["spread_pips"] = (valid["ask_close"] - valid["bid_close"]) / pip_divisor
+        valid["hour"] = valid.index.hour
+        profile = {"default": float(valid["spread_pips"].median())}
+        for hour, group in valid.groupby("hour"):
+            profile[f"hour_{int(hour):02d}"] = float(group["spread_pips"].median())
+        self._spread_profile_cache[key] = profile
+        return dict(profile)
+
+    def get_bid_ask_bar(self, instrument: str, granularity: str, now: datetime) -> dict[str, float] | None:
+        df = self.get_window(instrument, granularity, now + _granularity_step(granularity), 1, price="BA")
+        if df is None or df.empty:
+            return None
+        row = df.iloc[-1]
+        if float(row.get("bid_close", 0) or 0) <= 0 or float(row.get("ask_close", 0) or 0) <= 0:
+            return None
+        return {
+            "bid_open": float(row.get("bid_open", 0) or 0),
+            "bid_high": float(row.get("bid_high", 0) or 0),
+            "bid_low": float(row.get("bid_low", 0) or 0),
+            "bid_close": float(row.get("bid_close", 0) or 0),
+            "ask_open": float(row.get("ask_open", 0) or 0),
+            "ask_high": float(row.get("ask_high", 0) or 0),
+            "ask_low": float(row.get("ask_low", 0) or 0),
+            "ask_close": float(row.get("ask_close", 0) or 0),
+        }
 
     def save_json_snapshot(self, payload: dict, filename: str) -> Path:
         path = self.cache_dir / filename

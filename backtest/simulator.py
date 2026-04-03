@@ -38,13 +38,19 @@ class TradeSimulator:
         offset = pips_to_price(instrument, (spread_pips / 2.0) + slippage_pips)
         return raw_price - offset if direction == "LONG" else raw_price + offset
 
-    def open_trade(self, opp: dict[str, Any], label: str, opened_at: datetime, close_price: float, units: float, spread_pips: float, news_active: bool) -> dict[str, Any] | None:
+    def open_trade(self, opp: dict[str, Any], label: str, opened_at: datetime, close_price: float, units: float, spread_pips: float, news_active: bool, execution_bar: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if units <= 0 or not self.can_open_trade():
             return None
         direction = opp["direction"]
         effective_spread = max(spread_pips + self.config.spread_buffer_pips, self.config.spread_floor_pips)
         slippage = self.config.news_slippage_pips if news_active else self.config.slippage_pips
-        entry_price = self._entry_fill_price(opp["instrument"], direction, close_price, effective_spread, slippage)
+        if execution_bar and float(execution_bar.get("bid_close", 0) or 0) > 0 and float(execution_bar.get("ask_close", 0) or 0) > 0:
+            raw_entry = float(execution_bar["ask_close"]) if direction == "LONG" else float(execution_bar["bid_close"])
+            entry_price = raw_entry + pips_to_price(opp["instrument"], slippage if direction == "LONG" else -slippage)
+            execution_mode = "bid_ask"
+        else:
+            entry_price = self._entry_fill_price(opp["instrument"], direction, close_price, effective_spread, slippage)
+            execution_mode = "synthetic"
         ps = pip_size(opp["instrument"])
         if direction == "LONG":
             tp_price = entry_price + opp["tp_pips"] * ps
@@ -82,6 +88,7 @@ class TradeSimulator:
             "macro_confidence": opp.get("macro_confidence", 0.0),
             "regime_multiplier": opp.get("regime_multiplier", 1.0),
             "news_active_at_entry": news_active,
+            "execution_mode": execution_mode,
         }
         if label == "TREND" and opp.get("partial_tp_pips"):
             if direction == "LONG":
@@ -144,6 +151,13 @@ class TradeSimulator:
             high = float(bar["high"])
             low = float(bar["low"])
             close = float(bar["close"])
+            bid_high = float(bar.get("bid_high", 0) or 0)
+            bid_low = float(bar.get("bid_low", 0) or 0)
+            bid_close = float(bar.get("bid_close", 0) or 0)
+            ask_high = float(bar.get("ask_high", 0) or 0)
+            ask_low = float(bar.get("ask_low", 0) or 0)
+            ask_close = float(bar.get("ask_close", 0) or 0)
+            has_bid_ask = bid_close > 0 and ask_close > 0
             if trade["direction"] == "LONG":
                 trade["highest_price"] = max(float(trade.get("highest_price", trade["entry_price"])), high)
             else:
@@ -163,17 +177,21 @@ class TradeSimulator:
             exit_reason = None
             raw_exit_price = None
             if trade["direction"] == "LONG":
-                if low <= float(trade["sl_price"]):
+                trigger_low = bid_low if has_bid_ask else low
+                trigger_high = bid_high if has_bid_ask else high
+                if trigger_low <= float(trade["sl_price"]):
                     exit_reason = "STOP_LOSS"
                     raw_exit_price = float(trade["sl_price"])
-                elif high >= float(trade["tp_price"]):
+                elif trigger_high >= float(trade["tp_price"]):
                     exit_reason = "TAKE_PROFIT"
                     raw_exit_price = float(trade["tp_price"])
             else:
-                if high >= float(trade["sl_price"]):
+                trigger_high = ask_high if has_bid_ask else high
+                trigger_low = ask_low if has_bid_ask else low
+                if trigger_high >= float(trade["sl_price"]):
                     exit_reason = "STOP_LOSS"
                     raw_exit_price = float(trade["sl_price"])
-                elif low <= float(trade["tp_price"]):
+                elif trigger_low <= float(trade["tp_price"]):
                     exit_reason = "TAKE_PROFIT"
                     raw_exit_price = float(trade["tp_price"])
 
@@ -181,12 +199,18 @@ class TradeSimulator:
             held_hours = (current_time.timestamp() - trade["opened_ts"]) / 3600.0
             if exit_reason is None and held_hours >= max_hours:
                 exit_reason = "TIMEOUT"
-                raw_exit_price = close
+                raw_exit_price = bid_close if has_bid_ask and trade["direction"] == "LONG" else ask_close if has_bid_ask else close
 
             if exit_reason is None or raw_exit_price is None:
                 continue
 
-            fill_price = self._exit_fill_price(trade["instrument"], trade["direction"], raw_exit_price, trade["spread_pips"], self.config.slippage_pips)
+            if has_bid_ask:
+                if trade["direction"] == "LONG":
+                    fill_price = raw_exit_price - pips_to_price(trade["instrument"], self.config.slippage_pips)
+                else:
+                    fill_price = raw_exit_price + pips_to_price(trade["instrument"], self.config.slippage_pips)
+            else:
+                fill_price = self._exit_fill_price(trade["instrument"], trade["direction"], raw_exit_price, trade["spread_pips"], self.config.slippage_pips)
             self.open_trades.remove(trade)
             closed.append(self._record_closed_trade(trade, current_time, fill_price, exit_reason))
         return closed

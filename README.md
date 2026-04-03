@@ -83,8 +83,9 @@ Files:
 
 - `backtest/config.py`: backtest runtime settings and strategy thresholds
 - `backtest/data.py`: cached historical candle loader for OANDA
-- `backtest/macro_sim.py`: macro/news replay from daily snapshots or static files
-- `backtest/simulator.py`: fills, slippage, spread, TP/SL, timeout, and partial TP simulation
+- `backtest/build_macro_inputs.py`: helper CLI to build historical macro CSV/JSON inputs
+- `backtest/macro_sim.py`: macro/news replay plus daily macro snapshot generation
+- `backtest/simulator.py`: fills, slippage, spread, TP/SL, timeout, partial TP, and optional bid/ask execution
 - `backtest/engine.py`: bar-by-bar strategy evaluation using the shared `StrategyScoringContext`
 - `backtest/reporter.py`: summary metrics and artifact export
 - `backtest/run_backtest.py`: CLI entrypoint
@@ -103,12 +104,36 @@ Useful environment variables:
 - `BACKTEST_CACHE_DIR`
 - `BACKTEST_MACRO_STATE_DIR`
 - `BACKTEST_OUTPUT_DIR`
+- `BACKTEST_GENERATE_MACRO_STATES`
+- `BACKTEST_USE_BID_ASK_DATA`
+- `BACKTEST_MACRO_RATES_FILE`, `BACKTEST_MACRO_MOMENTUM_FILE`
+- `BACKTEST_MACRO_ESI_FILE`, `BACKTEST_MACRO_LIQUIDITY_FILE`
+- `BACKTEST_MACRO_NEWS_FILE`, `BACKTEST_DXY_HISTORY_FILE`, `BACKTEST_VIX_HISTORY_FILE`
+
+Historical macro input helper:
+
+```bash
+python -m backtest.build_macro_inputs --start 2023-01-01T00:00:00Z --end 2025-01-01T00:00:00Z --output-dir backtest_macro_inputs
+```
+
+What it does:
+
+- Builds `rates.csv`, `momentum.csv`, `esi.csv`, `liquidity.csv`, `dxy.csv`, `vix.csv`, and `news.json` in one directory.
+- Pulls US Treasury and TED spread history from FRED when `FRED_API_KEY` is available.
+- Pulls oil, copper, DXY, and VIX daily history from Yahoo Finance and derives momentum series for the snapshot generator.
+- Accepts optional override files for UK/EU/JP yields, ESI, liquidity, dairy, and news so you can fill gaps in sources without hand-editing the generated files.
 
 Artifacts are written to the configured output directory as:
 
 - `equity_curve.csv`
 - `trade_journal.csv`
 - `summary.json`
+
+Historical realism notes:
+
+- If `BACKTEST_GENERATE_MACRO_STATES=true`, the backtester writes one macro snapshot per day into `BACKTEST_MACRO_STATE_DIR` using the supplied historical macro input files.
+- If `BACKTEST_USE_BID_ASK_DATA=true`, OANDA candles are requested with bid/ask components and the simulator uses those for trade entry, stop-loss, take-profit, and timeout exits when available.
+- When bid/ask candles are not available, the engine falls back to pair-specific spread profiles built from cached bid/ask history and only then to ATR-based spread estimation.
 
 ## GitHub setup
 

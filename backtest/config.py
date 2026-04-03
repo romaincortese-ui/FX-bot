@@ -31,15 +31,24 @@ class BacktestConfig:
     cache_dir: str = "backtest_cache"
     macro_state_dir: str = "backtest_macro"
     output_dir: str = "backtest_output"
+    generate_macro_states: bool = True
     spread_buffer_pips: float = 0.2
     spread_floor_pips: float = 0.8
     slippage_pips: float = 0.4
     news_slippage_pips: float = 2.0
     round_trip_cost_pips: float = 0.5
+    use_bid_ask_data: bool = True
     max_open_trades: int = 8
     max_correlated_trades: int = 3
     max_risk_per_trade: float = 0.01
     leverage: float = 30.0
+    macro_rates_file: str = ""
+    macro_momentum_file: str = ""
+    macro_esi_file: str = ""
+    macro_liquidity_file: str = ""
+    macro_news_file: str = ""
+    dxy_history_file: str = ""
+    vix_history_file: str = ""
     strategies: list[str] = field(default_factory=lambda: [
         "SCALPER",
         "TREND",
@@ -66,15 +75,24 @@ class BacktestConfig:
             cache_dir=env_str("BACKTEST_CACHE_DIR", "backtest_cache"),
             macro_state_dir=env_str("BACKTEST_MACRO_STATE_DIR", "backtest_macro"),
             output_dir=env_str("BACKTEST_OUTPUT_DIR", "backtest_output"),
+            generate_macro_states=env_str("BACKTEST_GENERATE_MACRO_STATES", "true").lower() == "true",
             spread_buffer_pips=env_float("BACKTEST_SPREAD_BUFFER_PIPS", 0.2),
             spread_floor_pips=env_float("BACKTEST_SPREAD_FLOOR_PIPS", 0.8),
             slippage_pips=env_float("BACKTEST_SLIPPAGE_PIPS", 0.4),
             news_slippage_pips=env_float("BACKTEST_NEWS_SLIPPAGE_PIPS", 2.0),
             round_trip_cost_pips=env_float("BACKTEST_ROUND_TRIP_COST_PIPS", 0.5),
+            use_bid_ask_data=env_str("BACKTEST_USE_BID_ASK_DATA", "true").lower() == "true",
             max_open_trades=env_int("BACKTEST_MAX_OPEN_TRADES", env_int("MAX_OPEN_TRADES", 8)),
             max_correlated_trades=env_int("BACKTEST_MAX_CORRELATED_TRADES", env_int("MAX_CORRELATED_TRADES", 3)),
             max_risk_per_trade=env_float("BACKTEST_MAX_RISK_PER_TRADE", env_float("MAX_RISK_PER_TRADE", 0.01)),
             leverage=env_float("BACKTEST_LEVERAGE", env_float("LEVERAGE", 30.0)),
+            macro_rates_file=env_str("BACKTEST_MACRO_RATES_FILE", ""),
+            macro_momentum_file=env_str("BACKTEST_MACRO_MOMENTUM_FILE", ""),
+            macro_esi_file=env_str("BACKTEST_MACRO_ESI_FILE", ""),
+            macro_liquidity_file=env_str("BACKTEST_MACRO_LIQUIDITY_FILE", ""),
+            macro_news_file=env_str("BACKTEST_MACRO_NEWS_FILE", ""),
+            dxy_history_file=env_str("BACKTEST_DXY_HISTORY_FILE", ""),
+            vix_history_file=env_str("BACKTEST_VIX_HISTORY_FILE", ""),
             strategies=strategies,
         )
 

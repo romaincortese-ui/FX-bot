@@ -48,11 +48,13 @@ class BacktestEngine:
             ("POST_NEWS", score_post_news),
             ("PULLBACK", score_pullback),
         ]
+        self._spread_profiles: dict[str, dict[str, float]] = {}
 
     def _load_series(self, instrument: str, granularity: str) -> pd.DataFrame | None:
         key = (instrument, granularity)
         if key not in self.data_cache:
-            self.data_cache[key] = self.data_provider.get_candles(instrument, granularity, self.config.start - timedelta(days=10), self.config.end + timedelta(days=2)) or pd.DataFrame()
+            price = "MBA" if self.config.use_bid_ask_data else "M"
+            self.data_cache[key] = self.data_provider.get_candles(instrument, granularity, self.config.start - timedelta(days=10), self.config.end + timedelta(days=2), price=price) or pd.DataFrame()
         df = self.data_cache[key]
         return df if not df.empty else None
 
@@ -77,6 +79,14 @@ class BacktestEngine:
             "high": float(row["high"]),
             "low": float(row["low"]),
             "close": float(row["close"]),
+            "bid_open": float(row.get("bid_open", 0) or 0),
+            "bid_high": float(row.get("bid_high", 0) or 0),
+            "bid_low": float(row.get("bid_low", 0) or 0),
+            "bid_close": float(row.get("bid_close", 0) or 0),
+            "ask_open": float(row.get("ask_open", 0) or 0),
+            "ask_high": float(row.get("ask_high", 0) or 0),
+            "ask_low": float(row.get("ask_low", 0) or 0),
+            "ask_close": float(row.get("ask_close", 0) or 0),
             "volume": int(row.get("volume", 0)),
         }
 
@@ -180,6 +190,19 @@ class BacktestEngine:
         return round(regime_atr_mult * vix_regime * dxy_regime, 3)
 
     def _estimate_spread_pips(self, instrument: str, now: datetime) -> float:
+        bar = self._bar_at(instrument, self.config.granularity, now)
+        if bar and float(bar.get("bid_close", 0) or 0) > 0 and float(bar.get("ask_close", 0) or 0) > 0:
+            pip_divisor = 0.01 if "JPY" in instrument else 0.0001
+            return round(max(self.config.spread_floor_pips, (float(bar["ask_close"]) - float(bar["bid_close"])) / pip_divisor), 3)
+        if instrument not in self._spread_profiles:
+            self._spread_profiles[instrument] = self.data_provider.get_pair_spread_profile(instrument, self.config.granularity, self.config.start - timedelta(days=10), self.config.end + timedelta(days=2))
+        profile = self._spread_profiles[instrument]
+        by_hour = profile.get(f"hour_{now.hour:02d}")
+        if by_hour is not None:
+            return round(max(self.config.spread_floor_pips, float(by_hour)), 3)
+        default = profile.get("default")
+        if default is not None:
+            return round(max(self.config.spread_floor_pips, float(default)), 3)
         df = self._fetch_candles_until(instrument, self.config.granularity, 40, now)
         if df is None or len(df) < 20:
             return self.config.spread_floor_pips
@@ -298,6 +321,6 @@ class BacktestEngine:
                 units = self._position_units(best_opp["instrument"], float(bar["close"]), float(best_opp["sl_pips"]), self.simulator.balance, kelly_mult, "USD", current)
                 best_opp["kelly_mult"] = kelly_mult
                 news_active = self._is_pair_paused_by_news(macro_state, best_opp["instrument"], current)
-                self.simulator.open_trade(best_opp, label, current, float(bar["close"]), units, self._estimate_spread_pips(best_opp["instrument"], current), news_active)
+                self.simulator.open_trade(best_opp, label, current, float(bar["close"]), units, self._estimate_spread_pips(best_opp["instrument"], current), news_active, execution_bar=bar)
             current += step
         return self.simulator.equity_curve, self.simulator.closed_trades
