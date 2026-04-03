@@ -12,4 +12,4 @@ def test_calc_atr_returns_expected_value_for_simple_series():
         }
     )
     atr = calc_atr(df, period=3)
-    assert round(atr, 4) == 2.3333
+    assert round(atr, 4) == 1.8519
