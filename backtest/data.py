@@ -71,6 +71,11 @@ class HistoricalDataProvider:
     def get_candles(self, instrument: str, granularity: str, start: datetime, end: datetime, price: str = "M") -> pd.DataFrame | None:
         start = _to_utc(start)
         end = _to_utc(end)
+        now_utc = datetime.now(timezone.utc)
+        if end > now_utc:
+            end = now_utc
+        if start >= end:
+            return None
         cache_base = self._cache_base(instrument, granularity, start, end)
         cached = self._read_cache(cache_base)
         if cached is not None:

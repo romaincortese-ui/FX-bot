@@ -36,3 +36,19 @@ def test_get_candles_chunks_m5_requests_under_oanda_limit(tmp_path):
         chunk_start = datetime.fromisoformat(call["params"]["from"].replace("Z", "+00:00"))
         chunk_end = datetime.fromisoformat(call["params"]["to"].replace("Z", "+00:00"))
         assert chunk_end - chunk_start <= max_span
+
+
+def test_get_candles_clamps_future_end_before_oanda_request(tmp_path):
+    provider = HistoricalDataProvider(oanda_api_key="token", cache_dir=str(tmp_path))
+    provider.session = RecordingSession()
+
+    start = datetime.now(timezone.utc) - timedelta(days=2)
+    requested_end = datetime.now(timezone.utc) + timedelta(days=3)
+
+    provider.get_candles("EUR_USD", "M15", start, requested_end, price="MBA")
+
+    assert provider.session.calls
+    latest_allowed = datetime.now(timezone.utc)
+    for call in provider.session.calls:
+        chunk_end = datetime.fromisoformat(call["params"]["to"].replace("Z", "+00:00"))
+        assert chunk_end <= latest_allowed
