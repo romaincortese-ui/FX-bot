@@ -1,0 +1,510 @@
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping, Sequence
+
+import numpy as np
+
+from fxbot.fx_math import price_to_pips
+from fxbot.indicators import calc_atr, calc_bollinger_bands, calc_ema, calc_macd, calc_rsi, keltner_squeeze
+
+
+@dataclass
+class StrategyScoringContext:
+    get_spread_pips: Callable[[str], float]
+    fetch_candles: Callable[[str, str, int], Any]
+    reject: Callable[[str, str, str], None]
+    mark_pair_failure: Callable[..., None]
+    determine_direction: Callable[..., str]
+    get_post_news_events: Callable[[str, datetime | None], list[dict]]
+    apply_macro_directional_bias: Callable[[str, dict], None] | None
+    macro_filters: Mapping[str, str]
+    macro_news: Sequence[dict]
+    market_regime_mult: float
+    adaptive_offsets: Mapping[str, float]
+    dxy_ema_gap: float | None
+    dxy_gate_threshold: float
+    vix_level: float | None
+    vix_low_threshold: float
+    now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+
+
+def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    spread_pips = ctx.get_spread_pips(instrument)
+    if spread_pips > settings["SCALPER_MAX_SPREAD_PIPS"]:
+        ctx.reject("SCALPER", instrument, "spread too high")
+        return None
+
+    df_5m = ctx.fetch_candles(instrument, "M5", 60)
+    if df_5m is None or len(df_5m) < 30:
+        ctx.reject("SCALPER", instrument, "not enough M5 data")
+        return None
+
+    df_1h = ctx.fetch_candles(instrument, "H1", 60)
+    close = df_5m["close"]
+    volume = df_5m["volume"]
+    rsi = calc_rsi(close)
+    atr = calc_atr(df_5m, 14)
+    atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0
+
+    if rsi > settings["SCALPER_MAX_RSI"] or rsi < settings["SCALPER_MIN_RSI"]:
+        ctx.reject("SCALPER", instrument, "RSI out of range")
+        return None
+
+    ema9 = calc_ema(close, 9)
+    ema21 = calc_ema(close, 21)
+    crossed_now = float(ema9.iloc[-1]) > float(ema21.iloc[-1]) and float(ema9.iloc[-2]) <= float(ema21.iloc[-2])
+    crossed_recent = float(ema9.iloc[-2]) > float(ema21.iloc[-2]) and float(ema9.iloc[-3]) <= float(ema21.iloc[-3])
+    crossed_down_now = float(ema9.iloc[-1]) < float(ema21.iloc[-1]) and float(ema9.iloc[-2]) >= float(ema21.iloc[-2])
+    crossed = crossed_now or crossed_recent or crossed_down_now
+
+    avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 1
+    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
+    rsi_prev = calc_rsi(close.iloc[:-1])
+    rsi_delta = rsi - rsi_prev if not np.isnan(rsi_prev) else 0
+
+    ma_score = 30 if crossed else (15 if float(ema9.iloc[-1]) != float(ema21.iloc[-1]) else 0)
+    rsi_score = max(0, 40 - min(rsi, 100 - rsi)) if rsi < 45 or rsi > 55 else 0
+    vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
+    confluence = settings["SCALPER_CONFLUENCE_BONUS"] if crossed and vol_ratio > 1.5 and abs(rsi_delta) > 2 else 0
+    macd = calc_macd(df_5m)
+    macd_bonus = 5 if macd["cross_up"] or macd["cross_down"] else 0
+    spread_penalty = max(0, (spread_pips - 0.5) * 5)
+    score = ma_score + rsi_score + vol_score + confluence + macd_bonus - spread_penalty
+
+    direction = ctx.determine_direction(
+        instrument,
+        df_5m,
+        df_1h,
+        strategy="SCALPER",
+        dxy_ema_gap=ctx.dxy_ema_gap,
+        dxy_gate_threshold=ctx.dxy_gate_threshold,
+        apply_macro_directional_bias=ctx.apply_macro_directional_bias,
+    )
+    if direction == "SHORT" and not (crossed_down_now or float(ema9.iloc[-1]) < float(ema21.iloc[-1])):
+        score *= 0.5
+
+    eff_threshold = settings["SCALPER_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
+    eff_threshold += ctx.adaptive_offsets.get("SCALPER", 0)
+    if score < eff_threshold:
+        ctx.reject("SCALPER", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+        return None
+
+    tp_pips = max(settings["SCALPER_TP_MIN_PIPS"], min(settings["SCALPER_TP_MAX_PIPS"], price_to_pips(instrument, atr * settings["SCALPER_TP_ATR_MULT"])))
+    sl_pips = max(settings["SCALPER_SL_MIN_PIPS"], min(settings["SCALPER_SL_MAX_PIPS"], price_to_pips(instrument, atr * settings["SCALPER_SL_ATR_MULT"])))
+    if tp_pips / sl_pips < 1.5:
+        tp_pips = sl_pips * 1.5
+    return {
+        "instrument": instrument,
+        "score": round(score, 2),
+        "direction": direction,
+        "rsi": round(rsi, 2),
+        "rsi_delta": round(rsi_delta, 2),
+        "vol_ratio": round(vol_ratio, 2),
+        "atr": atr,
+        "atr_pct": round(atr_pct, 6),
+        "spread_pips": round(spread_pips, 2),
+        "tp_pips": round(tp_pips, 1),
+        "sl_pips": round(sl_pips, 1),
+        "trail_pips": settings["SCALPER_TRAIL_PIPS"],
+        "crossed_now": crossed_now or crossed_down_now,
+        "entry_signal": "CROSSOVER" if crossed else ("VOL_SPIKE" if vol_ratio > 2 else "TREND"),
+        "macd": macd,
+    }
+
+
+def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    spread_pips = ctx.get_spread_pips(instrument)
+    if spread_pips > settings["TREND_MAX_SPREAD_PIPS"]:
+        ctx.reject("TREND", instrument, "spread too high")
+        return None
+    df_5m = ctx.fetch_candles(instrument, "M5", 60)
+    df_1h = ctx.fetch_candles(instrument, "H1", 100)
+    df_4h = ctx.fetch_candles(instrument, "H4", 60)
+    if df_1h is None or len(df_1h) < 50:
+        ctx.mark_pair_failure(instrument, "insufficient H1 history for trend", "candle", timeframe="H1")
+        ctx.reject("TREND", instrument, "not enough H1 data")
+        return None
+    if df_4h is None or len(df_4h) < 30:
+        ctx.mark_pair_failure(instrument, "insufficient H4 history for trend", "candle", timeframe="H4")
+        ctx.reject("TREND", instrument, "not enough H4 data")
+        return None
+    close_1h = df_1h["close"]
+    close_4h = df_4h["close"]
+    ema20_1h = calc_ema(close_1h, 20)
+    ema50_1h = calc_ema(close_1h, 50)
+    ema20_4h = calc_ema(close_4h, 20)
+    ema50_4h = calc_ema(close_4h, 50)
+    bullish_4h = float(ema20_4h.iloc[-1]) > float(ema50_4h.iloc[-1])
+    bullish_1h = float(ema20_1h.iloc[-1]) > float(ema50_1h.iloc[-1])
+    if bullish_4h != bullish_1h:
+        ctx.reject("TREND", instrument, "H1/H4 trend not aligned")
+        return None
+    direction = "LONG" if bullish_4h else "SHORT"
+    score = 25
+    ema50_gap_4h = abs(float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1)
+    score += min(20, ema50_gap_4h * 1000)
+    ema20_dist = abs(float(close_1h.iloc[-1]) / float(ema20_1h.iloc[-1]) - 1)
+    score += 15 if ema20_dist < 0.002 else 8 if ema20_dist < 0.005 else 0
+    rsi_1h = calc_rsi(close_1h)
+    if (direction == "LONG" and 40 < rsi_1h < 65) or (direction == "SHORT" and 35 < rsi_1h < 60):
+        score += 10
+    macd_1h = calc_macd(df_1h)
+    if (direction == "LONG" and macd_1h["histogram"] > 0) or (direction == "SHORT" and macd_1h["histogram"] < 0):
+        score += 10
+    vol = df_1h["volume"]
+    vol_ratio = float(vol.iloc[-1]) / float(vol.iloc[-20:-1].mean()) if len(vol) >= 21 else 1
+    if vol_ratio > 1.2:
+        score += 5
+    if ctx.dxy_ema_gap is not None and "USD" in instrument:
+        base, _ = instrument.split("_")
+        usd_is_base = base == "USD"
+        dxy_long = ctx.dxy_ema_gap > ctx.dxy_gate_threshold
+        dxy_short = ctx.dxy_ema_gap < -ctx.dxy_gate_threshold
+        if (usd_is_base and direction == "LONG" and dxy_long) or (usd_is_base and direction == "SHORT" and dxy_short) or (not usd_is_base and direction == "SHORT" and dxy_long) or (not usd_is_base and direction == "LONG" and dxy_short):
+            score += 10
+    atr = calc_atr(df_1h, 14)
+    atr_pct = atr / float(close_1h.iloc[-1])
+    eff_threshold = settings["TREND_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
+    eff_threshold += ctx.adaptive_offsets.get("TREND", 0)
+    if score < eff_threshold:
+        ctx.reject("TREND", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+        return None
+    tp_pips = max(15, price_to_pips(instrument, atr * settings["TREND_TP_ATR_MULT"]))
+    sl_pips = max(8, price_to_pips(instrument, atr * settings["TREND_SL_ATR_MULT"]))
+    partial_tp_pips = max(10, price_to_pips(instrument, atr * settings["TREND_PARTIAL_TP_ATR"]))
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "partial_tp_pips": round(partial_tp_pips, 1), "trail_pips": settings["TREND_TRAIL_PIPS"], "entry_signal": "TREND_ALIGNED", "ema50_gap_4h": round(ema50_gap_4h * 100, 2)}
+
+
+def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    spread_pips = ctx.get_spread_pips(instrument)
+    if spread_pips > settings["REVERSAL_MAX_SPREAD_PIPS"]:
+        ctx.reject("REVERSAL", instrument, "spread too high")
+        return None
+    if session["aggression"] == "MINIMAL":
+        ctx.reject("REVERSAL", instrument, "session too quiet")
+        return None
+    df_5m = ctx.fetch_candles(instrument, "M5", 60)
+    df_1h = ctx.fetch_candles(instrument, "H1", 60)
+    if df_5m is None or len(df_5m) < 30:
+        ctx.reject("REVERSAL", instrument, "not enough M5 data")
+        return None
+    close = df_5m["close"]
+    rsi = calc_rsi(close)
+    is_oversold = rsi <= settings["REVERSAL_RSI_OVERSOLD"]
+    is_overbought = rsi >= settings["REVERSAL_RSI_OVERBOUGHT"]
+    if not (is_oversold or is_overbought):
+        ctx.reject("REVERSAL", instrument, "RSI not stretched")
+        return None
+    direction = "LONG" if is_oversold else "SHORT"
+    score = min(30, (settings["REVERSAL_RSI_OVERSOLD"] - rsi) * 3) if is_oversold else min(30, (rsi - settings["REVERSAL_RSI_OVERBOUGHT"]) * 3)
+    bb = calc_bollinger_bands(df_5m)
+    price = float(close.iloc[-1])
+    if (is_oversold and price <= bb["lower"]) or (is_overbought and price >= bb["upper"]):
+        score += 15
+    rsi_prev = calc_rsi(close.iloc[:-5])
+    if (is_oversold and rsi > rsi_prev) or (is_overbought and rsi < rsi_prev):
+        score += 10
+    volume = df_5m["volume"]
+    avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 1
+    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1
+    if vol_ratio > 2.0:
+        score += 10
+    if df_1h is not None and len(df_1h) >= 30:
+        low_1h = float(df_1h["low"].iloc[-20:].min())
+        high_1h = float(df_1h["high"].iloc[-20:].max())
+        if is_oversold and abs(price - low_1h) / low_1h < 0.002:
+            score += 10
+        elif is_overbought and abs(price - high_1h) / high_1h < 0.002:
+            score += 10
+    atr = calc_atr(df_5m, 14)
+    atr_pct = atr / float(close.iloc[-1])
+    eff_threshold = settings["REVERSAL_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
+    eff_threshold += ctx.adaptive_offsets.get("REVERSAL", 0)
+    if score < eff_threshold:
+        ctx.reject("REVERSAL", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+        return None
+    tp_pips = max(8, price_to_pips(instrument, atr * settings["REVERSAL_TP_ATR_MULT"]))
+    sl_pips = max(5, price_to_pips(instrument, atr * settings["REVERSAL_SL_ATR_MULT"]))
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["REVERSAL_TRAIL_PIPS"], "entry_signal": "OVERSOLD_BOUNCE" if is_oversold else "OVERBOUGHT_FADE"}
+
+
+def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    spread_pips = ctx.get_spread_pips(instrument)
+    if spread_pips > settings["BREAKOUT_MAX_SPREAD_PIPS"]:
+        ctx.reject("BREAKOUT", instrument, "spread too high")
+        return None
+    if session["aggression"] in ("MINIMAL", "LOW"):
+        ctx.reject("BREAKOUT", instrument, "session not active enough")
+        return None
+    df_15m = ctx.fetch_candles(instrument, "M15", 80)
+    df_1h = ctx.fetch_candles(instrument, "H1", 60)
+    if df_15m is None or len(df_15m) < 40:
+        ctx.mark_pair_failure(instrument, "insufficient M15 history for breakout", "candle", timeframe="M15")
+        ctx.reject("BREAKOUT", instrument, "not enough M15 data")
+        return None
+    squeeze = keltner_squeeze(df_15m)
+    if not squeeze["in_squeeze"] and squeeze["squeeze_bars"] < 5:
+        ctx.reject("BREAKOUT", instrument, "no squeeze")
+        return None
+    score = min(25, squeeze["squeeze_bars"] * 3)
+    score += 20 if squeeze["bb_percentile"] < 20 else 10 if squeeze["bb_percentile"] < 35 else 0
+    volume = df_15m["volume"]
+    recent_vol = float(volume.iloc[-3:].mean())
+    avg_vol = float(volume.iloc[-20:-3].mean()) if len(volume) >= 23 else 1
+    vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1
+    if vol_ratio > 1.3:
+        score += 10
+    macd = calc_macd(df_15m)
+    hist_prev = float((df_15m["close"].ewm(span=12).mean() - df_15m["close"].ewm(span=26).mean() - (df_15m["close"].ewm(span=12).mean() - df_15m["close"].ewm(span=26).mean()).ewm(span=9).mean()).iloc[-2])
+    if abs(macd["histogram"]) > abs(hist_prev):
+        score += 10
+    direction = ctx.determine_direction(instrument, df_15m, df_1h, strategy="BREAKOUT", dxy_ema_gap=ctx.dxy_ema_gap, dxy_gate_threshold=ctx.dxy_gate_threshold, apply_macro_directional_bias=ctx.apply_macro_directional_bias)
+    atr = calc_atr(df_15m, 14)
+    atr_pct = atr / float(df_15m["close"].iloc[-1])
+    eff_threshold = settings["BREAKOUT_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
+    eff_threshold += ctx.adaptive_offsets.get("BREAKOUT", 0)
+    if score < eff_threshold:
+        ctx.reject("BREAKOUT", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+        return None
+    tp_pips = max(15, price_to_pips(instrument, atr * settings["BREAKOUT_TP_ATR_MULT"]))
+    sl_pips = max(5, price_to_pips(instrument, atr * settings["BREAKOUT_SL_ATR_MULT"]))
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "squeeze_bars": squeeze["squeeze_bars"], "bb_percentile": round(squeeze["bb_percentile"], 1), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["BREAKOUT_TRAIL_PIPS"], "entry_signal": "BB_KC_SQUEEZE"}
+
+
+def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if ctx.market_regime_mult > 1.05:
+        ctx.reject("CARRY", instrument, "regime too hot")
+        return None
+    if ctx.vix_level is not None and ctx.vix_level > settings["CARRY_VIX_MAX"]:
+        ctx.reject("CARRY", instrument, "VIX too high")
+        return None
+    if ctx.macro_filters.get(instrument.upper()) != "LONG_ONLY":
+        ctx.reject("CARRY", instrument, "no long carry bias")
+        return None
+    spread_pips = ctx.get_spread_pips(instrument)
+    if spread_pips > settings["CARRY_MAX_SPREAD_PIPS"]:
+        ctx.reject("CARRY", instrument, "spread too high")
+        return None
+    df_4h = ctx.fetch_candles(instrument, "H4", 60)
+    if df_4h is None or len(df_4h) < 30:
+        ctx.mark_pair_failure(instrument, "insufficient H4 history for carry", "candle", timeframe="H4")
+        ctx.reject("CARRY", instrument, "not enough H4 data")
+        return None
+    close_4h = df_4h["close"]
+    ema20_4h = calc_ema(close_4h, 20)
+    ema50_4h = calc_ema(close_4h, 50)
+    bullish = float(ema20_4h.iloc[-1]) > float(ema50_4h.iloc[-1])
+    if not bullish:
+        ctx.reject("CARRY", instrument, "4H trend not up")
+        return None
+    score = 25
+    ema50_gap = float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1
+    score += min(15, abs(ema50_gap) * 500)
+    rsi_4h = calc_rsi(close_4h)
+    score += 15 if 40 < rsi_4h < 65 else 8 if 35 < rsi_4h < 70 else 0
+    atr = calc_atr(df_4h, 14)
+    atr_pct = atr / float(close_4h.iloc[-1])
+    if atr_pct < 0.005:
+        score += 10
+    macd_4h = calc_macd(df_4h)
+    if macd_4h["histogram"] > 0:
+        score += 10
+    if ctx.vix_level is not None and ctx.vix_level < ctx.vix_low_threshold:
+        score += 5
+    eff_threshold = settings["CARRY_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
+    eff_threshold += ctx.adaptive_offsets.get("CARRY", 0)
+    if score < eff_threshold:
+        ctx.reject("CARRY", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+        return None
+    tp_pips = max(15, price_to_pips(instrument, atr * settings["CARRY_TP_ATR_MULT"]))
+    sl_pips = max(10, price_to_pips(instrument, atr * settings["CARRY_SL_ATR_MULT"]))
+    return {"instrument": instrument, "score": round(score, 2), "direction": "LONG", "rsi": round(rsi_4h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["CARRY_TRAIL_PIPS"], "entry_signal": "CARRY_YIELD"}
+
+
+def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if session["name"] != "TOKYO":
+        ctx.reject("ASIAN_FADE", instrument, "Tokyo only")
+        return None
+    spread_pips = ctx.get_spread_pips(instrument)
+    if spread_pips > settings["ASIAN_FADE_MAX_SPREAD_PIPS"]:
+        ctx.reject("ASIAN_FADE", instrument, "spread too high")
+        return None
+    df_5m = ctx.fetch_candles(instrument, "M5", 60)
+    if df_5m is None or len(df_5m) < 30:
+        ctx.reject("ASIAN_FADE", instrument, "not enough M5 data")
+        return None
+    close = df_5m["close"]
+    rsi = calc_rsi(close)
+    is_oversold = rsi <= settings["ASIAN_FADE_RSI_LOW"]
+    is_overbought = rsi >= settings["ASIAN_FADE_RSI_HIGH"]
+    if not (is_oversold or is_overbought):
+        ctx.reject("ASIAN_FADE", instrument, "RSI not stretched")
+        return None
+    direction = "LONG" if is_oversold else "SHORT"
+    bb = calc_bollinger_bands(df_5m)
+    price = float(close.iloc[-1])
+    score = 0
+    if (is_oversold and price <= bb["lower"]) or (is_overbought and price >= bb["upper"]):
+        score += 25
+    elif (is_oversold and price <= bb["lower"] * 1.001) or (is_overbought and price >= bb["upper"] * 0.999):
+        score += 15
+    else:
+        ctx.reject("ASIAN_FADE", instrument, "not at range edge")
+        return None
+    score += min(20, (settings["ASIAN_FADE_RSI_LOW"] - rsi) * 2) if is_oversold else min(20, (rsi - settings["ASIAN_FADE_RSI_HIGH"]) * 2)
+    session_high = float(df_5m["high"].iloc[-18:].max())
+    session_low = float(df_5m["low"].iloc[-18:].min())
+    session_range = session_high - session_low
+    atr = calc_atr(df_5m, 14)
+    if session_range < atr * 1.5:
+        score += 10
+    volume = df_5m["volume"]
+    avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 1
+    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1
+    if vol_ratio > 1.5:
+        score += 10
+    rsi_prev = calc_rsi(close.iloc[:-3])
+    if (is_oversold and rsi > rsi_prev) or (is_overbought and rsi < rsi_prev):
+        score += 5
+    atr_pct = atr / float(close.iloc[-1])
+    eff_threshold = settings["ASIAN_FADE_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
+    eff_threshold += ctx.adaptive_offsets.get("ASIAN_FADE", 0)
+    if score < eff_threshold:
+        ctx.reject("ASIAN_FADE", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+        return None
+    tp_pips = max(5, min(20, price_to_pips(instrument, atr * settings["ASIAN_FADE_TP_ATR_MULT"])))
+    sl_pips = max(4, min(15, price_to_pips(instrument, atr * settings["ASIAN_FADE_SL_ATR_MULT"])))
+    if tp_pips / sl_pips < 1.2:
+        tp_pips = sl_pips * 1.2
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["ASIAN_FADE_TRAIL_PIPS"], "entry_signal": "ASIAN_RANGE_FADE"}
+
+
+def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    if not ctx.macro_news:
+        ctx.reject("POST_NEWS", instrument, "no macro news loaded")
+        return None
+    now = ctx.now_provider()
+    matching_events = ctx.get_post_news_events(instrument, now)
+    if not matching_events:
+        ctx.reject("POST_NEWS", instrument, "no recent high-impact post-news window")
+        return None
+    spread_pips = ctx.get_spread_pips(instrument)
+    if spread_pips > settings["POST_NEWS_MAX_SPREAD_PIPS"]:
+        ctx.reject("POST_NEWS", instrument, "spread too high")
+        return None
+    df_5m = ctx.fetch_candles(instrument, "M5", 30)
+    if df_5m is None or len(df_5m) < 10:
+        ctx.reject("POST_NEWS", instrument, "not enough M5 data")
+        return None
+    close = df_5m["close"]
+    volume = df_5m["volume"]
+    atr = calc_atr(df_5m, 14)
+    pre_news_high = float(df_5m["high"].iloc[-10:-3].max())
+    pre_news_low = float(df_5m["low"].iloc[-10:-3].min())
+    current_close = float(close.iloc[-1])
+    broke_high = current_close > pre_news_high
+    broke_low = current_close < pre_news_low
+    if not (broke_high or broke_low):
+        ctx.reject("POST_NEWS", instrument, "no breakout yet")
+        return None
+    direction = "LONG" if broke_high else "SHORT"
+    score = 25
+    breakout_size = abs(current_close - (pre_news_high if broke_high else pre_news_low))
+    score += 15 if breakout_size > atr * 0.5 else 8 if breakout_size > atr * 0.25 else 0
+    avg_vol = float(volume.iloc[-10:-3].mean()) if len(volume) >= 13 else 1
+    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1
+    score += 15 if vol_ratio > 2.0 else 10 if vol_ratio > 1.5 else 0
+    macd = calc_macd(df_5m)
+    if (direction == "LONG" and macd["histogram"] > 0) or (direction == "SHORT" and macd["histogram"] < 0):
+        score += 10
+    rsi = calc_rsi(close)
+    if (direction == "LONG" and 50 < rsi < 80) or (direction == "SHORT" and 20 < rsi < 50):
+        score += 5
+    atr_pct = atr / float(close.iloc[-1])
+    eff_threshold = settings["POST_NEWS_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
+    eff_threshold += ctx.adaptive_offsets.get("POST_NEWS", 0)
+    if score < eff_threshold:
+        ctx.reject("POST_NEWS", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+        return None
+    tp_pips = max(10, price_to_pips(instrument, atr * settings["POST_NEWS_TP_ATR_MULT"]))
+    sl_pips = max(5, price_to_pips(instrument, atr * settings["POST_NEWS_SL_ATR_MULT"]))
+    if tp_pips / sl_pips < 1.5:
+        tp_pips = sl_pips * 1.5
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["POST_NEWS_TRAIL_PIPS"], "entry_signal": "POST_NEWS_BREAKOUT"}
+
+
+def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
+    spread_pips = ctx.get_spread_pips(instrument)
+    if spread_pips > settings["PULLBACK_MAX_SPREAD_PIPS"]:
+        ctx.reject("PULLBACK", instrument, "spread too high")
+        return None
+    if session["aggression"] == "MINIMAL":
+        ctx.reject("PULLBACK", instrument, "session too quiet")
+        return None
+    df_1h = ctx.fetch_candles(instrument, "H1", 100)
+    df_4h = ctx.fetch_candles(instrument, "H4", 60)
+    if df_1h is None or len(df_1h) < 50:
+        ctx.mark_pair_failure(instrument, "insufficient H1 history for pullback", "candle", timeframe="H1")
+        ctx.reject("PULLBACK", instrument, "not enough H1 data")
+        return None
+    if df_4h is None or len(df_4h) < 30:
+        ctx.mark_pair_failure(instrument, "insufficient H4 history for pullback", "candle", timeframe="H4")
+        ctx.reject("PULLBACK", instrument, "not enough H4 data")
+        return None
+    close_4h = df_4h["close"]
+    close_1h = df_1h["close"]
+    ema20_4h = calc_ema(close_4h, 20)
+    ema50_4h = calc_ema(close_4h, 50)
+    bullish_4h = float(ema20_4h.iloc[-1]) > float(ema50_4h.iloc[-1])
+    ema50_gap = abs(float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1)
+    if ema50_gap < 0.002:
+        ctx.reject("PULLBACK", instrument, "4H trend too weak")
+        return None
+    direction = "LONG" if bullish_4h else "SHORT"
+    ema20_1h = calc_ema(close_1h, 20)
+    current_price = float(close_1h.iloc[-1])
+    ema20_val = float(ema20_1h.iloc[-1])
+    atr = calc_atr(df_1h, 14)
+    pullback_depth = abs(current_price - ema20_val) / atr if atr > 0 else 999
+    if direction == "LONG":
+        if current_price > ema20_val:
+            ctx.reject("PULLBACK", instrument, "no dip yet")
+            return None
+        if pullback_depth > 2.0:
+            ctx.reject("PULLBACK", instrument, "pullback too deep")
+            return None
+    else:
+        if current_price < ema20_val:
+            ctx.reject("PULLBACK", instrument, "no rally yet")
+            return None
+        if pullback_depth > 2.0:
+            ctx.reject("PULLBACK", instrument, "pullback too deep")
+            return None
+    score = 20
+    score += min(15, ema50_gap * 800)
+    score += 15 if 0.5 <= pullback_depth <= 1.5 else 8 if pullback_depth <= 2.0 else 0
+    rsi_1h = calc_rsi(close_1h)
+    if direction == "LONG" and rsi_1h < 45:
+        score += min(15, (45 - rsi_1h) * 1.5)
+    elif direction == "SHORT" and rsi_1h > 55:
+        score += min(15, (rsi_1h - 55) * 1.5)
+    else:
+        ctx.reject("PULLBACK", instrument, "RSI not supportive")
+        return None
+    macd_1h = calc_macd(df_1h)
+    if (direction == "LONG" and macd_1h["histogram"] > 0) or (direction == "SHORT" and macd_1h["histogram"] < 0):
+        score += 10
+    bias = ctx.macro_filters.get(instrument.upper())
+    if (direction == "LONG" and bias == "LONG_ONLY") or (direction == "SHORT" and bias == "SHORT_ONLY"):
+        score += 10
+    atr_pct = atr / float(close_1h.iloc[-1])
+    eff_threshold = settings["PULLBACK_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
+    eff_threshold += ctx.adaptive_offsets.get("PULLBACK", 0)
+    if score < eff_threshold:
+        ctx.reject("PULLBACK", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+        return None
+    tp_pips = max(12, price_to_pips(instrument, atr * settings["PULLBACK_TP_ATR_MULT"]))
+    sl_pips = max(6, price_to_pips(instrument, atr * settings["PULLBACK_SL_ATR_MULT"]))
+    if tp_pips / sl_pips < 1.5:
+        tp_pips = sl_pips * 1.5
+    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["PULLBACK_TRAIL_PIPS"], "entry_signal": "PULLBACK_REENTRY", "pullback_depth": round(pullback_depth, 2)}

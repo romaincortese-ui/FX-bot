@@ -23,6 +23,42 @@ import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from fxbot.config import validate_main_config
+from fxbot.fx_math import (
+    pip_size as core_pip_size,
+    pip_value_from_conversion,
+    pips_to_price as core_pips_to_price,
+    price_to_pips as core_price_to_pips,
+)
+from fxbot.indicators import (
+    calc_atr as core_calc_atr,
+    calc_atr_pct as core_calc_atr_pct,
+    calc_bollinger_bands as core_calc_bollinger_bands,
+    calc_ema as core_calc_ema,
+    calc_macd as core_calc_macd,
+    calc_rsi as core_calc_rsi,
+    keltner_squeeze as core_keltner_squeeze,
+    percentile_rank as core_percentile_rank,
+)
+from fxbot.pair_health import (
+    apply_pair_failure,
+    apply_pair_success,
+    can_count_pair_health_event,
+    default_pair_health,
+    pair_health_block_seconds,
+)
+from fxbot.risk import would_breach_correlation_limit
+from fxbot.strategies import StrategyScoringContext
+from fxbot.strategies import determine_direction as core_determine_direction
+from fxbot.strategies import score_asian_fade as core_score_asian_fade
+from fxbot.strategies import score_breakout as core_score_breakout
+from fxbot.strategies import score_carry as core_score_carry
+from fxbot.strategies import score_post_news as core_score_post_news
+from fxbot.strategies import score_pullback as core_score_pullback
+from fxbot.strategies import score_reversal as core_score_reversal
+from fxbot.strategies import score_scalper as core_score_scalper
+from fxbot.strategies import score_trend as core_score_trend
+
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
@@ -246,6 +282,8 @@ HEARTBEAT_INTERVAL  = int(os.getenv("HEARTBEAT_INTERVAL",  "3600"))
 KLINE_CACHE_TTL     = 15
 MAX_KLINE_CACHE     = 200
 
+validate_main_config(globals())
+
 # ═══════════════════════════════════════════════════════════════
 #  LOGGING
 # ═══════════════════════════════════════════════════════════════
@@ -331,26 +369,28 @@ _stop_stream_event = threading.Event()
 # ═══════════════════════════════════════════════════════════════
 
 def pip_size(instrument: str) -> float:
-    return 0.01 if "JPY" in instrument else 0.0001
+    return core_pip_size(instrument)
 
 def price_to_pips(instrument: str, price_diff: float) -> float:
-    return price_diff / pip_size(instrument)
+    return core_price_to_pips(instrument, price_diff)
 
 def pips_to_price(instrument: str, pips: float) -> float:
-    return pips * pip_size(instrument)
+    return core_pips_to_price(instrument, pips)
 
 
 def uses_oanda_native_units() -> bool:
     return bool(OANDA_API_KEY and OANDA_ACCOUNT_ID and not PAPER_TRADE)
 
 def pip_value(instrument: str, units: float, account_currency: str = "GBP") -> float:
-    if ACCOUNT_TYPE == "spread_bet" and not uses_oanda_native_units():
-        return abs(units)
     base_currency, quote_currency = instrument.split("_")
     quote_to_account = estimate_fx_conversion_rate(quote_currency, account_currency)
-    if quote_to_account is None:
-        return abs(units) * pip_size(instrument)
-    return abs(units) * pip_size(instrument) * quote_to_account
+    return pip_value_from_conversion(
+        instrument,
+        units,
+        quote_to_account=quote_to_account,
+        account_type=ACCOUNT_TYPE,
+        uses_native_units=uses_oanda_native_units(),
+    )
 
 
 def _extract_oanda_error_message(payload: dict | None, fallback_text: str = "") -> str:
@@ -375,29 +415,7 @@ def _extract_oanda_error_message(payload: dict | None, fallback_text: str = "") 
 
 
 def _default_pair_health() -> dict:
-    return {
-        "status": "healthy",
-        "health_score": 100.0,
-        "blocked_until": 0.0,
-        "block_level": 0,
-        "next_probe_at": 0.0,
-        "clean_probes": 0,
-        "last_failure_reason": "",
-        "last_failure_at": 0.0,
-        "last_recovery_at": 0.0,
-        "last_quote_ok_at": 0.0,
-        "last_order_ok_at": 0.0,
-        "last_close_ok_at": 0.0,
-        "last_spread_ok_at": 0.0,
-        "last_candle_ok_at": {},
-        "consecutive_quote_failures": 0,
-        "consecutive_order_failures": 0,
-        "consecutive_close_failures": 0,
-        "consecutive_spread_failures": 0,
-        "consecutive_candle_failures": {},
-        "last_failure_buckets": {},
-        "last_success_buckets": {},
-    }
+    return default_pair_health()
 
 
 def _ensure_pair_health(instrument: str) -> dict:
@@ -409,25 +427,18 @@ def _ensure_pair_health(instrument: str) -> dict:
 
 
 def _pair_health_block_seconds(block_level: int) -> int:
-    ladder = [
-        PAIR_HEALTH_BLOCK_BASE_SECS,
-        PAIR_HEALTH_BLOCK_BASE_SECS * 4,
-        PAIR_HEALTH_BLOCK_BASE_SECS * 12,
-        PAIR_HEALTH_BLOCK_MAX_SECS,
-    ]
-    idx = max(0, min(block_level - 1, len(ladder) - 1))
-    return min(ladder[idx], PAIR_HEALTH_BLOCK_MAX_SECS)
+    return pair_health_block_seconds(block_level, PAIR_HEALTH_BLOCK_BASE_SECS, PAIR_HEALTH_BLOCK_MAX_SECS)
 
 
 def _can_count_pair_health_event(rec: dict, bucket: str, success: bool) -> bool:
-    now = time.time()
-    store = rec["last_success_buckets"] if success else rec["last_failure_buckets"]
-    cooldown = PAIR_HEALTH_SUCCESS_COOLDOWN_SECS if success else PAIR_HEALTH_FAILURE_COOLDOWN_SECS
-    last_at = float(store.get(bucket, 0.0))
-    if now - last_at < cooldown:
-        return False
-    store[bucket] = now
-    return True
+    return can_count_pair_health_event(
+        rec,
+        bucket,
+        success,
+        now=time.time(),
+        success_cooldown=PAIR_HEALTH_SUCCESS_COOLDOWN_SECS,
+        failure_cooldown=PAIR_HEALTH_FAILURE_COOLDOWN_SECS,
+    )
 
 
 def get_pair_health_status(instrument: str) -> str:
@@ -441,62 +452,29 @@ def get_pair_health_reason(instrument: str) -> str:
 def mark_pair_failure(instrument: str, reason: str, source: str, severity: str = "soft", timeframe: str = "") -> None:
     rec = _ensure_pair_health(instrument)
     bucket = f"{source}:{timeframe or '-'}"
-    if not _can_count_pair_health_event(rec, bucket, success=False):
-        return
-
     now = time.time()
-    prev_status = rec["status"]
-    rec["last_failure_reason"] = reason
-    rec["last_failure_at"] = now
-    rec["clean_probes"] = 0
-    penalty = 35.0 if source == "close" and severity == "hard" else 25.0 if severity == "hard" else 10.0
-    rec["health_score"] = max(0.0, float(rec.get("health_score", 100.0)) - penalty)
+    if not can_count_pair_health_event(
+        rec,
+        bucket,
+        success=False,
+        now=now,
+        success_cooldown=PAIR_HEALTH_SUCCESS_COOLDOWN_SECS,
+        failure_cooldown=PAIR_HEALTH_FAILURE_COOLDOWN_SECS,
+    ):
+        return
+    event = apply_pair_failure(
+        rec,
+        reason=reason,
+        source=source,
+        severity=severity,
+        timeframe=timeframe,
+        now=now,
+        block_base_secs=PAIR_HEALTH_BLOCK_BASE_SECS,
+        block_max_secs=PAIR_HEALTH_BLOCK_MAX_SECS,
+        probe_interval_secs=PAIR_HEALTH_PROBE_INTERVAL_SECS,
+    )
 
-    degrade = False
-    block = False
-
-    if source == "quote":
-        rec["consecutive_quote_failures"] = int(rec.get("consecutive_quote_failures", 0)) + 1
-        degrade = rec["consecutive_quote_failures"] >= 3
-        block = rec["consecutive_quote_failures"] >= 6
-    elif source == "candle":
-        candle_failures = rec.setdefault("consecutive_candle_failures", {})
-        candle_failures[timeframe or "UNKNOWN"] = int(candle_failures.get(timeframe or "UNKNOWN", 0)) + 1
-        current = candle_failures[timeframe or "UNKNOWN"]
-        important = timeframe in {"M15", "H1", "H4"}
-        degrade = current >= (2 if important else 3)
-        block = current >= (4 if important else 6)
-    elif source == "spread":
-        rec["consecutive_spread_failures"] = int(rec.get("consecutive_spread_failures", 0)) + 1
-        degrade = rec["consecutive_spread_failures"] >= 5
-        block = rec["consecutive_spread_failures"] >= 10
-    elif source == "order":
-        rec["consecutive_order_failures"] = int(rec.get("consecutive_order_failures", 0)) + 1
-        hard_terms = ("close-only", "close only", "tradeable", "tradable", "instrument", "liquidity", "market halted")
-        if severity == "hard" or any(term in reason.lower() for term in hard_terms):
-            block = True
-        else:
-            degrade = rec["consecutive_order_failures"] >= 2
-            block = rec["consecutive_order_failures"] >= 4
-    elif source == "close":
-        rec["consecutive_close_failures"] = int(rec.get("consecutive_close_failures", 0)) + 1
-        hard_terms = ("market_halted", "market halted", "close-only", "close only", "tradeable", "tradable")
-        if severity == "hard" or any(term in reason.lower() for term in hard_terms):
-            block = True
-        else:
-            degrade = rec["consecutive_close_failures"] >= 1
-            block = rec["consecutive_close_failures"] >= 2
-
-    if block:
-        rec["status"] = "blocked"
-        rec["block_level"] = int(rec.get("block_level", 0)) + (2 if source == "close" else 1)
-        rec["blocked_until"] = now + _pair_health_block_seconds(rec["block_level"])
-        rec["next_probe_at"] = rec["blocked_until"]
-    elif degrade and rec["status"] == "healthy":
-        rec["status"] = "degraded"
-        rec["next_probe_at"] = now + PAIR_HEALTH_PROBE_INTERVAL_SECS
-
-    if rec["status"] != prev_status:
+    if event["status_changed"]:
         if rec["status"] == "blocked":
             until_text = datetime.fromtimestamp(rec["blocked_until"], timezone.utc).strftime("%H:%M UTC")
             log.warning(f"🧱 Pair blocked: {instrument} | {reason} | until {until_text}")
@@ -507,53 +485,29 @@ def mark_pair_failure(instrument: str, reason: str, source: str, severity: str =
 def mark_pair_success(instrument: str, source: str, timeframe: str = "") -> None:
     rec = _ensure_pair_health(instrument)
     bucket = f"{source}:{timeframe or '-'}"
-    if not _can_count_pair_health_event(rec, bucket, success=True):
-        return
-
     now = time.time()
-    prev_status = rec["status"]
+    if not can_count_pair_health_event(
+        rec,
+        bucket,
+        success=True,
+        now=now,
+        success_cooldown=PAIR_HEALTH_SUCCESS_COOLDOWN_SECS,
+        failure_cooldown=PAIR_HEALTH_FAILURE_COOLDOWN_SECS,
+    ):
+        return
+    event = apply_pair_success(
+        rec,
+        source=source,
+        timeframe=timeframe,
+        now=now,
+        probe_interval_secs=PAIR_HEALTH_PROBE_INTERVAL_SECS,
+        recovery_successes=PAIR_HEALTH_RECOVERY_SUCCESSES,
+    )
 
-    if source == "quote":
-        rec["last_quote_ok_at"] = now
-        rec["consecutive_quote_failures"] = 0
-    elif source == "candle":
-        rec.setdefault("last_candle_ok_at", {})[timeframe or "UNKNOWN"] = now
-        rec.setdefault("consecutive_candle_failures", {})[timeframe or "UNKNOWN"] = 0
-    elif source == "order":
-        rec["last_order_ok_at"] = now
-        rec["consecutive_order_failures"] = 0
-    elif source == "close":
-        rec["last_close_ok_at"] = now
-        rec["consecutive_close_failures"] = 0
-    elif source == "spread":
-        rec["last_spread_ok_at"] = now
-        rec["consecutive_spread_failures"] = 0
-
-    rec["health_score"] = min(100.0, float(rec.get("health_score", 100.0)) + 5.0)
-
-    if rec["status"] == "blocked" and now >= float(rec.get("blocked_until", 0.0)):
-        rec["status"] = "degraded"
-        rec["clean_probes"] = 1
-        rec["next_probe_at"] = now + PAIR_HEALTH_PROBE_INTERVAL_SECS
-        rec["last_recovery_at"] = now
+    if event["previous_status"] == "blocked" and rec["status"] == "degraded":
         log.info(f"🛠️ Pair recovery started: {instrument} | moved to degraded")
-    elif rec["status"] == "degraded":
-        rec["clean_probes"] = int(rec.get("clean_probes", 0)) + 1
-        rec["next_probe_at"] = now + PAIR_HEALTH_PROBE_INTERVAL_SECS
-        if rec["clean_probes"] >= PAIR_HEALTH_RECOVERY_SUCCESSES:
-            rec["status"] = "healthy"
-            rec["clean_probes"] = 0
-            rec["next_probe_at"] = 0.0
-            rec["last_recovery_at"] = now
-            rec["last_failure_reason"] = ""
-            rec["block_level"] = max(0, int(rec.get("block_level", 0)) - 1)
-            rec["health_score"] = max(80.0, rec["health_score"])
-            log.info(f"✅ Pair healthy again: {instrument}")
-    else:
-        rec["clean_probes"] = 0
-
-    if prev_status == "blocked" and rec["status"] == "blocked":
-        rec["next_probe_at"] = max(float(rec.get("next_probe_at", 0.0)), float(rec.get("blocked_until", 0.0)))
+    elif event["current_status"] == "healthy" and event["status_changed"]:
+        log.info(f"✅ Pair healthy again: {instrument}")
 
 
 def is_pair_tradeable(instrument: str) -> bool:
@@ -1508,105 +1462,29 @@ def modify_trade(trade_id: str, tp_price: float = None, sl_price: float = None,
 # ═══════════════════════════════════════════════════════════════
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+    return core_calc_ema(series, period)
 
 def calc_rsi(series: pd.Series, period: int = 14) -> float:
-    if len(series) < period + 1:
-        return 50.0
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta.clip(upper=0))
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    val = float(rsi.iloc[-1])
-    return val if not np.isnan(val) else 50.0
+    return core_calc_rsi(series, period)
 
 def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
-    if df is None or len(df) < period + 1:
-        return 0.0
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift(1)).abs(),
-        (df["low"]  - df["close"].shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
-    return float(atr.iloc[-1])
+    return core_calc_atr(df, period)
 
 def calc_atr_pct(df: pd.DataFrame, period: int = 14) -> float:
-    atr = calc_atr(df, period)
-    close = float(df["close"].iloc[-1]) if len(df) > 0 else 1.0
-    return atr / close if close > 0 else 0.0
+    return core_calc_atr_pct(df, period)
 
 def calc_bollinger_bands(df: pd.DataFrame, period: int = 20, std_mult: float = 2.0) -> dict:
-    close = df["close"]
-    sma = close.rolling(period).mean()
-    std = close.rolling(period).std()
-    upper = sma + std_mult * std
-    lower = sma - std_mult * std
-    width = (upper - lower) / sma
-    return {
-        "upper": float(upper.iloc[-1]),
-        "lower": float(lower.iloc[-1]),
-        "mid":   float(sma.iloc[-1]),
-        "width": float(width.iloc[-1]) if not np.isnan(float(width.iloc[-1])) else 0.04,
-        "width_percentile": _percentile_rank(width),
-    }
+    return core_calc_bollinger_bands(df, period, std_mult)
 
 def _percentile_rank(series: pd.Series) -> float:
-    vals = series.dropna()
-    if len(vals) < 5:
-        return 50.0
-    current = float(vals.iloc[-1])
-    return float((vals < current).sum() / len(vals) * 100)
+    return core_percentile_rank(series)
 
 def calc_macd(df: pd.DataFrame) -> dict:
-    close = df["close"]
-    ema12 = calc_ema(close, 12)
-    ema26 = calc_ema(close, 26)
-    macd_line = ema12 - ema26
-    signal = calc_ema(macd_line, 9)
-    histogram = macd_line - signal
-    return {
-        "macd":      float(macd_line.iloc[-1]),
-        "signal":    float(signal.iloc[-1]),
-        "histogram": float(histogram.iloc[-1]),
-        "cross_up":  float(macd_line.iloc[-1]) > float(signal.iloc[-1]) and
-                     float(macd_line.iloc[-2]) <= float(signal.iloc[-2]),
-        "cross_down": float(macd_line.iloc[-1]) < float(signal.iloc[-1]) and
-                      float(macd_line.iloc[-2]) >= float(signal.iloc[-2]),
-    }
+    return core_calc_macd(df)
 
 def keltner_squeeze(df: pd.DataFrame, bb_period: int = 20, kc_period: int = 20,
                     kc_mult: float = 1.5) -> dict:
-    close = df["close"]
-    ema = calc_ema(close, kc_period)
-    atr = calc_atr(df, kc_period)
-    kc_upper = float(ema.iloc[-1]) + kc_mult * atr
-    kc_lower = float(ema.iloc[-1]) - kc_mult * atr
-    bb = calc_bollinger_bands(df, bb_period)
-    in_squeeze = bb["upper"] < kc_upper and bb["lower"] > kc_lower
-    squeeze_bars = 0
-    if in_squeeze:
-        for i in range(min(len(df) - bb_period, 50)):
-            idx = -(i + 1)
-            if idx < -len(df):
-                break
-            bb_u = float((close.rolling(bb_period).mean() + 2 * close.rolling(bb_period).std()).iloc[idx])
-            bb_l = float((close.rolling(bb_period).mean() - 2 * close.rolling(bb_period).std()).iloc[idx])
-            kc_u = float(ema.iloc[idx]) + kc_mult * atr
-            kc_l = float(ema.iloc[idx]) - kc_mult * atr
-            if bb_u < kc_u and bb_l > kc_l:
-                squeeze_bars += 1
-            else:
-                break
-    return {
-        "in_squeeze":   in_squeeze,
-        "squeeze_bars": squeeze_bars,
-        "bb_width":     bb["width"],
-        "bb_percentile": bb["width_percentile"],
-    }
+    return core_keltner_squeeze(df, bb_period, kc_period, kc_mult)
 
 # ═══════════════════════════════════════════════════════════════
 #  TELEGRAM & COMMANDS
@@ -2332,6 +2210,26 @@ def compute_market_regime(df: pd.DataFrame) -> float:
             mult *= 1.10
     return round(mult, 3)
 
+
+def _build_strategy_scoring_context() -> StrategyScoringContext:
+    return StrategyScoringContext(
+        get_spread_pips=get_spread_pips,
+        fetch_candles=fetch_candles,
+        reject=_set_scan_reject_reason,
+        mark_pair_failure=mark_pair_failure,
+        determine_direction=core_determine_direction,
+        get_post_news_events=get_post_news_events_for_instrument,
+        apply_macro_directional_bias=apply_macro_directional_bias,
+        macro_filters=macro_filters,
+        macro_news=macro_news,
+        market_regime_mult=_market_regime_mult,
+        adaptive_offsets=_adaptive_offsets,
+        dxy_ema_gap=_dxy_ema_gap,
+        dxy_gate_threshold=DXY_GATE_THRESHOLD,
+        vix_level=_vix_level,
+        vix_low_threshold=VIX_LOW_THRESHOLD,
+    )
+
 # ═══════════════════════════════════════════════════════════════
 #  DIRECTION DETERMINATION (unchanged)
 # ═══════════════════════════════════════════════════════════════
@@ -2339,834 +2237,48 @@ def compute_market_regime(df: pd.DataFrame) -> float:
 def determine_direction(instrument: str, df_5m: pd.DataFrame,
                         df_1h: pd.DataFrame = None, df_4h: pd.DataFrame = None,
                         strategy: str = "SCALPER") -> str:
-    signals = {"long": 0, "short": 0}
-    if df_5m is not None and len(df_5m) >= 30:
-        close = df_5m["close"]
-        ema9  = calc_ema(close, 9)
-        ema21 = calc_ema(close, 21)
-        rsi   = calc_rsi(close)
-        if float(ema9.iloc[-1]) > float(ema21.iloc[-1]):
-            signals["long"] += 2
-        else:
-            signals["short"] += 2
-        if rsi < 40:
-            signals["long"] += 1
-        elif rsi > 60:
-            signals["short"] += 1
-        macd = calc_macd(df_5m)
-        if macd["histogram"] > 0:
-            signals["long"] += 1
-        else:
-            signals["short"] += 1
-    if df_1h is not None and len(df_1h) >= 30:
-        close_1h = df_1h["close"]
-        ema50_1h = calc_ema(close_1h, 50)
-        rsi_1h = calc_rsi(close_1h)
-        if float(close_1h.iloc[-1]) > float(ema50_1h.iloc[-1]):
-            signals["long"] += 3
-        else:
-            signals["short"] += 3
-        macd_1h = calc_macd(df_1h)
-        if macd_1h["histogram"] > 0:
-            signals["long"] += 2
-        else:
-            signals["short"] += 2
-    if df_4h is not None and len(df_4h) >= 30:
-        close_4h = df_4h["close"]
-        ema50_4h = calc_ema(close_4h, 50)
-        if float(close_4h.iloc[-1]) > float(ema50_4h.iloc[-1]):
-            signals["long"] += 4
-        else:
-            signals["short"] += 4
-    if _dxy_ema_gap is not None and "USD" in instrument:
-        base, quote = instrument.split("_")
-        if base == "USD":
-            if _dxy_ema_gap > DXY_GATE_THRESHOLD:
-                signals["long"] += 2
-            elif _dxy_ema_gap < -DXY_GATE_THRESHOLD:
-                signals["short"] += 2
-        else:
-            if _dxy_ema_gap > DXY_GATE_THRESHOLD:
-                signals["short"] += 2
-            elif _dxy_ema_gap < -DXY_GATE_THRESHOLD:
-                signals["long"] += 2
-
-    apply_macro_directional_bias(instrument, signals)
-
-    if strategy == "REVERSAL":
-        signals["long"], signals["short"] = signals["short"], signals["long"]
-    return "LONG" if signals["long"] >= signals["short"] else "SHORT"
+    return core_determine_direction(
+        instrument,
+        df_5m,
+        df_1h,
+        df_4h,
+        strategy=strategy,
+        dxy_ema_gap=_dxy_ema_gap,
+        dxy_gate_threshold=DXY_GATE_THRESHOLD,
+        apply_macro_directional_bias=apply_macro_directional_bias,
+    )
 
 # ═══════════════════════════════════════════════════════════════
 #  SCORING FUNCTIONS (unchanged)
 # ═══════════════════════════════════════════════════════════════
 
 def score_scalper(instrument: str, session: dict) -> dict | None:
-    spread_pips = get_spread_pips(instrument)
-    if spread_pips > SCALPER_MAX_SPREAD_PIPS:
-        _set_scan_reject_reason("SCALPER", instrument, "spread too high")
-        return None
-
-    df_5m = fetch_candles(instrument, "M5", 60)
-    if df_5m is None or len(df_5m) < 30:
-        _set_scan_reject_reason("SCALPER", instrument, "not enough M5 data")
-        return None
-
-    df_1h = fetch_candles(instrument, "H1", 60)
-
-    close  = df_5m["close"]
-    volume = df_5m["volume"]
-    rsi    = calc_rsi(close)
-    atr    = calc_atr(df_5m, 14)
-    atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0
-
-    if rsi > SCALPER_MAX_RSI or rsi < SCALPER_MIN_RSI:
-        _set_scan_reject_reason("SCALPER", instrument, "RSI out of range")
-        return None
-
-    ema9  = calc_ema(close, 9)
-    ema21 = calc_ema(close, 21)
-    crossed_now    = ((float(ema9.iloc[-1]) > float(ema21.iloc[-1])) and
-                      (float(ema9.iloc[-2]) <= float(ema21.iloc[-2])))
-    crossed_recent = ((float(ema9.iloc[-2]) > float(ema21.iloc[-2])) and
-                      (float(ema9.iloc[-3]) <= float(ema21.iloc[-3])))
-    crossed_down_now = ((float(ema9.iloc[-1]) < float(ema21.iloc[-1])) and
-                        (float(ema9.iloc[-2]) >= float(ema21.iloc[-2])))
-
-    crossed = crossed_now or crossed_recent or crossed_down_now
-
-    avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 1
-    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
-
-    rsi_prev = calc_rsi(close.iloc[:-1])
-    rsi_delta = rsi - rsi_prev if not np.isnan(rsi_prev) else 0
-
-    ma_score = 30 if crossed else (15 if float(ema9.iloc[-1]) != float(ema21.iloc[-1]) else 0)
-    rsi_score = max(0, 40 - min(rsi, 100 - rsi)) if rsi < 45 or rsi > 55 else 0
-    vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
-
-    confluence = 0
-    if crossed and vol_ratio > 1.5 and abs(rsi_delta) > 2:
-        confluence = SCALPER_CONFLUENCE_BONUS
-
-    macd = calc_macd(df_5m)
-    macd_bonus = 5 if macd["cross_up"] or macd["cross_down"] else 0
-
-    spread_penalty = max(0, (spread_pips - 0.5) * 5)
-
-    score = ma_score + rsi_score + vol_score + confluence + macd_bonus - spread_penalty
-
-    direction = determine_direction(instrument, df_5m, df_1h, strategy="SCALPER")
-
-    if direction == "SHORT":
-        if not (crossed_down_now or (float(ema9.iloc[-1]) < float(ema21.iloc[-1]))):
-            score *= 0.5
-
-    eff_threshold = SCALPER_THRESHOLD * session["multiplier"] * _market_regime_mult
-    eff_threshold += _adaptive_offsets.get("SCALPER", 0)
-
-    if score < eff_threshold:
-        _set_scan_reject_reason("SCALPER", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
-        return None
-
-    tp_pips = max(SCALPER_TP_MIN_PIPS, min(SCALPER_TP_MAX_PIPS,
-                  price_to_pips(instrument, atr * SCALPER_TP_ATR_MULT)))
-    sl_pips = max(SCALPER_SL_MIN_PIPS, min(SCALPER_SL_MAX_PIPS,
-                  price_to_pips(instrument, atr * SCALPER_SL_ATR_MULT)))
-
-    if tp_pips / sl_pips < 1.5:
-        tp_pips = sl_pips * 1.5
-
-    return {
-        "instrument": instrument,
-        "score":      round(score, 2),
-        "direction":  direction,
-        "rsi":        round(rsi, 2),
-        "rsi_delta":  round(rsi_delta, 2),
-        "vol_ratio":  round(vol_ratio, 2),
-        "atr":        atr,
-        "atr_pct":    round(atr_pct, 6),
-        "spread_pips": round(spread_pips, 2),
-        "tp_pips":    round(tp_pips, 1),
-        "sl_pips":    round(sl_pips, 1),
-        "trail_pips": SCALPER_TRAIL_PIPS,
-        "crossed_now": crossed_now or crossed_down_now,
-        "entry_signal": "CROSSOVER" if crossed else ("VOL_SPIKE" if vol_ratio > 2 else "TREND"),
-        "macd":       macd,
-    }
+    return core_score_scalper(instrument, session, _build_strategy_scoring_context(), globals())
 
 def score_trend(instrument: str, session: dict) -> dict | None:
-    spread_pips = get_spread_pips(instrument)
-    if spread_pips > TREND_MAX_SPREAD_PIPS:
-        _set_scan_reject_reason("TREND", instrument, "spread too high")
-        return None
-
-    df_5m = fetch_candles(instrument, "M5", 60)
-    df_1h = fetch_candles(instrument, "H1", 100)
-    df_4h = fetch_candles(instrument, "H4", 60)
-
-    if df_1h is None or len(df_1h) < 50:
-        mark_pair_failure(instrument, "insufficient H1 history for trend", "candle", timeframe="H1")
-        _set_scan_reject_reason("TREND", instrument, "not enough H1 data")
-        return None
-    if df_4h is None or len(df_4h) < 30:
-        mark_pair_failure(instrument, "insufficient H4 history for trend", "candle", timeframe="H4")
-        _set_scan_reject_reason("TREND", instrument, "not enough H4 data")
-        return None
-
-    close_1h = df_1h["close"]
-    close_4h = df_4h["close"]
-
-    ema20_1h = calc_ema(close_1h, 20)
-    ema50_1h = calc_ema(close_1h, 50)
-    ema20_4h = calc_ema(close_4h, 20)
-    ema50_4h = calc_ema(close_4h, 50)
-
-    bullish_4h = float(ema20_4h.iloc[-1]) > float(ema50_4h.iloc[-1])
-    bullish_1h = float(ema20_1h.iloc[-1]) > float(ema50_1h.iloc[-1])
-
-    aligned = (bullish_4h == bullish_1h)
-    if not aligned:
-        _set_scan_reject_reason("TREND", instrument, "H1/H4 trend not aligned")
-        return None
-
-    direction = "LONG" if bullish_4h else "SHORT"
-
-    score = 0
-    score += 25
-
-    ema50_gap_4h = abs(float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1)
-    score += min(20, ema50_gap_4h * 1000)
-
-    ema20_dist = abs(float(close_1h.iloc[-1]) / float(ema20_1h.iloc[-1]) - 1)
-    if ema20_dist < 0.002:
-        score += 15
-    elif ema20_dist < 0.005:
-        score += 8
-
-    rsi_1h = calc_rsi(close_1h)
-    if direction == "LONG" and 40 < rsi_1h < 65:
-        score += 10
-    elif direction == "SHORT" and 35 < rsi_1h < 60:
-        score += 10
-
-    macd_1h = calc_macd(df_1h)
-    if (direction == "LONG" and macd_1h["histogram"] > 0) or \
-       (direction == "SHORT" and macd_1h["histogram"] < 0):
-        score += 10
-
-    vol = df_1h["volume"]
-    vol_ratio = float(vol.iloc[-1]) / float(vol.iloc[-20:-1].mean()) if len(vol) >= 21 else 1
-    if vol_ratio > 1.2:
-        score += 5
-
-    if _dxy_ema_gap is not None and "USD" in instrument:
-        base, quote = instrument.split("_")
-        usd_is_base = base == "USD"
-        dxy_long = _dxy_ema_gap > DXY_GATE_THRESHOLD
-        dxy_short = _dxy_ema_gap < -DXY_GATE_THRESHOLD
-
-        if (usd_is_base and direction == "LONG" and dxy_long) or \
-           (usd_is_base and direction == "SHORT" and dxy_short) or \
-           (not usd_is_base and direction == "SHORT" and dxy_long) or \
-           (not usd_is_base and direction == "LONG" and dxy_short):
-            score += 10
-
-    atr = calc_atr(df_1h, 14)
-    atr_pct = atr / float(close_1h.iloc[-1])
-
-    eff_threshold = TREND_THRESHOLD * session["multiplier"] * _market_regime_mult
-    eff_threshold += _adaptive_offsets.get("TREND", 0)
-
-    if score < eff_threshold:
-        _set_scan_reject_reason("TREND", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
-        return None
-
-    tp_pips = max(15, price_to_pips(instrument, atr * TREND_TP_ATR_MULT))
-    sl_pips = max(8,  price_to_pips(instrument, atr * TREND_SL_ATR_MULT))
-    partial_tp_pips = max(10, price_to_pips(instrument, atr * TREND_PARTIAL_TP_ATR))
-
-    return {
-        "instrument":      instrument,
-        "score":           round(score, 2),
-        "direction":       direction,
-        "rsi":             round(rsi_1h, 2),
-        "vol_ratio":       round(vol_ratio, 2),
-        "atr":             atr,
-        "atr_pct":         round(atr_pct, 6),
-        "spread_pips":     round(spread_pips, 2),
-        "tp_pips":         round(tp_pips, 1),
-        "sl_pips":         round(sl_pips, 1),
-        "partial_tp_pips": round(partial_tp_pips, 1),
-        "trail_pips":      TREND_TRAIL_PIPS,
-        "entry_signal":    "TREND_ALIGNED",
-        "ema50_gap_4h":    round(ema50_gap_4h * 100, 2),
-    }
+    return core_score_trend(instrument, session, _build_strategy_scoring_context(), globals())
 
 def score_reversal(instrument: str, session: dict) -> dict | None:
-    spread_pips = get_spread_pips(instrument)
-    if spread_pips > REVERSAL_MAX_SPREAD_PIPS:
-        _set_scan_reject_reason("REVERSAL", instrument, "spread too high")
-        return None
-
-    if session["aggression"] == "MINIMAL":
-        _set_scan_reject_reason("REVERSAL", instrument, "session too quiet")
-        return None
-
-    df_5m = fetch_candles(instrument, "M5", 60)
-    df_1h = fetch_candles(instrument, "H1", 60)
-
-    if df_5m is None or len(df_5m) < 30:
-        _set_scan_reject_reason("REVERSAL", instrument, "not enough M5 data")
-        return None
-
-    close = df_5m["close"]
-    rsi = calc_rsi(close)
-
-    is_oversold  = rsi <= REVERSAL_RSI_OVERSOLD
-    is_overbought = rsi >= REVERSAL_RSI_OVERBOUGHT
-    if not (is_oversold or is_overbought):
-        _set_scan_reject_reason("REVERSAL", instrument, "RSI not stretched")
-        return None
-
-    direction = "LONG" if is_oversold else "SHORT"
-
-    score = 0
-    if is_oversold:
-        score += min(30, (REVERSAL_RSI_OVERSOLD - rsi) * 3)
-    else:
-        score += min(30, (rsi - REVERSAL_RSI_OVERBOUGHT) * 3)
-
-    bb = calc_bollinger_bands(df_5m)
-    price = float(close.iloc[-1])
-    if is_oversold and price <= bb["lower"]:
-        score += 15
-    elif is_overbought and price >= bb["upper"]:
-        score += 15
-
-    rsi_prev = calc_rsi(close.iloc[:-5])
-    if is_oversold and rsi > rsi_prev:
-        score += 10
-    elif is_overbought and rsi < rsi_prev:
-        score += 10
-
-    volume = df_5m["volume"]
-    avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 1
-    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1
-    if vol_ratio > 2.0:
-        score += 10
-
-    if df_1h is not None and len(df_1h) >= 30:
-        low_1h = float(df_1h["low"].iloc[-20:].min())
-        high_1h = float(df_1h["high"].iloc[-20:].max())
-        if is_oversold and abs(price - low_1h) / low_1h < 0.002:
-            score += 10
-        elif is_overbought and abs(price - high_1h) / high_1h < 0.002:
-            score += 10
-
-    atr = calc_atr(df_5m, 14)
-    atr_pct = atr / float(close.iloc[-1])
-
-    eff_threshold = REVERSAL_THRESHOLD * session["multiplier"] * _market_regime_mult
-    eff_threshold += _adaptive_offsets.get("REVERSAL", 0)
-
-    if score < eff_threshold:
-        _set_scan_reject_reason("REVERSAL", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
-        return None
-
-    tp_pips = max(8,  price_to_pips(instrument, atr * REVERSAL_TP_ATR_MULT))
-    sl_pips = max(5,  price_to_pips(instrument, atr * REVERSAL_SL_ATR_MULT))
-
-    return {
-        "instrument":  instrument,
-        "score":       round(score, 2),
-        "direction":   direction,
-        "rsi":         round(rsi, 2),
-        "vol_ratio":   round(vol_ratio, 2),
-        "atr":         atr,
-        "atr_pct":     round(atr_pct, 6),
-        "spread_pips": round(spread_pips, 2),
-        "tp_pips":     round(tp_pips, 1),
-        "sl_pips":     round(sl_pips, 1),
-        "trail_pips":  REVERSAL_TRAIL_PIPS,
-        "entry_signal": "OVERSOLD_BOUNCE" if is_oversold else "OVERBOUGHT_FADE",
-    }
+    return core_score_reversal(instrument, session, _build_strategy_scoring_context(), globals())
 
 def score_breakout(instrument: str, session: dict) -> dict | None:
-    spread_pips = get_spread_pips(instrument)
-    if spread_pips > BREAKOUT_MAX_SPREAD_PIPS:
-        _set_scan_reject_reason("BREAKOUT", instrument, "spread too high")
-        return None
-
-    if session["aggression"] in ("MINIMAL", "LOW"):
-        _set_scan_reject_reason("BREAKOUT", instrument, "session not active enough")
-        return None
-
-    df_15m = fetch_candles(instrument, "M15", 80)
-    df_1h  = fetch_candles(instrument, "H1", 60)
-
-    if df_15m is None or len(df_15m) < 40:
-        mark_pair_failure(instrument, "insufficient M15 history for breakout", "candle", timeframe="M15")
-        _set_scan_reject_reason("BREAKOUT", instrument, "not enough M15 data")
-        return None
-
-    squeeze = keltner_squeeze(df_15m)
-
-    if not squeeze["in_squeeze"] and squeeze["squeeze_bars"] < 5:
-        _set_scan_reject_reason("BREAKOUT", instrument, "no squeeze")
-        return None
-
-    score = 0
-    score += min(25, squeeze["squeeze_bars"] * 3)
-
-    if squeeze["bb_percentile"] < 20:
-        score += 20
-    elif squeeze["bb_percentile"] < 35:
-        score += 10
-
-    volume = df_15m["volume"]
-    recent_vol = float(volume.iloc[-3:].mean())
-    avg_vol = float(volume.iloc[-20:-3].mean()) if len(volume) >= 23 else 1
-    vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1
-    if vol_ratio > 1.3:
-        score += 10
-
-    macd = calc_macd(df_15m)
-    if abs(macd["histogram"]) > abs(float((df_15m["close"].ewm(span=12).mean() -
-                                            df_15m["close"].ewm(span=26).mean() -
-                                            (df_15m["close"].ewm(span=12).mean() -
-                                             df_15m["close"].ewm(span=26).mean()).ewm(span=9).mean()).iloc[-2])):
-        score += 10
-
-    direction = determine_direction(instrument, df_15m, df_1h, strategy="BREAKOUT")
-
-    atr = calc_atr(df_15m, 14)
-    atr_pct = atr / float(df_15m["close"].iloc[-1])
-
-    eff_threshold = BREAKOUT_THRESHOLD * session["multiplier"] * _market_regime_mult
-    eff_threshold += _adaptive_offsets.get("BREAKOUT", 0)
-
-    if score < eff_threshold:
-        _set_scan_reject_reason("BREAKOUT", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
-        return None
-
-    tp_pips = max(15, price_to_pips(instrument, atr * BREAKOUT_TP_ATR_MULT))
-    sl_pips = max(5,  price_to_pips(instrument, atr * BREAKOUT_SL_ATR_MULT))
-
-    return {
-        "instrument":   instrument,
-        "score":        round(score, 2),
-        "direction":    direction,
-        "squeeze_bars": squeeze["squeeze_bars"],
-        "bb_percentile": round(squeeze["bb_percentile"], 1),
-        "vol_ratio":    round(vol_ratio, 2),
-        "atr":          atr,
-        "atr_pct":      round(atr_pct, 6),
-        "spread_pips":  round(spread_pips, 2),
-        "tp_pips":      round(tp_pips, 1),
-        "sl_pips":      round(sl_pips, 1),
-        "trail_pips":   BREAKOUT_TRAIL_PIPS,
-        "entry_signal": "BB_KC_SQUEEZE",
-    }
+    return core_score_breakout(instrument, session, _build_strategy_scoring_context(), globals())
 
 
 def score_carry(instrument: str, session: dict) -> dict | None:
-    """Carry trade: long high-yield vs low-yield in quiet markets."""
-    if _market_regime_mult > 1.05:
-        _set_scan_reject_reason("CARRY", instrument, "regime too hot")
-        return None
-    if _vix_level is not None and _vix_level > CARRY_VIX_MAX:
-        _set_scan_reject_reason("CARRY", instrument, "VIX too high")
-        return None
-
-    bias = macro_filters.get(instrument.upper())
-    if bias != "LONG_ONLY":
-        _set_scan_reject_reason("CARRY", instrument, "no long carry bias")
-        return None
-
-    spread_pips = get_spread_pips(instrument)
-    if spread_pips > CARRY_MAX_SPREAD_PIPS:
-        _set_scan_reject_reason("CARRY", instrument, "spread too high")
-        return None
-
-    df_4h = fetch_candles(instrument, "H4", 60)
-    if df_4h is None or len(df_4h) < 30:
-        mark_pair_failure(instrument, "insufficient H4 history for carry", "candle", timeframe="H4")
-        _set_scan_reject_reason("CARRY", instrument, "not enough H4 data")
-        return None
-
-    close_4h = df_4h["close"]
-    ema20_4h = calc_ema(close_4h, 20)
-    ema50_4h = calc_ema(close_4h, 50)
-
-    bullish = float(ema20_4h.iloc[-1]) > float(ema50_4h.iloc[-1])
-    if not bullish:
-        _set_scan_reject_reason("CARRY", instrument, "4H trend not up")
-        return None
-
-    score = 0
-    score += 25  # macro bias alignment
-
-    ema50_gap = float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1
-    score += min(15, abs(ema50_gap) * 500)
-
-    rsi_4h = calc_rsi(close_4h)
-    if 40 < rsi_4h < 65:
-        score += 15
-    elif 35 < rsi_4h < 70:
-        score += 8
-
-    atr = calc_atr(df_4h, 14)
-    atr_pct = atr / float(close_4h.iloc[-1])
-    if atr_pct < 0.005:
-        score += 10
-
-    macd_4h = calc_macd(df_4h)
-    if macd_4h["histogram"] > 0:
-        score += 10
-
-    if _vix_level is not None and _vix_level < VIX_LOW_THRESHOLD:
-        score += 5
-
-    eff_threshold = CARRY_THRESHOLD * session["multiplier"] * _market_regime_mult
-    eff_threshold += _adaptive_offsets.get("CARRY", 0)
-
-    if score < eff_threshold:
-        _set_scan_reject_reason("CARRY", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
-        return None
-
-    tp_pips = max(15, price_to_pips(instrument, atr * CARRY_TP_ATR_MULT))
-    sl_pips = max(10, price_to_pips(instrument, atr * CARRY_SL_ATR_MULT))
-
-    return {
-        "instrument":  instrument,
-        "score":       round(score, 2),
-        "direction":   "LONG",
-        "rsi":         round(rsi_4h, 2),
-        "atr":         atr,
-        "atr_pct":     round(atr_pct, 6),
-        "spread_pips": round(spread_pips, 2),
-        "tp_pips":     round(tp_pips, 1),
-        "sl_pips":     round(sl_pips, 1),
-        "trail_pips":  CARRY_TRAIL_PIPS,
-        "entry_signal": "CARRY_YIELD",
-    }
+    return core_score_carry(instrument, session, _build_strategy_scoring_context(), globals())
 
 
 def score_asian_fade(instrument: str, session: dict) -> dict | None:
-    """Mean-reversion fade at the edges of the developing Asian range."""
-    if session["name"] != "TOKYO":
-        _set_scan_reject_reason("ASIAN_FADE", instrument, "Tokyo only")
-        return None
-
-    spread_pips = get_spread_pips(instrument)
-    if spread_pips > ASIAN_FADE_MAX_SPREAD_PIPS:
-        _set_scan_reject_reason("ASIAN_FADE", instrument, "spread too high")
-        return None
-
-    df_5m = fetch_candles(instrument, "M5", 60)
-    if df_5m is None or len(df_5m) < 30:
-        _set_scan_reject_reason("ASIAN_FADE", instrument, "not enough M5 data")
-        return None
-
-    close = df_5m["close"]
-    rsi = calc_rsi(close)
-
-    is_oversold = rsi <= ASIAN_FADE_RSI_LOW
-    is_overbought = rsi >= ASIAN_FADE_RSI_HIGH
-    if not (is_oversold or is_overbought):
-        _set_scan_reject_reason("ASIAN_FADE", instrument, "RSI not stretched")
-        return None
-
-    direction = "LONG" if is_oversold else "SHORT"
-
-    bb = calc_bollinger_bands(df_5m)
-    price = float(close.iloc[-1])
-
-    score = 0
-
-    if is_oversold and price <= bb["lower"]:
-        score += 25
-    elif is_overbought and price >= bb["upper"]:
-        score += 25
-    elif is_oversold and price <= bb["lower"] * 1.001:
-        score += 15
-    elif is_overbought and price >= bb["upper"] * 0.999:
-        score += 15
-    else:
-        _set_scan_reject_reason("ASIAN_FADE", instrument, "not at range edge")
-        return None
-
-    if is_oversold:
-        score += min(20, (ASIAN_FADE_RSI_LOW - rsi) * 2)
-    else:
-        score += min(20, (rsi - ASIAN_FADE_RSI_HIGH) * 2)
-
-    session_high = float(df_5m["high"].iloc[-18:].max())  # ~90 min range
-    session_low = float(df_5m["low"].iloc[-18:].min())
-    session_range = session_high - session_low
-    atr = calc_atr(df_5m, 14)
-
-    if session_range < atr * 1.5:
-        score += 10
-
-    volume = df_5m["volume"]
-    avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 1
-    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1
-    if vol_ratio > 1.5:
-        score += 10
-
-    rsi_prev = calc_rsi(close.iloc[:-3])
-    if is_oversold and rsi > rsi_prev:
-        score += 5
-    elif is_overbought and rsi < rsi_prev:
-        score += 5
-
-    atr_pct = atr / float(close.iloc[-1])
-
-    eff_threshold = ASIAN_FADE_THRESHOLD * session["multiplier"] * _market_regime_mult
-    eff_threshold += _adaptive_offsets.get("ASIAN_FADE", 0)
-
-    if score < eff_threshold:
-        _set_scan_reject_reason("ASIAN_FADE", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
-        return None
-
-    tp_pips = max(5, min(20, price_to_pips(instrument, atr * ASIAN_FADE_TP_ATR_MULT)))
-    sl_pips = max(4, min(15, price_to_pips(instrument, atr * ASIAN_FADE_SL_ATR_MULT)))
-
-    if tp_pips / sl_pips < 1.2:
-        tp_pips = sl_pips * 1.2
-
-    return {
-        "instrument":  instrument,
-        "score":       round(score, 2),
-        "direction":   direction,
-        "rsi":         round(rsi, 2),
-        "vol_ratio":   round(vol_ratio, 2),
-        "atr":         atr,
-        "atr_pct":     round(atr_pct, 6),
-        "spread_pips": round(spread_pips, 2),
-        "tp_pips":     round(tp_pips, 1),
-        "sl_pips":     round(sl_pips, 1),
-        "trail_pips":  ASIAN_FADE_TRAIL_PIPS,
-        "entry_signal": "ASIAN_RANGE_FADE",
-    }
+    return core_score_asian_fade(instrument, session, _build_strategy_scoring_context(), globals())
 
 
 def score_post_news(instrument: str, session: dict) -> dict | None:
-    """Momentum breakout in the first minutes after a high-impact news pause."""
-    if not macro_news:
-        _set_scan_reject_reason("POST_NEWS", instrument, "no macro news loaded")
-        return None
-
-    now = datetime.now(timezone.utc)
-    matching_events = get_post_news_events_for_instrument(instrument, now)
-    if not matching_events:
-        _set_scan_reject_reason("POST_NEWS", instrument, "no recent high-impact post-news window")
-        return None
-
-    spread_pips = get_spread_pips(instrument)
-    if spread_pips > POST_NEWS_MAX_SPREAD_PIPS:
-        _set_scan_reject_reason("POST_NEWS", instrument, "spread too high")
-        return None
-
-    df_5m = fetch_candles(instrument, "M5", 30)
-    if df_5m is None or len(df_5m) < 10:
-        _set_scan_reject_reason("POST_NEWS", instrument, "not enough M5 data")
-        return None
-
-    close = df_5m["close"]
-    volume = df_5m["volume"]
-    atr = calc_atr(df_5m, 14)
-
-    pre_news_high = float(df_5m["high"].iloc[-10:-3].max())
-    pre_news_low = float(df_5m["low"].iloc[-10:-3].min())
-    current_close = float(close.iloc[-1])
-
-    broke_high = current_close > pre_news_high
-    broke_low = current_close < pre_news_low
-    if not (broke_high or broke_low):
-        _set_scan_reject_reason("POST_NEWS", instrument, "no breakout yet")
-        return None
-
-    direction = "LONG" if broke_high else "SHORT"
-
-    score = 0
-    score += 25  # post-news breakout
-
-    breakout_size = abs(current_close - (pre_news_high if broke_high else pre_news_low))
-    if breakout_size > atr * 0.5:
-        score += 15
-    elif breakout_size > atr * 0.25:
-        score += 8
-
-    avg_vol = float(volume.iloc[-10:-3].mean()) if len(volume) >= 13 else 1
-    vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1
-    if vol_ratio > 2.0:
-        score += 15
-    elif vol_ratio > 1.5:
-        score += 10
-
-    macd = calc_macd(df_5m)
-    if (direction == "LONG" and macd["histogram"] > 0) or \
-       (direction == "SHORT" and macd["histogram"] < 0):
-        score += 10
-
-    rsi = calc_rsi(close)
-    if direction == "LONG" and 50 < rsi < 80:
-        score += 5
-    elif direction == "SHORT" and 20 < rsi < 50:
-        score += 5
-
-    atr_pct = atr / float(close.iloc[-1])
-
-    eff_threshold = POST_NEWS_THRESHOLD * session["multiplier"] * _market_regime_mult
-    eff_threshold += _adaptive_offsets.get("POST_NEWS", 0)
-
-    if score < eff_threshold:
-        _set_scan_reject_reason("POST_NEWS", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
-        return None
-
-    tp_pips = max(10, price_to_pips(instrument, atr * POST_NEWS_TP_ATR_MULT))
-    sl_pips = max(5, price_to_pips(instrument, atr * POST_NEWS_SL_ATR_MULT))
-
-    if tp_pips / sl_pips < 1.5:
-        tp_pips = sl_pips * 1.5
-
-    return {
-        "instrument":  instrument,
-        "score":       round(score, 2),
-        "direction":   direction,
-        "rsi":         round(rsi, 2),
-        "vol_ratio":   round(vol_ratio, 2),
-        "atr":         atr,
-        "atr_pct":     round(atr_pct, 6),
-        "spread_pips": round(spread_pips, 2),
-        "tp_pips":     round(tp_pips, 1),
-        "sl_pips":     round(sl_pips, 1),
-        "trail_pips":  POST_NEWS_TRAIL_PIPS,
-        "entry_signal": "POST_NEWS_BREAKOUT",
-    }
+    return core_score_post_news(instrument, session, _build_strategy_scoring_context(), globals())
 
 
 def score_pullback(instrument: str, session: dict) -> dict | None:
-    """Trend continuation: buy the dip / sell the rally in a strong trend."""
-    spread_pips = get_spread_pips(instrument)
-    if spread_pips > PULLBACK_MAX_SPREAD_PIPS:
-        _set_scan_reject_reason("PULLBACK", instrument, "spread too high")
-        return None
-
-    if session["aggression"] == "MINIMAL":
-        _set_scan_reject_reason("PULLBACK", instrument, "session too quiet")
-        return None
-
-    df_1h = fetch_candles(instrument, "H1", 100)
-    df_4h = fetch_candles(instrument, "H4", 60)
-
-    if df_1h is None or len(df_1h) < 50:
-        mark_pair_failure(instrument, "insufficient H1 history for pullback", "candle", timeframe="H1")
-        _set_scan_reject_reason("PULLBACK", instrument, "not enough H1 data")
-        return None
-    if df_4h is None or len(df_4h) < 30:
-        mark_pair_failure(instrument, "insufficient H4 history for pullback", "candle", timeframe="H4")
-        _set_scan_reject_reason("PULLBACK", instrument, "not enough H4 data")
-        return None
-
-    close_4h = df_4h["close"]
-    close_1h = df_1h["close"]
-
-    ema20_4h = calc_ema(close_4h, 20)
-    ema50_4h = calc_ema(close_4h, 50)
-
-    bullish_4h = float(ema20_4h.iloc[-1]) > float(ema50_4h.iloc[-1])
-
-    ema50_gap = abs(float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1)
-    if ema50_gap < 0.002:
-        _set_scan_reject_reason("PULLBACK", instrument, "4H trend too weak")
-        return None
-
-    direction = "LONG" if bullish_4h else "SHORT"
-
-    ema20_1h = calc_ema(close_1h, 20)
-    current_price = float(close_1h.iloc[-1])
-    ema20_val = float(ema20_1h.iloc[-1])
-
-    atr = calc_atr(df_1h, 14)
-    pullback_depth = abs(current_price - ema20_val) / atr if atr > 0 else 999
-
-    if direction == "LONG":
-        if current_price > ema20_val:
-            _set_scan_reject_reason("PULLBACK", instrument, "no dip yet")
-            return None
-        if pullback_depth > 2.0:
-            _set_scan_reject_reason("PULLBACK", instrument, "pullback too deep")
-            return None
-    else:
-        if current_price < ema20_val:
-            _set_scan_reject_reason("PULLBACK", instrument, "no rally yet")
-            return None
-        if pullback_depth > 2.0:
-            _set_scan_reject_reason("PULLBACK", instrument, "pullback too deep")
-            return None
-
-    score = 0
-    score += 20  # trend established on 4H
-
-    score += min(15, ema50_gap * 800)
-
-    if 0.5 <= pullback_depth <= 1.5:
-        score += 15
-    elif pullback_depth <= 2.0:
-        score += 8
-
-    rsi_1h = calc_rsi(close_1h)
-    if direction == "LONG" and rsi_1h < 45:
-        score += min(15, (45 - rsi_1h) * 1.5)
-    elif direction == "SHORT" and rsi_1h > 55:
-        score += min(15, (rsi_1h - 55) * 1.5)
-    else:
-        _set_scan_reject_reason("PULLBACK", instrument, "RSI not supportive")
-        return None
-
-    macd_1h = calc_macd(df_1h)
-    if (direction == "LONG" and macd_1h["histogram"] > 0) or \
-       (direction == "SHORT" and macd_1h["histogram"] < 0):
-        score += 10
-
-    bias = macro_filters.get(instrument.upper())
-    if (direction == "LONG" and bias == "LONG_ONLY") or \
-       (direction == "SHORT" and bias == "SHORT_ONLY"):
-        score += 10
-
-    atr_pct = atr / float(close_1h.iloc[-1])
-
-    eff_threshold = PULLBACK_THRESHOLD * session["multiplier"] * _market_regime_mult
-    eff_threshold += _adaptive_offsets.get("PULLBACK", 0)
-
-    if score < eff_threshold:
-        _set_scan_reject_reason("PULLBACK", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
-        return None
-
-    tp_pips = max(12, price_to_pips(instrument, atr * PULLBACK_TP_ATR_MULT))
-    sl_pips = max(6, price_to_pips(instrument, atr * PULLBACK_SL_ATR_MULT))
-
-    if tp_pips / sl_pips < 1.5:
-        tp_pips = sl_pips * 1.5
-
-    return {
-        "instrument":  instrument,
-        "score":       round(score, 2),
-        "direction":   direction,
-        "rsi":         round(rsi_1h, 2),
-        "atr":         atr,
-        "atr_pct":     round(atr_pct, 6),
-        "spread_pips": round(spread_pips, 2),
-        "tp_pips":     round(tp_pips, 1),
-        "sl_pips":     round(sl_pips, 1),
-        "trail_pips":  PULLBACK_TRAIL_PIPS,
-        "entry_signal": "PULLBACK_REENTRY",
-        "pullback_depth": round(pullback_depth, 2),
-    }
+    return core_score_pullback(instrument, session, _build_strategy_scoring_context(), globals())
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3174,35 +2286,7 @@ def score_pullback(instrument: str, session: dict) -> dict | None:
 # ═══════════════════════════════════════════════════════════════
 
 def _would_breach_correlation_limit(instrument: str, direction: str) -> tuple[bool, int, int]:
-    base, quote = instrument.split("_")
-    usd_long = 0
-    usd_short = 0
-    for t in open_trades:
-        t_base, t_quote = t["instrument"].split("_")
-        t_dir = t["direction"]
-        if t_base == "USD":
-            if t_dir == "LONG":
-                usd_long += 1
-            else:
-                usd_short += 1
-        elif t_quote == "USD":
-            if t_dir == "LONG":
-                usd_short += 1
-            else:
-                usd_long += 1
-
-    if quote == "USD":
-        if direction == "LONG":
-            usd_short += 1
-        else:
-            usd_long += 1
-    elif base == "USD":
-        if direction == "LONG":
-            usd_long += 1
-        else:
-            usd_short += 1
-
-    return max(usd_long, usd_short) > MAX_CORRELATED_TRADES, usd_long, usd_short
+    return would_breach_correlation_limit(open_trades, instrument, direction, MAX_CORRELATED_TRADES)
 
 
 def check_correlation_limit(instrument: str, direction: str) -> bool:

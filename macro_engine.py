@@ -16,6 +16,22 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from fxbot.config import env_float, env_int, env_str, validate_macro_config
+from fxbot.macro_logic import (
+    build_commodity_bias as core_build_commodity_bias,
+    build_esi_bias as core_build_esi_bias,
+    build_liquidity_bias as core_build_liquidity_bias,
+    build_market_index_bias as core_build_market_index_bias,
+    build_rate_bias as core_build_rate_bias,
+    merge_biases as core_merge_biases,
+)
+from fxbot.news import (
+    load_cached_news,
+    parse_calendar_event_datetime as core_parse_calendar_event_datetime,
+    parse_forex_datetime_string as core_parse_forex_datetime_string,
+    save_cached_news,
+)
+
 try:
     import redis
 except ImportError:
@@ -26,30 +42,31 @@ try:
 except ImportError:
     ZoneInfo = None
 
-MACRO_FILTER_FILE = os.getenv("MACRO_FILTER_FILE", "macro_filter.json")
-REDIS_URL = os.getenv("REDIS_URL", "")
-REDIS_MACRO_STATE_KEY = os.getenv("REDIS_MACRO_STATE_KEY", "macro_state")
-MACRO_NEWS_FILE = os.getenv("MACRO_NEWS_FILE", "macro_news.json")
-RATE_SPREAD_THRESHOLD = float(os.getenv("RATE_SPREAD_THRESHOLD", "0.25"))
-COMMODITY_MOMENTUM_THRESHOLD = float(os.getenv("COMMODITY_MOMENTUM_THRESHOLD", "0.03"))
-ESI_THRESHOLD = float(os.getenv("ESI_THRESHOLD", "5.0"))
-LIQUIDITY_RISK_THRESHOLD = float(os.getenv("LIQUIDITY_RISK_THRESHOLD", "0.50"))
+MACRO_FILTER_FILE = env_str("MACRO_FILTER_FILE", "macro_filter.json")
+REDIS_URL = env_str("REDIS_URL", "")
+REDIS_MACRO_STATE_KEY = env_str("REDIS_MACRO_STATE_KEY", "macro_state")
+MACRO_NEWS_FILE = env_str("MACRO_NEWS_FILE", "macro_news.json")
+MACRO_NEWS_CACHE_FILE = env_str("MACRO_NEWS_CACHE_FILE", "macro_news_cache.json")
+RATE_SPREAD_THRESHOLD = env_float("RATE_SPREAD_THRESHOLD", 0.25)
+COMMODITY_MOMENTUM_THRESHOLD = env_float("COMMODITY_MOMENTUM_THRESHOLD", 0.03)
+ESI_THRESHOLD = env_float("ESI_THRESHOLD", 5.0)
+LIQUIDITY_RISK_THRESHOLD = env_float("LIQUIDITY_RISK_THRESHOLD", 0.50)
 
-OANDA_API_URL = os.getenv("OANDA_API_URL", "https://api-fxpractice.oanda.com")
-OANDA_API_KEY = os.getenv("OANDA_API_KEY", "")
+OANDA_API_URL = env_str("OANDA_API_URL", "https://api-fxpractice.oanda.com")
+OANDA_API_KEY = env_str("OANDA_API_KEY", "")
 OANDA_COMMODITY_INSTRUMENTS = {
-    "OIL": os.getenv("OANDA_OIL_INSTRUMENT", "BCO_USD"),
-    "COPPER": os.getenv("OANDA_COPPER_INSTRUMENT", "XCU_USD"),
+    "OIL": env_str("OANDA_OIL_INSTRUMENT", "BCO_USD"),
+    "COPPER": env_str("OANDA_COPPER_INSTRUMENT", "XCU_USD"),
 }
 YFINANCE_MARKET_INDICATORS = {
-    "DXY": os.getenv("DXY_TICKER", "DX-Y.NYB"),
-    "VIX": os.getenv("VIX_TICKER", "^VIX"),
+    "DXY": env_str("DXY_TICKER", "DX-Y.NYB"),
+    "VIX": env_str("VIX_TICKER", "^VIX"),
 }
 YFINANCE_COMMODITY_TICKERS = {
-    "OIL": os.getenv("YFINANCE_OIL_TICKER", "CL=F"),
-    "COPPER": os.getenv("YFINANCE_COPPER_TICKER", "HG=F"),
+    "OIL": env_str("YFINANCE_OIL_TICKER", "CL=F"),
+    "COPPER": env_str("YFINANCE_COPPER_TICKER", "HG=F"),
 }
-FX_INDEX_MOMENTUM_THRESHOLD = float(os.getenv("FX_INDEX_MOMENTUM_THRESHOLD", "0.01"))
+FX_INDEX_MOMENTUM_THRESHOLD = env_float("FX_INDEX_MOMENTUM_THRESHOLD", 0.01)
 DEFAULT_ECONOMIC_CALENDAR_URLS = [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
     "https://www.forexfactory.com/ffcal_week_this.xml",
@@ -57,8 +74,9 @@ DEFAULT_ECONOMIC_CALENDAR_URLS = [
     "https://www.investing.com/rss/economic-calendar",
 ]
 DEFAULT_ECONOMIC_CALENDAR_URL = DEFAULT_ECONOMIC_CALENDAR_URLS[0]
-ECONOMIC_CALENDAR_URL = os.getenv("ECONOMIC_CALENDAR_URL", DEFAULT_ECONOMIC_CALENDAR_URL)
-NEWS_PAUSE_BEFORE_MINUTES = int(os.getenv("NEWS_PAUSE_BEFORE_MINUTES", "15"))
+ECONOMIC_CALENDAR_URL = env_str("ECONOMIC_CALENDAR_URL", DEFAULT_ECONOMIC_CALENDAR_URL)
+NEWS_PAUSE_BEFORE_MINUTES = env_int("NEWS_PAUSE_BEFORE_MINUTES", 15)
+NEWS_CACHE_MAX_HOURS = env_int("NEWS_CACHE_MAX_HOURS", 12)
 
 LOG_FORMAT = "%Y-%m-%d %H:%M:%S"
 logging.basicConfig(
@@ -67,6 +85,8 @@ logging.basicConfig(
     datefmt=LOG_FORMAT,
 )
 log = logging.getLogger(__name__)
+
+validate_macro_config(globals())
 
 try:
     import yfinance as yf
@@ -296,30 +316,7 @@ def load_liquidity_risk() -> Dict[str, Optional[float]]:
 
 
 def _parse_forex_datetime_string(value: str) -> Optional[datetime]:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    # Normalize explicit UTC designations
-    text = text.replace("Z", "+00:00")
-    # Forex Factory can emit EST/EDT-like timestamps; convert these to offsets explicitly
-    text = text.replace(" EST", "-05:00")
-    text = text.replace(" EDT", "-04:00")
-    try:
-        parsed = datetime.fromisoformat(text)
-        if parsed.tzinfo is None:
-            if ZoneInfo is not None:
-                try:
-                    eastern = ZoneInfo("America/New_York")
-                except Exception:
-                    eastern = timezone(timedelta(hours=-5))
-            else:
-                eastern = timezone(timedelta(hours=-5))
-            parsed = parsed.replace(tzinfo=eastern)
-        return parsed.astimezone(timezone.utc)
-    except Exception:
-        return None
+    return core_parse_forex_datetime_string(value, ZoneInfo)
 
 
 def parse_forex_event_time(raw: dict) -> Optional[datetime]:
@@ -365,22 +362,7 @@ def extract_forex_factory_events(raw: Any) -> List[dict]:
 
 
 def _parse_calendar_event_datetime(date_text: str, time_text: str) -> Optional[datetime]:
-    if not date_text:
-        return None
-
-    normalized_date = date_text.strip()
-    normalized_time = (time_text or "").strip().lower()
-    if not normalized_time or normalized_time in {"all day", "tentative"}:
-        normalized_time = "12:00am"
-
-    normalized_time = normalized_time.replace(" ", "")
-    combined = f"{normalized_date} {normalized_time}"
-    for fmt in ("%m-%d-%Y %I:%M%p", "%Y-%m-%d %I:%M%p"):
-        try:
-            return datetime.strptime(combined, fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    return None
+    return core_parse_calendar_event_datetime(date_text, time_text)
 
 
 def load_forex_factory_news() -> List[dict]:
@@ -408,6 +390,9 @@ def load_forex_factory_news() -> List[dict]:
             log.warning(f"Failed to fetch or parse economic calendar XML from {url}: {e}")
 
     if root is None:
+        cached_events = load_cached_news(MACRO_NEWS_CACHE_FILE, NEWS_CACHE_MAX_HOURS, logger=log)
+        if cached_events:
+            return cached_events
         log.error("Failed to fetch economic calendar XML from all candidate URLs.")
         return []
 
@@ -490,6 +475,7 @@ def load_forex_factory_news() -> List[dict]:
             f"Successfully loaded {len(events)} news events from economic calendar XML "
             f"(lookback {news_lookback_days}d). Sample: {sample_titles}"
         )
+        save_cached_news(MACRO_NEWS_CACHE_FILE, source_url or "", events, logger=log)
     else:
         log.info(
             f"No economic calendar events found in lookback window after filtering {len(items)} raw {item_kind} nodes "
@@ -509,166 +495,27 @@ def fetch_json(url: str, params: Dict[str, str] = None, headers: Dict[str, str] 
 
 
 def build_rate_bias(rates: Dict[str, Optional[float]]) -> Dict[str, str]:
-    biases = {}
-    us_2y = rates.get("US_2Y")
-    uk_2y = rates.get("UK_2Y")
-    eu_2y = rates.get("EU_2Y")
-    jp_2y = rates.get("JP_2Y")
-
-    if us_2y is not None and uk_2y is not None:
-        if uk_2y - us_2y > RATE_SPREAD_THRESHOLD:
-            biases["GBP_USD"] = "LONG_ONLY"
-        elif us_2y - uk_2y > RATE_SPREAD_THRESHOLD:
-            biases["GBP_USD"] = "SHORT_ONLY"
-
-    if us_2y is not None and eu_2y is not None:
-        if eu_2y - us_2y > RATE_SPREAD_THRESHOLD:
-            biases["EUR_USD"] = "LONG_ONLY"
-        elif us_2y - eu_2y > RATE_SPREAD_THRESHOLD:
-            biases["EUR_USD"] = "SHORT_ONLY"
-
-    if us_2y is not None and jp_2y is not None:
-        if us_2y - jp_2y > RATE_SPREAD_THRESHOLD:
-            biases["USD_JPY"] = "LONG_ONLY"
-        elif jp_2y - us_2y > RATE_SPREAD_THRESHOLD:
-            biases["USD_JPY"] = "SHORT_ONLY"
-
-    return biases
+    return core_build_rate_bias(rates, RATE_SPREAD_THRESHOLD)
 
 
 def build_commodity_bias(momentum: Dict[str, Optional[float]]) -> Dict[str, str]:
-    biases = {}
-    oil = momentum.get("OIL")
-    copper = momentum.get("COPPER")
-    dairy = momentum.get("DAIRY")
-
-    if oil is not None:
-        if oil > COMMODITY_MOMENTUM_THRESHOLD:
-            biases["USD_CAD"] = "SHORT_ONLY"
-        elif oil < -COMMODITY_MOMENTUM_THRESHOLD:
-            biases["USD_CAD"] = "LONG_ONLY"
-
-    if copper is not None:
-        if copper > COMMODITY_MOMENTUM_THRESHOLD:
-            biases["AUD_JPY"] = "LONG_ONLY"
-        elif copper < -COMMODITY_MOMENTUM_THRESHOLD:
-            biases["AUD_JPY"] = "SHORT_ONLY"
-
-    if dairy is not None:
-        if dairy > COMMODITY_MOMENTUM_THRESHOLD:
-            biases["NZD_USD"] = "LONG_ONLY"
-        elif dairy < -COMMODITY_MOMENTUM_THRESHOLD:
-            biases["NZD_USD"] = "SHORT_ONLY"
-
-    return biases
+    return core_build_commodity_bias(momentum, COMMODITY_MOMENTUM_THRESHOLD)
 
 
 def build_market_index_bias(indices: Dict[str, Optional[float]]) -> Dict[str, str]:
-    biases = {}
-    dxy = indices.get("DXY")
-    vix = indices.get("VIX")
-
-    if dxy is not None:
-        if dxy > FX_INDEX_MOMENTUM_THRESHOLD:
-            biases.update({
-                "EUR_USD": "SHORT_ONLY",
-                "GBP_USD": "SHORT_ONLY",
-                "AUD_USD": "SHORT_ONLY",
-                "USD_JPY": "LONG_ONLY",
-                "USD_CHF": "LONG_ONLY",
-                "USD_CAD": "LONG_ONLY",
-            })
-        elif dxy < -FX_INDEX_MOMENTUM_THRESHOLD:
-            biases.update({
-                "EUR_USD": "LONG_ONLY",
-                "GBP_USD": "LONG_ONLY",
-                "AUD_USD": "LONG_ONLY",
-                "USD_JPY": "SHORT_ONLY",
-                "USD_CHF": "SHORT_ONLY",
-                "USD_CAD": "SHORT_ONLY",
-            })
-
-    if vix is not None:
-        if vix > FX_INDEX_MOMENTUM_THRESHOLD:
-            biases.update({
-                "AUD_USD": "SHORT_ONLY",
-                "NZD_USD": "SHORT_ONLY",
-                "GBP_USD": "SHORT_ONLY",
-                "EUR_USD": "SHORT_ONLY",
-                "USD_JPY": "LONG_ONLY",
-                "USD_CHF": "LONG_ONLY",
-            })
-        elif vix < -FX_INDEX_MOMENTUM_THRESHOLD:
-            biases.update({
-                "AUD_USD": "LONG_ONLY",
-                "NZD_USD": "LONG_ONLY",
-                "GBP_USD": "LONG_ONLY",
-                "EUR_USD": "LONG_ONLY",
-                "USD_JPY": "SHORT_ONLY",
-                "USD_CHF": "SHORT_ONLY",
-            })
-
-    return biases
+    return core_build_market_index_bias(indices, FX_INDEX_MOMENTUM_THRESHOLD)
 
 
 def build_esi_bias(esi: Dict[str, Optional[float]]) -> Dict[str, str]:
-    biases = {}
-    us = esi.get("US")
-    uk = esi.get("UK")
-    eu = esi.get("EU")
-    jp = esi.get("JP")
-
-    if us is not None:
-        if us > ESI_THRESHOLD:
-            biases.update({"EUR_USD": "SHORT_ONLY", "GBP_USD": "SHORT_ONLY", "AUD_USD": "SHORT_ONLY"})
-        elif us < -ESI_THRESHOLD:
-            biases.update({"EUR_USD": "LONG_ONLY", "GBP_USD": "LONG_ONLY", "AUD_USD": "LONG_ONLY"})
-
-    if uk is not None:
-        if uk > ESI_THRESHOLD:
-            biases["GBP_USD"] = "LONG_ONLY"
-        elif uk < -ESI_THRESHOLD:
-            biases["GBP_USD"] = "SHORT_ONLY"
-
-    if eu is not None:
-        if eu > ESI_THRESHOLD:
-            biases["EUR_USD"] = "LONG_ONLY"
-        elif eu < -ESI_THRESHOLD:
-            biases["EUR_USD"] = "SHORT_ONLY"
-
-    if jp is not None:
-        if jp > ESI_THRESHOLD:
-            biases["USD_JPY"] = "LONG_ONLY"
-        elif jp < -ESI_THRESHOLD:
-            biases["USD_JPY"] = "SHORT_ONLY"
-
-    return biases
+    return core_build_esi_bias(esi, ESI_THRESHOLD)
 
 
 def build_liquidity_bias(risk: Dict[str, Optional[float]]) -> Dict[str, str]:
-    biases = {}
-    ted = risk.get("TED_SPREAD")
-    fra = risk.get("FRA_OIS_SPREAD")
-
-    if (ted is not None and ted > LIQUIDITY_RISK_THRESHOLD) or (fra is not None and fra > LIQUIDITY_RISK_THRESHOLD):
-        biases.update({
-            "AUD_USD": "SHORT_ONLY",
-            "NZD_USD": "SHORT_ONLY",
-            "USD_CHF": "LONG_ONLY",
-            "USD_JPY": "LONG_ONLY",
-        })
-    return biases
+    return core_build_liquidity_bias(risk, LIQUIDITY_RISK_THRESHOLD)
 
 
 def merge_biases(*bias_groups: Dict[str, str]) -> Dict[str, str]:
-    merged: Dict[str, str] = {}
-    for group in bias_groups:
-        for symbol, value in group.items():
-            existing = merged.get(symbol)
-            if existing and existing != value:
-                log.info(f"Macro bias conflict for {symbol}: keeping {value} over {existing}")
-            merged[symbol] = value
-    return merged
+    return core_merge_biases(*bias_groups, logger=log)
 
 
 def generate_macro_filters() -> Dict[str, Any]:
