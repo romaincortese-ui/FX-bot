@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime, timezone
+from typing import Any
 
 from backtest.config import BacktestConfig
 from backtest.data import HistoricalDataProvider
@@ -20,24 +21,7 @@ def _parse_cli_datetime(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the integrated FX bot backtester")
-    parser.add_argument("--start", help="UTC ISO start datetime")
-    parser.add_argument("--end", help="UTC ISO end datetime")
-    parser.add_argument("--instruments", help="Comma-separated instrument list")
-    parser.add_argument("--granularity", help="Base granularity such as M5 or M15")
-    args = parser.parse_args()
-
-    config = BacktestConfig.from_env()
-    if args.start:
-        config.start = _parse_cli_datetime(args.start)
-    if args.end:
-        config.end = _parse_cli_datetime(args.end)
-    if args.instruments:
-        config.instruments = [item.strip().upper().replace("/", "_") for item in args.instruments.split(",") if item.strip()]
-    if args.granularity:
-        config.granularity = args.granularity.upper()
-
+def run_backtest(config: BacktestConfig) -> dict[str, Any]:
     provider = HistoricalDataProvider(
         oanda_api_key=env_str("OANDA_API_KEY", ""),
         oanda_api_url=env_str("OANDA_API_URL", "https://api-fxpractice.oanda.com"),
@@ -67,6 +51,28 @@ def main() -> None:
         env_str("REDIS_TRADE_CALIBRATION_KEY", "trade_calibration"),
         calibration,
     )
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the integrated FX bot backtester")
+    parser.add_argument("--start", help="UTC ISO start datetime")
+    parser.add_argument("--end", help="UTC ISO end datetime")
+    parser.add_argument("--instruments", help="Comma-separated instrument list")
+    parser.add_argument("--granularity", help="Base granularity such as M5 or M15")
+    args = parser.parse_args()
+
+    config = BacktestConfig.from_env()
+    if args.start:
+        config.start = _parse_cli_datetime(args.start)
+    if args.end:
+        config.end = _parse_cli_datetime(args.end)
+    if args.instruments:
+        config.instruments = [item.strip().upper().replace("/", "_") for item in args.instruments.split(",") if item.strip()]
+    if args.granularity:
+        config.granularity = args.granularity.upper()
+
+    report = run_backtest(config)
     print(json.dumps(report, indent=2))
 
 

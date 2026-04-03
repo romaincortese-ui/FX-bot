@@ -97,6 +97,14 @@ Example:
 python -m backtest.run_backtest --start 2023-01-01T00:00:00Z --end 2023-06-01T00:00:00Z --instruments EUR_USD,GBP_USD,USD_JPY --granularity M15
 ```
 
+For Railway or other schedulers, use the rolling entrypoint instead of fixed dates if you want the window to advance automatically:
+
+```bash
+python run_daily_calibration.py
+```
+
+That script anchors `end` to the current UTC midnight and sets `start = end - BACKTEST_ROLLING_DAYS`.
+
 If you want the backtest to fetch historical candles from OANDA locally, add `OANDA_API_KEY` and `OANDA_API_URL` to the root `.env` before running it.
 
 Useful environment variables:
@@ -105,6 +113,7 @@ Useful environment variables:
 - `REDIS_URL`, `REDIS_MACRO_STATE_KEY`, `REDIS_TRADE_CALIBRATION_KEY`
 - `CALIBRATION_MAX_AGE_HOURS`, `CALIBRATION_MIN_TOTAL_TRADES`
 - `BACKTEST_START`, `BACKTEST_END`
+- `BACKTEST_ROLLING_DAYS`, `BACKTEST_ROLLING_END_OFFSET_DAYS`
 - `BACKTEST_INSTRUMENTS`
 - `BACKTEST_GRANULARITY`
 - `BACKTEST_STRATEGIES`
