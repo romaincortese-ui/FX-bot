@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 import requests
+
+
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def _to_utc(value: datetime) -> datetime:
@@ -42,6 +46,27 @@ class HistoricalDataProvider:
         self._spread_profile_cache: dict[tuple[str, str], dict[str, float]] = {}
         if self.oanda_api_key:
             self.session.headers.update({"Authorization": f"Bearer {self.oanda_api_key}"})
+
+    def _request_json(self, url: str, params: dict[str, str], timeout: int = 30) -> dict:
+        last_error: Exception | None = None
+        for attempt in range(4):
+            try:
+                response = self.session.get(url, params=params, timeout=timeout)
+                response.raise_for_status()
+                return response.json()
+            except requests.HTTPError as exc:
+                status_code = getattr(exc.response, "status_code", None)
+                if status_code not in RETRYABLE_STATUS_CODES or attempt == 3:
+                    raise
+                last_error = exc
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if attempt == 3:
+                    raise
+                last_error = exc
+            time.sleep(1.5 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+        return {}
 
     def _cache_base(self, instrument: str, granularity: str, start: datetime, end: datetime) -> Path:
         name = f"{instrument}_{granularity}_{start:%Y%m%d%H%M}_{end:%Y%m%d%H%M}"
@@ -95,9 +120,7 @@ class HistoricalDataProvider:
                 "to": chunk_end.isoformat().replace("+00:00", "Z"),
             }
             url = f"{self.oanda_api_url}/v3/instruments/{instrument}/candles"
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            payload = response.json()
+            payload = self._request_json(url, params=params, timeout=30)
             candles = payload.get("candles", [])
             rows = []
             for candle in candles:

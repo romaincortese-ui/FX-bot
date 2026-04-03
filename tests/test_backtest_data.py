@@ -1,10 +1,17 @@
 from datetime import datetime, timedelta, timezone
 
+import requests
+
 from backtest.data import HistoricalDataProvider
 
 
 class FakeResponse:
+    def __init__(self, status_code=200):
+        self.status_code = status_code
+
     def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} error", response=self)
         return None
 
     def json(self):
@@ -18,6 +25,18 @@ class RecordingSession:
 
     def get(self, url, params=None, timeout=30):
         self.calls.append({"url": url, "params": dict(params or {}), "timeout": timeout})
+        return FakeResponse()
+
+
+class FlakySession(RecordingSession):
+    def __init__(self, responses):
+        super().__init__()
+        self.responses = list(responses)
+
+    def get(self, url, params=None, timeout=30):
+        self.calls.append({"url": url, "params": dict(params or {}), "timeout": timeout})
+        if self.responses:
+            return self.responses.pop(0)
         return FakeResponse()
 
 
@@ -52,3 +71,16 @@ def test_get_candles_clamps_future_end_before_oanda_request(tmp_path):
     for call in provider.session.calls:
         chunk_end = datetime.fromisoformat(call["params"]["to"].replace("Z", "+00:00"))
         assert chunk_end <= latest_allowed
+
+
+def test_get_candles_retries_transient_oanda_errors(tmp_path, monkeypatch):
+    provider = HistoricalDataProvider(oanda_api_key="token", cache_dir=str(tmp_path))
+    provider.session = FlakySession([FakeResponse(status_code=502), FakeResponse(status_code=200)])
+    monkeypatch.setattr("backtest.data.time.sleep", lambda *_args, **_kwargs: None)
+
+    start = datetime(2023, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(hours=4)
+
+    provider.get_candles("GBP_USD", "H4", start, end, price="MBA")
+
+    assert len(provider.session.calls) == 2
