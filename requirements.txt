@@ -6,4 +6,5 @@ redis>=4.6.0
 tzdata>=2024.1
 yfinance>=0.2.54
 pydantic>=2.10.0
+python-dotenv>=1.0.1
 pytest>=8.3.0

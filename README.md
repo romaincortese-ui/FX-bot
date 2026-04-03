@@ -56,7 +56,8 @@ Still intentionally deferred:
 pip install -r requirements.txt
 ```
 
-4. Copy `.env.sample` to `.env` and set your OANDA, Telegram, Redis, and macro values.
+4. Copy `.env.sample` to `.env` in the repository root and set your OANDA, Redis, and macro values.
+	Local runs of `main.py`, `macro_engine.py`, and `python -m backtest.run_backtest` now auto-load that file.
 5. Run tests:
 
 ```bash
@@ -96,8 +97,13 @@ Example:
 python -m backtest.run_backtest --start 2023-01-01T00:00:00Z --end 2023-06-01T00:00:00Z --instruments EUR_USD,GBP_USD,USD_JPY --granularity M15
 ```
 
+If you want the backtest to fetch historical candles from OANDA locally, add `OANDA_API_KEY` and `OANDA_API_URL` to the root `.env` before running it.
+
 Useful environment variables:
 
+- `OANDA_API_KEY`, `OANDA_API_URL`
+- `REDIS_URL`, `REDIS_MACRO_STATE_KEY`, `REDIS_TRADE_CALIBRATION_KEY`
+- `CALIBRATION_MAX_AGE_HOURS`, `CALIBRATION_MIN_TOTAL_TRADES`
 - `BACKTEST_START`, `BACKTEST_END`
 - `BACKTEST_INSTRUMENTS`
 - `BACKTEST_GRANULARITY`
@@ -128,6 +134,10 @@ Artifacts are written to the configured output directory as:
 - `equity_curve.csv`
 - `trade_journal.csv`
 - `summary.json`
+- `calibration.json`
+
+`calibration.json` contains grouped backtest stats by strategy, strategy/pair, and strategy/pair/session.
+The live bot can read that file through `TRADE_CALIBRATION_FILE` or, when `REDIS_URL` is configured, from `REDIS_TRADE_CALIBRATION_KEY` on the same Redis used by the macro engine.
 
 Historical realism notes:
 

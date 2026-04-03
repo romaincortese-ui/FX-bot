@@ -26,6 +26,7 @@ class StrategyScoringContext:
     dxy_gate_threshold: float
     vix_level: float | None
     vix_low_threshold: float
+    get_trade_calibration_adjustment: Callable[[str, str, str | None], Mapping[str, Any]] | None = None
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
 
@@ -73,6 +74,30 @@ def _reject_if_news_paused(strategy: str, instrument: str, ctx: StrategyScoringC
         ctx.reject(strategy, instrument, "pre-news risk window")
         return True
     return False
+
+
+def _get_trade_calibration_adjustment(ctx: StrategyScoringContext, strategy: str, instrument: str, session_name: str | None) -> dict[str, Any]:
+    if ctx.get_trade_calibration_adjustment is None:
+        return {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None, "source": None}
+    raw = ctx.get_trade_calibration_adjustment(strategy, instrument, session_name)
+    if not isinstance(raw, Mapping):
+        return {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None, "source": None}
+    return {
+        "threshold_offset": float(raw.get("threshold_offset", 0.0) or 0.0),
+        "risk_mult": float(raw.get("risk_mult", 1.0) or 1.0),
+        "block_reason": raw.get("block_reason"),
+        "source": raw.get("source"),
+    }
+
+
+def _apply_calibration(strategy: str, instrument: str, session: Mapping[str, Any], score: float, eff_threshold: float, ctx: StrategyScoringContext) -> tuple[float, float, dict[str, Any]] | None:
+    adjustment = _get_trade_calibration_adjustment(ctx, strategy, instrument, str(session.get("name") or ""))
+    if adjustment["block_reason"]:
+        ctx.reject(strategy, instrument, str(adjustment["block_reason"]))
+        return None
+    selection_score = float(score) * max(0.5, float(adjustment["risk_mult"])) - float(adjustment["threshold_offset"])
+    adjusted_threshold = float(eff_threshold) + float(adjustment["threshold_offset"])
+    return selection_score, adjusted_threshold, adjustment
 
 
 def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -137,8 +162,12 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
 
     eff_threshold = settings["SCALPER_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("SCALPER", 0)
-    if score < eff_threshold:
-        ctx.reject("SCALPER", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+    calibrated = _apply_calibration("SCALPER", instrument, session, score, eff_threshold, ctx)
+    if calibrated is None:
+        return None
+    selection_score, eff_threshold, calibration = calibrated
+    if selection_score < eff_threshold:
+        ctx.reject("SCALPER", instrument, f"score {selection_score:.0f} < {eff_threshold:.0f}")
         return None
 
     tp_pips = max(settings["SCALPER_TP_MIN_PIPS"], min(settings["SCALPER_TP_MAX_PIPS"], price_to_pips(instrument, atr * settings["SCALPER_TP_ATR_MULT"])))
@@ -149,6 +178,7 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
     return {
         "instrument": instrument,
         "score": round(score, 2),
+        "selection_score": round(selection_score, 2),
         "direction": direction,
         "rsi": round(rsi, 2),
         "rsi_delta": round(rsi_delta, 2),
@@ -161,6 +191,9 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
         "trail_pips": settings["SCALPER_TRAIL_PIPS"],
         "macro_confidence": macro_confidence,
         "regime_multiplier": ctx.market_regime_mult,
+        "calibration_threshold_offset": calibration["threshold_offset"],
+        "calibration_risk_mult": calibration["risk_mult"],
+        "calibration_source": calibration["source"],
         "crossed_now": crossed_now or crossed_down_now,
         "entry_signal": "CROSSOVER" if crossed else ("VOL_SPIKE" if vol_ratio > 2 else "TREND"),
         "macd": macd,
@@ -226,14 +259,18 @@ def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
         return None
     eff_threshold = settings["TREND_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("TREND", 0)
-    if score < eff_threshold:
-        ctx.reject("TREND", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+    calibrated = _apply_calibration("TREND", instrument, session, score, eff_threshold, ctx)
+    if calibrated is None:
+        return None
+    selection_score, eff_threshold, calibration = calibrated
+    if selection_score < eff_threshold:
+        ctx.reject("TREND", instrument, f"score {selection_score:.0f} < {eff_threshold:.0f}")
         return None
     tp_pips = max(15, price_to_pips(instrument, atr * settings["TREND_TP_ATR_MULT"]))
     sl_pips = max(8, price_to_pips(instrument, atr * settings["TREND_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     partial_tp_pips = max(10, price_to_pips(instrument, atr * settings["TREND_PARTIAL_TP_ATR"]))
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "partial_tp_pips": round(partial_tp_pips, 1), "trail_pips": settings["TREND_TRAIL_PIPS"], "entry_signal": "TREND_ALIGNED", "ema50_gap_4h": round(ema50_gap_4h * 100, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
+    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "partial_tp_pips": round(partial_tp_pips, 1), "trail_pips": settings["TREND_TRAIL_PIPS"], "entry_signal": "TREND_ALIGNED", "ema50_gap_4h": round(ema50_gap_4h * 100, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
 
 
 def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -286,13 +323,17 @@ def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategySco
         return None
     eff_threshold = settings["REVERSAL_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("REVERSAL", 0)
-    if score < eff_threshold:
-        ctx.reject("REVERSAL", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+    calibrated = _apply_calibration("REVERSAL", instrument, session, score, eff_threshold, ctx)
+    if calibrated is None:
+        return None
+    selection_score, eff_threshold, calibration = calibrated
+    if selection_score < eff_threshold:
+        ctx.reject("REVERSAL", instrument, f"score {selection_score:.0f} < {eff_threshold:.0f}")
         return None
     tp_pips = max(8, price_to_pips(instrument, atr * settings["REVERSAL_TP_ATR_MULT"]))
     sl_pips = max(5, price_to_pips(instrument, atr * settings["REVERSAL_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["REVERSAL_TRAIL_PIPS"], "entry_signal": "OVERSOLD_BOUNCE" if is_oversold else "OVERBOUGHT_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
+    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["REVERSAL_TRAIL_PIPS"], "entry_signal": "OVERSOLD_BOUNCE" if is_oversold else "OVERBOUGHT_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
 
 
 def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -335,13 +376,17 @@ def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategySco
         return None
     eff_threshold = settings["BREAKOUT_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("BREAKOUT", 0)
-    if score < eff_threshold:
-        ctx.reject("BREAKOUT", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+    calibrated = _apply_calibration("BREAKOUT", instrument, session, score, eff_threshold, ctx)
+    if calibrated is None:
+        return None
+    selection_score, eff_threshold, calibration = calibrated
+    if selection_score < eff_threshold:
+        ctx.reject("BREAKOUT", instrument, f"score {selection_score:.0f} < {eff_threshold:.0f}")
         return None
     tp_pips = max(15, price_to_pips(instrument, atr * settings["BREAKOUT_TP_ATR_MULT"]))
     sl_pips = max(5, price_to_pips(instrument, atr * settings["BREAKOUT_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "squeeze_bars": squeeze["squeeze_bars"], "bb_percentile": round(squeeze["bb_percentile"], 1), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["BREAKOUT_TRAIL_PIPS"], "entry_signal": "BB_KC_SQUEEZE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
+    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "squeeze_bars": squeeze["squeeze_bars"], "bb_percentile": round(squeeze["bb_percentile"], 1), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["BREAKOUT_TRAIL_PIPS"], "entry_signal": "BB_KC_SQUEEZE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
 
 
 def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -393,13 +438,17 @@ def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
         score += 5
     eff_threshold = settings["CARRY_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("CARRY", 0)
-    if score < eff_threshold:
-        ctx.reject("CARRY", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+    calibrated = _apply_calibration("CARRY", instrument, session, score, eff_threshold, ctx)
+    if calibrated is None:
+        return None
+    selection_score, eff_threshold, calibration = calibrated
+    if selection_score < eff_threshold:
+        ctx.reject("CARRY", instrument, f"score {selection_score:.0f} < {eff_threshold:.0f}")
         return None
     tp_pips = max(15, price_to_pips(instrument, atr * settings["CARRY_TP_ATR_MULT"]))
     sl_pips = max(10, price_to_pips(instrument, atr * settings["CARRY_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, "LONG", "LONG_ONLY", ctx.vix_level)
-    return {"instrument": instrument, "score": round(score, 2), "direction": "LONG", "rsi": round(rsi_4h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["CARRY_TRAIL_PIPS"], "entry_signal": "CARRY_YIELD", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "momentum_5d": round(momentum_5d, 4)}
+    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": "LONG", "rsi": round(rsi_4h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["CARRY_TRAIL_PIPS"], "entry_signal": "CARRY_YIELD", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "momentum_5d": round(momentum_5d, 4), "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
 
 
 def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -455,15 +504,19 @@ def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyS
         return None
     eff_threshold = settings["ASIAN_FADE_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("ASIAN_FADE", 0)
-    if score < eff_threshold:
-        ctx.reject("ASIAN_FADE", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+    calibrated = _apply_calibration("ASIAN_FADE", instrument, session, score, eff_threshold, ctx)
+    if calibrated is None:
+        return None
+    selection_score, eff_threshold, calibration = calibrated
+    if selection_score < eff_threshold:
+        ctx.reject("ASIAN_FADE", instrument, f"score {selection_score:.0f} < {eff_threshold:.0f}")
         return None
     tp_pips = max(5, min(20, price_to_pips(instrument, atr * settings["ASIAN_FADE_TP_ATR_MULT"])))
     sl_pips = max(4, min(15, price_to_pips(instrument, atr * settings["ASIAN_FADE_SL_ATR_MULT"])))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.2:
         tp_pips = sl_pips * 1.2
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["ASIAN_FADE_TRAIL_PIPS"], "entry_signal": "ASIAN_RANGE_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
+    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["ASIAN_FADE_TRAIL_PIPS"], "entry_signal": "ASIAN_RANGE_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
 
 
 def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -513,15 +566,19 @@ def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategySc
     atr_pct = atr / float(close.iloc[-1])
     eff_threshold = settings["POST_NEWS_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("POST_NEWS", 0)
-    if score < eff_threshold:
-        ctx.reject("POST_NEWS", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+    calibrated = _apply_calibration("POST_NEWS", instrument, session, score, eff_threshold, ctx)
+    if calibrated is None:
+        return None
+    selection_score, eff_threshold, calibration = calibrated
+    if selection_score < eff_threshold:
+        ctx.reject("POST_NEWS", instrument, f"score {selection_score:.0f} < {eff_threshold:.0f}")
         return None
     tp_pips = max(10, price_to_pips(instrument, atr * settings["POST_NEWS_TP_ATR_MULT"]))
     sl_pips = max(5, price_to_pips(instrument, atr * settings["POST_NEWS_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.5:
         tp_pips = sl_pips * 1.5
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["POST_NEWS_TRAIL_PIPS"], "entry_signal": "POST_NEWS_BREAKOUT", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
+    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["POST_NEWS_TRAIL_PIPS"], "entry_signal": "POST_NEWS_BREAKOUT", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
 
 
 def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -595,12 +652,16 @@ def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     atr_pct = atr / float(close_1h.iloc[-1])
     eff_threshold = settings["PULLBACK_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("PULLBACK", 0)
-    if score < eff_threshold:
-        ctx.reject("PULLBACK", instrument, f"score {score:.0f} < {eff_threshold:.0f}")
+    calibrated = _apply_calibration("PULLBACK", instrument, session, score, eff_threshold, ctx)
+    if calibrated is None:
+        return None
+    selection_score, eff_threshold, calibration = calibrated
+    if selection_score < eff_threshold:
+        ctx.reject("PULLBACK", instrument, f"score {selection_score:.0f} < {eff_threshold:.0f}")
         return None
     tp_pips = max(12, price_to_pips(instrument, atr * settings["PULLBACK_TP_ATR_MULT"]))
     sl_pips = max(6, price_to_pips(instrument, atr * settings["PULLBACK_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.5:
         tp_pips = sl_pips * 1.5
-    return {"instrument": instrument, "score": round(score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["PULLBACK_TRAIL_PIPS"], "entry_signal": "PULLBACK_REENTRY", "pullback_depth": round(pullback_depth, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult}
+    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["PULLBACK_TRAIL_PIPS"], "entry_signal": "PULLBACK_REENTRY", "pullback_depth": round(pullback_depth, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}

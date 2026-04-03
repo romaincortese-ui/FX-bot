@@ -27,6 +27,11 @@ def _granularity_step(granularity: str) -> timedelta:
     return mapping.get(granularity.upper(), timedelta(minutes=5))
 
 
+def _request_chunk_span(granularity: str, max_candles: int = 4500) -> timedelta:
+    step = _granularity_step(granularity)
+    return step * max(1, max_candles)
+
+
 class HistoricalDataProvider:
     def __init__(self, oanda_api_key: str = "", oanda_api_url: str = "https://api-fxpractice.oanda.com", cache_dir: str = "backtest_cache"):
         self.oanda_api_key = oanda_api_key
@@ -75,9 +80,9 @@ class HistoricalDataProvider:
 
         frames: list[pd.DataFrame] = []
         cursor = start
-        chunk_days = 30
+        chunk_span = _request_chunk_span(granularity)
         while cursor < end:
-            chunk_end = min(cursor + timedelta(days=chunk_days), end)
+            chunk_end = min(cursor + chunk_span, end)
             params = {
                 "price": price,
                 "granularity": granularity,

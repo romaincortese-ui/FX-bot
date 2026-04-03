@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import pandas as pd
+import requests
 
 from fxbot.indicators import calc_atr, calc_ema
 from fxbot.risk import would_breach_correlation_limit
@@ -54,7 +55,14 @@ class BacktestEngine:
         key = (instrument, granularity)
         if key not in self.data_cache:
             price = "MBA" if self.config.use_bid_ask_data else "M"
-            self.data_cache[key] = self.data_provider.get_candles(instrument, granularity, self.config.start - timedelta(days=10), self.config.end + timedelta(days=2), price=price) or pd.DataFrame()
+            fetched = self.data_provider.get_candles(
+                instrument,
+                granularity,
+                self.config.start - timedelta(days=10),
+                self.config.end + timedelta(days=2),
+                price=price,
+            )
+            self.data_cache[key] = fetched if fetched is not None else pd.DataFrame()
         df = self.data_cache[key]
         return df if not df.empty else None
 
@@ -227,10 +235,16 @@ class BacktestEngine:
     def _conversion_rate(self, from_currency: str, to_currency: str, now: datetime) -> float | None:
         if from_currency == to_currency:
             return 1.0
-        direct = self._bar_at(f"{from_currency}_{to_currency}", self.config.granularity, now)
+        try:
+            direct = self._bar_at(f"{from_currency}_{to_currency}", self.config.granularity, now)
+        except requests.HTTPError:
+            direct = None
         if direct:
             return float(direct["close"])
-        inverse = self._bar_at(f"{to_currency}_{from_currency}", self.config.granularity, now)
+        try:
+            inverse = self._bar_at(f"{to_currency}_{from_currency}", self.config.granularity, now)
+        except requests.HTTPError:
+            inverse = None
         if inverse and float(inverse["close"]) > 0:
             return 1.0 / float(inverse["close"])
         return None
@@ -301,6 +315,7 @@ class BacktestEngine:
                         dxy_gate_threshold=self.settings["DXY_GATE_THRESHOLD"],
                         vix_level=macro_state.vix_value,
                         vix_low_threshold=self.settings["VIX_LOW_THRESHOLD"],
+                        get_trade_calibration_adjustment=lambda *args, **kwargs: {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None, "source": None},
                         now_provider=lambda now=current: now,
                     )
                     opp = scorer(instrument, session, ctx, self.settings)
@@ -310,7 +325,9 @@ class BacktestEngine:
                     if breached:
                         continue
                     opp["session_name"] = session["name"]
-                    if best_opp is None or float(opp["score"]) > float(best_opp["score"]):
+                    current_score = float(opp.get("selection_score", opp.get("score", 0.0)) or 0.0)
+                    best_score = float(best_opp.get("selection_score", best_opp.get("score", 0.0)) or 0.0) if best_opp is not None else float("-inf")
+                    if best_opp is None or current_score > best_score:
                         best_opp = opp
                 if best_opp is None:
                     continue

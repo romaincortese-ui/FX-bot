@@ -260,6 +260,15 @@ ADAPTIVE_TIGHTEN_STEP = float(os.getenv("ADAPTIVE_TIGHTEN_STEP","3"))
 ADAPTIVE_RELAX_STEP   = float(os.getenv("ADAPTIVE_RELAX_STEP", "2"))
 ADAPTIVE_MAX_OFFSET   = float(os.getenv("ADAPTIVE_MAX_OFFSET", "10"))
 ADAPTIVE_MIN_OFFSET   = float(os.getenv("ADAPTIVE_MIN_OFFSET", "-5"))
+TRADE_CALIBRATION_FILE = os.getenv("TRADE_CALIBRATION_FILE", "backtest_output/calibration.json")
+CALIBRATION_PAIR_MIN_TRADES = int(os.getenv("CALIBRATION_PAIR_MIN_TRADES", "20"))
+CALIBRATION_SESSION_MIN_TRADES = int(os.getenv("CALIBRATION_SESSION_MIN_TRADES", "8"))
+CALIBRATION_BLOCK_MAX_WIN_RATE = float(os.getenv("CALIBRATION_BLOCK_MAX_WIN_RATE", "0.20"))
+CALIBRATION_BLOCK_MAX_PROFIT_FACTOR = float(os.getenv("CALIBRATION_BLOCK_MAX_PROFIT_FACTOR", "0.60"))
+CALIBRATION_BLOCK_MAX_EXPECTANCY_PIPS = float(os.getenv("CALIBRATION_BLOCK_MAX_EXPECTANCY_PIPS", "-5.0"))
+CALIBRATION_RISK_FLOOR = float(os.getenv("CALIBRATION_RISK_FLOOR", "0.25"))
+CALIBRATION_MAX_TIGHTEN = float(os.getenv("CALIBRATION_MAX_TIGHTEN", "8.0"))
+CALIBRATION_MAX_RELAX = float(os.getenv("CALIBRATION_MAX_RELAX", "2.0"))
 
 DAILY_LOSS_LIMIT_PCT     = float(os.getenv("DAILY_LOSS_LIMIT_PCT",     "0.03"))
 STREAK_LOSS_MAX          = int(os.getenv("STREAK_LOSS_MAX",             "4"))
@@ -292,6 +301,9 @@ STATE_FILE          = "state.json"
 MACRO_NEWS_FILE     = os.getenv("MACRO_NEWS_FILE", "macro_news.json")
 REDIS_URL           = os.getenv("REDIS_URL", "")
 REDIS_MACRO_STATE_KEY = os.getenv("REDIS_MACRO_STATE_KEY", "macro_state")
+REDIS_TRADE_CALIBRATION_KEY = os.getenv("REDIS_TRADE_CALIBRATION_KEY", "trade_calibration")
+CALIBRATION_MAX_AGE_HOURS = float(os.getenv("CALIBRATION_MAX_AGE_HOURS", "72"))
+CALIBRATION_MIN_TOTAL_TRADES = int(os.getenv("CALIBRATION_MIN_TOTAL_TRADES", "50"))
 HTTP_RETRIES        = 3
 HTTP_RETRY_DELAY    = 1.0
 HEARTBEAT_INTERVAL  = int(os.getenv("HEARTBEAT_INTERVAL",  "3600"))
@@ -355,6 +367,8 @@ _macro_filter_mtime  = 0.0
 macro_news           = []
 _macro_news_mtime    = 0.0
 macro_news_pause_until = 0.0
+trade_calibration    = {}
+_trade_calibration_mtime = 0.0
 _recent_scan_decisions = []
 _last_scan_cycle_at   = ""
 _last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0, "active_pairs": [], "tradable_pairs": []}
@@ -1754,9 +1768,11 @@ def _find_best_opportunity(strategy: str, pairs: list[str], session: dict, score
     for pair in pairs:
         opp = scorer(pair, session)
         if opp:
-            block_reason = get_entry_block_reason(opp["instrument"], opp["direction"])
+            block_reason = get_strategy_entry_block_reason(strategy, opp["instrument"], opp["direction"], opp=opp, session_name=session["name"])
             if block_reason is None:
-                if best is None or opp["score"] > best["score"]:
+                current_score = float(opp.get("selection_score", opp.get("score", 0.0)) or 0.0)
+                best_score = float(best.get("selection_score", best.get("score", 0.0)) or 0.0) if best is not None else float("-inf")
+                if best is None or current_score > best_score:
                     best = opp
             elif blocked_reason is None:
                 blocked_pair = opp["instrument"]
@@ -2091,6 +2107,229 @@ def load_state():
     except Exception as e:
         log.warning(f"State load failed ({e}) — starting fresh")
 
+
+def _count_calibration_pairs(data: dict) -> int:
+    count = 0
+    for pairs in data.get("by_strategy_pair", {}).values():
+        if isinstance(pairs, dict):
+            count += len(pairs)
+    return count
+
+
+def _count_calibration_trades(data: dict) -> int:
+    total = data.get("total_trades")
+    if isinstance(total, int):
+        return total
+    by_strategy = data.get("by_strategy", {})
+    if isinstance(by_strategy, dict):
+        return sum(int(stats.get("trades", 0) or 0) for stats in by_strategy.values() if isinstance(stats, dict))
+    return 0
+
+
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _validate_trade_calibration_payload(data: dict) -> tuple[bool, str | None]:
+    total_trades = _count_calibration_trades(data)
+    if total_trades < CALIBRATION_MIN_TOTAL_TRADES:
+        return False, f"insufficient sample ({total_trades} trades < {CALIBRATION_MIN_TOTAL_TRADES})"
+    generated_at = _parse_iso_utc(data.get("generated_at"))
+    if generated_at is None:
+        return False, "missing generated_at"
+    max_age_seconds = max(0.0, CALIBRATION_MAX_AGE_HOURS * 3600.0)
+    age_seconds = (datetime.now(timezone.utc) - generated_at).total_seconds()
+    if age_seconds > max_age_seconds:
+        age_hours = age_seconds / 3600.0
+        return False, f"stale calibration ({age_hours:.1f}h > {CALIBRATION_MAX_AGE_HOURS:.1f}h)"
+    return True, None
+
+
+def _load_trade_calibration_from_redis() -> dict | None:
+    if REDIS_CLIENT is None:
+        return None
+    try:
+        raw = REDIS_CLIENT.get(REDIS_TRADE_CALIBRATION_KEY)
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        log.warning(f"Trade calibration Redis load failed for key {REDIS_TRADE_CALIBRATION_KEY}: {e}")
+    return None
+
+
+def load_trade_calibration() -> None:
+    global trade_calibration
+    try:
+        data = _load_trade_calibration_from_redis()
+        if data is not None:
+            ok, reason = _validate_trade_calibration_payload(data)
+            if not ok:
+                trade_calibration = {}
+                log.info(f"[CALIBRATION] Ignoring Redis calibration from key {REDIS_TRADE_CALIBRATION_KEY}: {reason}")
+                return
+            trade_calibration = data
+            log.info(
+                f"[CALIBRATION] Loaded trade calibration from Redis key {REDIS_TRADE_CALIBRATION_KEY}: "
+                f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
+                f"{_count_calibration_trades(trade_calibration)} trades"
+            )
+            return
+
+        if not os.path.exists(TRADE_CALIBRATION_FILE):
+            trade_calibration = {}
+            return
+
+        with open(TRADE_CALIBRATION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError("trade calibration file content must be an object")
+
+        ok, reason = _validate_trade_calibration_payload(data)
+        if not ok:
+            trade_calibration = {}
+            log.info(f"[CALIBRATION] Ignoring file calibration from {TRADE_CALIBRATION_FILE}: {reason}")
+            return
+
+        trade_calibration = data
+        log.info(
+            f"[CALIBRATION] Loaded trade calibration from {TRADE_CALIBRATION_FILE}: "
+            f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
+            f"{_count_calibration_trades(trade_calibration)} trades"
+        )
+    except Exception as e:
+        trade_calibration = {}
+        log.warning(f"Trade calibration load failed for {TRADE_CALIBRATION_FILE}: {e}")
+
+
+def refresh_trade_calibration() -> bool:
+    global _trade_calibration_mtime
+    if REDIS_CLIENT is not None:
+        data = _load_trade_calibration_from_redis()
+        if data is not None:
+            ok, reason = _validate_trade_calibration_payload(data)
+            if not ok:
+                if trade_calibration:
+                    trade_calibration.clear()
+                log.info(f"[CALIBRATION] Ignoring Redis calibration from key {REDIS_TRADE_CALIBRATION_KEY}: {reason}")
+                return False
+            generated_at = data.get("generated_at")
+            if generated_at and generated_at != _trade_calibration_mtime:
+                _trade_calibration_mtime = generated_at
+                trade_calibration.clear()
+                trade_calibration.update(data)
+                log.info(
+                    f"[CALIBRATION] Loaded trade calibration from Redis key {REDIS_TRADE_CALIBRATION_KEY}: "
+                    f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
+                    f"{_count_calibration_trades(trade_calibration)} trades"
+                )
+                return True
+            if generated_at and not trade_calibration:
+                _trade_calibration_mtime = generated_at
+                trade_calibration.clear()
+                trade_calibration.update(data)
+                return True
+            return False
+
+    try:
+        mtime = os.path.getmtime(TRADE_CALIBRATION_FILE)
+        if mtime != _trade_calibration_mtime:
+            _trade_calibration_mtime = mtime
+            load_trade_calibration()
+            return True
+    except FileNotFoundError:
+        if trade_calibration:
+            trade_calibration.clear()
+            log.warning(f"Trade calibration file removed: {TRADE_CALIBRATION_FILE}")
+        _trade_calibration_mtime = 0.0
+    return False
+
+
+def _get_trade_calibration_stats(strategy: str, instrument: str, session_name: str | None = None) -> tuple[dict | None, str | None]:
+    by_pair = trade_calibration.get("by_strategy_pair", {})
+    pair_stats = None
+    if isinstance(by_pair, dict):
+        pair_stats = by_pair.get(strategy, {}).get(instrument)
+
+    if session_name:
+        by_session = trade_calibration.get("by_strategy_pair_session", {})
+        if isinstance(by_session, dict):
+            session_stats = by_session.get(strategy, {}).get(instrument, {}).get(session_name)
+            if isinstance(session_stats, dict) and int(session_stats.get("trades", 0) or 0) >= CALIBRATION_SESSION_MIN_TRADES:
+                return session_stats, "session"
+
+    if isinstance(pair_stats, dict) and int(pair_stats.get("trades", 0) or 0) >= CALIBRATION_PAIR_MIN_TRADES:
+        return pair_stats, "pair"
+    return None, None
+
+
+def get_trade_calibration_adjustment(strategy: str, instrument: str, session_name: str | None = None) -> dict:
+    stats, source = _get_trade_calibration_stats(strategy, instrument, session_name)
+    result = {
+        "threshold_offset": 0.0,
+        "risk_mult": 1.0,
+        "block_reason": None,
+        "source": source,
+    }
+    if not stats:
+        return result
+
+    trades = int(stats.get("trades", 0) or 0)
+    win_rate = float(stats.get("win_rate", 0.0) or 0.0)
+    profit_factor = float(stats.get("profit_factor", 0.0) or 0.0)
+    expectancy_pips = float(stats.get("expectancy_pips", 0.0) or 0.0)
+
+    if (
+        win_rate <= CALIBRATION_BLOCK_MAX_WIN_RATE
+        and profit_factor <= CALIBRATION_BLOCK_MAX_PROFIT_FACTOR
+        and expectancy_pips <= CALIBRATION_BLOCK_MAX_EXPECTANCY_PIPS
+    ):
+        result["block_reason"] = (
+            f"calibration block ({source}: WR {win_rate:.0%}, "
+            f"exp {expectancy_pips:+.1f}p, n={trades})"
+        )
+        return result
+
+    if expectancy_pips < 0 or profit_factor < 1.0:
+        threshold_offset = min(CALIBRATION_MAX_TIGHTEN, abs(min(expectancy_pips, 0.0)) / 1.5)
+        threshold_offset += min(3.0, max(0.0, (1.0 - profit_factor) * 4.0))
+        risk_mult = max(CALIBRATION_RISK_FLOOR, 1.0 - min(0.75, abs(min(expectancy_pips, 0.0)) / 20.0))
+        if win_rate < 0.40:
+            risk_mult = max(CALIBRATION_RISK_FLOOR, risk_mult - 0.10)
+        result["threshold_offset"] = round(threshold_offset, 1)
+        result["risk_mult"] = round(risk_mult, 3)
+        return result
+
+    if expectancy_pips > 3.0 and profit_factor > 1.2 and win_rate > 0.50:
+        result["threshold_offset"] = round(-min(CALIBRATION_MAX_RELAX, expectancy_pips / 10.0), 1)
+    return result
+
+
+def _strategy_threshold_value(strategy: str) -> float:
+    return {
+        "SCALPER": SCALPER_THRESHOLD,
+        "TREND": TREND_THRESHOLD,
+        "REVERSAL": REVERSAL_THRESHOLD,
+        "BREAKOUT": BREAKOUT_THRESHOLD,
+        "CARRY": CARRY_THRESHOLD,
+        "ASIAN_FADE": ASIAN_FADE_THRESHOLD,
+        "POST_NEWS": POST_NEWS_THRESHOLD,
+        "PULLBACK": PULLBACK_THRESHOLD,
+    }.get(strategy, 40)
+
 # ═══════════════════════════════════════════════════════════════
 #  MACRO INTELLIGENCE (now only reads from Redis)
 # ═══════════════════════════════════════════════════════════════
@@ -2396,6 +2635,7 @@ def _build_strategy_scoring_context() -> StrategyScoringContext:
         dxy_gate_threshold=DXY_GATE_THRESHOLD,
         vix_level=_vix_level,
         vix_low_threshold=VIX_LOW_THRESHOLD,
+        get_trade_calibration_adjustment=get_trade_calibration_adjustment,
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -2487,28 +2727,45 @@ def get_entry_block_reason(instrument: str, direction: str) -> str | None:
     return None
 
 
-def get_strategy_entry_block_reason(strategy: str, instrument: str, direction: str) -> str | None:
+def get_strategy_entry_block_reason(strategy: str, instrument: str, direction: str, opp: dict | None = None, session_name: str | None = None) -> str | None:
     block_reason = get_entry_block_reason(instrument, direction)
     if block_reason is not None:
         return block_reason
+    if session_name is None:
+        session_name = get_current_session()["name"]
+    calibration = get_trade_calibration_adjustment(strategy, instrument, session_name)
+    if calibration["block_reason"] is not None:
+        return calibration["block_reason"]
+    if opp is not None:
+        required_score = _strategy_threshold_value(strategy) + calibration["threshold_offset"]
+        actual_score = float(opp.get("score", 0.0) or 0.0)
+        if actual_score < required_score:
+            return f"calibration threshold {actual_score:.1f} < {required_score:.1f}"
     if is_pair_paused_by_news(instrument) and strategy != "CARRY":
         return "pre-news risk window"
     return None
 
 
-def get_entry_risk_multiplier(strategy: str, instrument: str) -> float:
-    if is_pair_paused_by_news(instrument):
-        return NEWS_WINDOW_RISK_MULT
-    return 1.0
+def get_entry_risk_multiplier(strategy: str, instrument: str, session_name: str | None = None) -> float:
+    if session_name is None:
+        session_name = get_current_session()["name"]
+    risk_mult = NEWS_WINDOW_RISK_MULT if is_pair_paused_by_news(instrument) else 1.0
+    calibration = get_trade_calibration_adjustment(strategy, instrument, session_name)
+    return round(max(CALIBRATION_RISK_FLOOR, risk_mult * calibration["risk_mult"]), 3)
 
 def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     instrument = opp["instrument"]
     direction  = opp["direction"]
     acct = get_account_summary()
+    session = get_current_session()
+    session_name = session["name"]
 
-    block_reason = get_strategy_entry_block_reason(label, instrument, direction)
+    block_reason = get_strategy_entry_block_reason(label, instrument, direction, opp=opp, session_name=session_name)
     if block_reason is not None:
+        log.info(f"[{label}] Skip {instrument} {direction} — {block_reason}")
         return None
+
+    calibration = get_trade_calibration_adjustment(label, instrument, session_name)
 
     kelly_gap = opp["score"] - {"SCALPER": SCALPER_THRESHOLD, "TREND": TREND_THRESHOLD,
                                  "REVERSAL": REVERSAL_THRESHOLD, "BREAKOUT": BREAKOUT_THRESHOLD,
@@ -2518,7 +2775,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
                   else KELLY_MULT_STANDARD if kelly_gap >= 25
                   else KELLY_MULT_SOLID if kelly_gap >= 10
                   else KELLY_MULT_MARGINAL)
-    risk_mult = get_entry_risk_multiplier(label, instrument)
+    risk_mult = get_entry_risk_multiplier(label, instrument, session_name)
     effective_kelly_mult = kelly_mult * risk_mult
 
     account_currency = acct.get("currency", get_account_currency())
@@ -2578,9 +2835,12 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         "atr":            opp.get("atr", 0),
         "atr_pct":        opp.get("atr_pct", 0),
         "spread_at_entry": opp.get("spread_pips", 0),
-        "session_at_entry": get_current_session()["name"],
+        "session_at_entry": session_name,
         "kelly_mult":     effective_kelly_mult,
         "news_risk_mult": risk_mult,
+        "calibration_source": calibration.get("source"),
+        "calibration_threshold_offset": calibration.get("threshold_offset", 0.0),
+        "calibration_risk_mult": calibration.get("risk_mult", 1.0),
         "partial_tp_hit": False,
         "unrealized_pnl": 0,
     }
@@ -2594,7 +2854,6 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     _pair_cooldowns[instrument] = time.time() + PAIR_COOLDOWN_SECS
     save_state()
 
-    session = get_current_session()
     account_currency = acct.get("currency", account_currency)
     nav_value = float(acct.get("NAV", balance) or balance or 0)
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
@@ -3023,10 +3282,13 @@ def run():
     log.info("🔄 Refreshing macro filter and news data on startup...")
     filter_reloaded = refresh_macro_filters()
     news_reloaded = refresh_macro_news()
+    calibration_reloaded = refresh_trade_calibration()
     if not filter_reloaded:
         load_macro_filters()
     if not news_reloaded:
         load_macro_news()
+    if not calibration_reloaded:
+        load_trade_calibration()
 
     log.info(f"🔎 Macro proxy configuration: DXY proxy will be read from Redis, VIX from Redis")
     log.info(f"📰 Macro news file: {MACRO_NEWS_FILE}")
@@ -3050,11 +3312,14 @@ def run():
             session = get_current_session()
             filters_updated = refresh_macro_filters()
             news_updated = refresh_macro_news()
+            calibration_updated = refresh_trade_calibration()
             if filters_updated or news_updated:
                 log.info(
                     f"🔄 Macro JSON refresh: filters={'reloaded' if filters_updated else 'unchanged'} "
                     f"news={'reloaded' if news_updated else 'unchanged'}"
                 )
+            if calibration_updated:
+                log.info("🔄 Trade calibration refresh: reloaded")
             update_macro_news_pause()
             # DXY and VIX are already loaded from Redis via load_macro_filters; no need to call proxies
 
@@ -3123,7 +3388,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_strategy_entry_block_reason("SCALPER", best_scalper["instrument"], best_scalper["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("SCALPER", best_scalper["instrument"], best_scalper["direction"], opp=best_scalper, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("SCALPER", best_scalper["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("SCALPER", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3139,7 +3404,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_strategy_entry_block_reason("TREND", best_trend["instrument"], best_trend["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("TREND", best_trend["instrument"], best_trend["direction"], opp=best_trend, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("TREND", best_trend["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("TREND", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3155,7 +3420,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_strategy_entry_block_reason("REVERSAL", best_reversal["instrument"], best_reversal["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("REVERSAL", best_reversal["instrument"], best_reversal["direction"], opp=best_reversal, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("REVERSAL", best_reversal["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("REVERSAL", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3171,7 +3436,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_strategy_entry_block_reason("BREAKOUT", best_breakout["instrument"], best_breakout["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("BREAKOUT", best_breakout["instrument"], best_breakout["direction"], opp=best_breakout, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("BREAKOUT", best_breakout["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("BREAKOUT", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3189,7 +3454,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_strategy_entry_block_reason("CARRY", best_carry["instrument"], best_carry["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("CARRY", best_carry["instrument"], best_carry["direction"], opp=best_carry, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("CARRY", best_carry["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("CARRY", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3206,7 +3471,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_strategy_entry_block_reason("ASIAN_FADE", best_asian["instrument"], best_asian["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("ASIAN_FADE", best_asian["instrument"], best_asian["direction"], opp=best_asian, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("ASIAN", best_asian["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("ASIAN", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3223,7 +3488,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_strategy_entry_block_reason("POST_NEWS", best_pn["instrument"], best_pn["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("POST_NEWS", best_pn["instrument"], best_pn["direction"], opp=best_pn, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("POST_NEWS", best_pn["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("POST_NEWS", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
@@ -3240,7 +3505,7 @@ def run():
                         if trade:
                             open_trades.append(trade)
                         else:
-                            reason = get_strategy_entry_block_reason("PULLBACK", best_pb["instrument"], best_pb["direction"]) or "entry blocked"
+                            reason = get_strategy_entry_block_reason("PULLBACK", best_pb["instrument"], best_pb["direction"], opp=best_pb, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("PULLBACK", best_pb["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("PULLBACK", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")

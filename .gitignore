@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+backtest_cache/
+backtest_macro/
+backtest_output/
+bot.log

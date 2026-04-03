@@ -1,6 +1,18 @@
 import os
 from typing import Any, Mapping
 
+try:
+    from dotenv import find_dotenv, load_dotenv
+except ImportError:
+    find_dotenv = None  # type: ignore[assignment]
+    load_dotenv = None  # type: ignore[assignment]
+
+
+if load_dotenv is not None and find_dotenv is not None:
+    dotenv_path = find_dotenv(usecwd=True)
+    if dotenv_path:
+        load_dotenv(dotenv_path, override=False)
+
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 

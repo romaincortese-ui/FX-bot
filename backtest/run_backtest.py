@@ -9,7 +9,7 @@ from backtest.data import HistoricalDataProvider
 from backtest.engine import BacktestEngine
 from backtest.macro_sim import generate_daily_macro_snapshots
 from backtest.macro_sim import MacroReplay
-from backtest.reporter import build_backtest_report, export_backtest_artifacts
+from backtest.reporter import build_backtest_report, build_trade_calibration, export_backtest_artifacts, publish_trade_calibration
 from fxbot.config import env_str
 
 
@@ -60,7 +60,13 @@ def main() -> None:
     engine = BacktestEngine(config, provider, macro_replay)
     equity_curve, trades = engine.run()
     report = build_backtest_report(equity_curve, trades)
+    calibration = build_trade_calibration(trades)
     export_backtest_artifacts(config.output_dir, equity_curve, trades, report)
+    publish_trade_calibration(
+        env_str("REDIS_URL", ""),
+        env_str("REDIS_TRADE_CALIBRATION_KEY", "trade_calibration"),
+        calibration,
+    )
     print(json.dumps(report, indent=2))
 
 
