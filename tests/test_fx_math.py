@@ -1,3 +1,5 @@
+import pytest
+
 from fxbot.fx_math import pip_size, pip_value_from_conversion, pips_to_price, price_to_pips
 
 
@@ -9,8 +11,8 @@ def test_pip_helpers_handle_jpy_pairs():
 
 def test_pip_helpers_handle_non_jpy_pairs():
     assert pip_size("EUR_USD") == 0.0001
-    assert price_to_pips("EUR_USD", 0.0012) == 12
-    assert pips_to_price("EUR_USD", 12) == 0.0012
+    assert price_to_pips("EUR_USD", 0.0012) == pytest.approx(12)
+    assert pips_to_price("EUR_USD", 12) == pytest.approx(0.0012)
 
 
 def test_pip_value_respects_spread_bet_mode():
