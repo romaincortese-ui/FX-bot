@@ -38,6 +38,32 @@ class TradeSimulator:
         offset = pips_to_price(instrument, (spread_pips / 2.0) + slippage_pips)
         return raw_price - offset if direction == "LONG" else raw_price + offset
 
+    def _copy_trade_diagnostics(self, trade: dict[str, Any], opp: dict[str, Any]) -> None:
+        diagnostic_keys = (
+            "selection_score",
+            "effective_threshold",
+            "score_margin",
+            "macro_bias",
+            "session_multiplier",
+            "session_aggression",
+            "session_is_overlap",
+            "spread_pips",
+            "calibration_threshold_offset",
+            "calibration_risk_mult",
+            "calibration_source",
+            "rsi_delta",
+            "vol_ratio",
+            "ema50_gap_4h",
+            "squeeze_bars",
+            "bb_percentile",
+            "momentum_5d",
+            "pullback_depth",
+            "crossed_now",
+        )
+        for key in diagnostic_keys:
+            if key in opp:
+                trade[key] = opp[key]
+
     def open_trade(self, opp: dict[str, Any], label: str, opened_at: datetime, close_price: float, units: float, spread_pips: float, news_active: bool, execution_bar: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if units <= 0 or not self.can_open_trade():
             return None
@@ -90,6 +116,7 @@ class TradeSimulator:
             "news_active_at_entry": news_active,
             "execution_mode": execution_mode,
         }
+        self._copy_trade_diagnostics(trade, opp)
         if label == "TREND" and opp.get("partial_tp_pips"):
             if direction == "LONG":
                 trade["partial_tp_price"] = entry_price + opp["partial_tp_pips"] * ps
@@ -105,6 +132,14 @@ class TradeSimulator:
             pnl_pips *= -1
         pnl_pips -= self.config.round_trip_cost_pips
         pnl = pnl_pips * abs(float(trade["units"])) * pip_size(trade["instrument"])
+        highest_price = float(trade.get("highest_price", trade["entry_price"]))
+        lowest_price = float(trade.get("lowest_price", trade["entry_price"]))
+        if direction == "LONG":
+            mfe_pips = max(0.0, price_to_pips(trade["instrument"], highest_price - trade["entry_price"]))
+            mae_pips = max(0.0, price_to_pips(trade["instrument"], trade["entry_price"] - lowest_price))
+        else:
+            mfe_pips = max(0.0, price_to_pips(trade["instrument"], trade["entry_price"] - lowest_price))
+            mae_pips = max(0.0, price_to_pips(trade["instrument"], highest_price - trade["entry_price"]))
         closed = dict(trade)
         closed.update({
             "exit_price": exit_price,
@@ -112,6 +147,8 @@ class TradeSimulator:
             "reason": reason,
             "pnl_pips": round(pnl_pips, 2),
             "pnl": round(pnl, 2),
+            "mfe_pips": round(mfe_pips, 2),
+            "mae_pips": round(mae_pips, 2),
             "held_minutes": round((exit_time.timestamp() - trade["opened_ts"]) / 60.0, 2),
         })
         self.balance += pnl
@@ -158,10 +195,8 @@ class TradeSimulator:
             ask_low = float(bar.get("ask_low", 0) or 0)
             ask_close = float(bar.get("ask_close", 0) or 0)
             has_bid_ask = bid_close > 0 and ask_close > 0
-            if trade["direction"] == "LONG":
-                trade["highest_price"] = max(float(trade.get("highest_price", trade["entry_price"])), high)
-            else:
-                trade["lowest_price"] = min(float(trade.get("lowest_price", trade["entry_price"])), low)
+            trade["highest_price"] = max(float(trade.get("highest_price", trade["entry_price"])), high)
+            trade["lowest_price"] = min(float(trade.get("lowest_price", trade["entry_price"])), low)
 
             if trade["label"] in {"TREND", "BREAKOUT"}:
                 self._apply_partial_take_profit(trade, bar, current_time, partial_tp_pct)

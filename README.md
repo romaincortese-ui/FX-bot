@@ -107,6 +107,7 @@ Useful environment variables:
 - `BACKTEST_START`, `BACKTEST_END`
 - `BACKTEST_INSTRUMENTS`
 - `BACKTEST_GRANULARITY`
+- `BACKTEST_STRATEGIES`
 - `BACKTEST_CACHE_DIR`
 - `BACKTEST_MACRO_STATE_DIR`
 - `BACKTEST_OUTPUT_DIR`
@@ -135,6 +136,8 @@ Artifacts are written to the configured output directory as:
 - `trade_journal.csv`
 - `summary.json`
 - `calibration.json`
+
+Backtest defaults now exclude `ASIAN_FADE` because recent calibration runs showed it was catastrophically unprofitable on `USD_JPY` Tokyo sessions. You can still include it explicitly with `BACKTEST_STRATEGIES` when diagnosing that strategy in isolation.
 
 `calibration.json` contains grouped backtest stats by strategy, strategy/pair, and strategy/pair/session.
 The live bot can read that file through `TRADE_CALIBRATION_FILE` or, when `REDIS_URL` is configured, from `REDIS_TRADE_CALIBRATION_KEY` on the same Redis used by the macro engine.

@@ -55,7 +55,6 @@ class BacktestConfig:
         "REVERSAL",
         "BREAKOUT",
         "CARRY",
-        "ASIAN_FADE",
         "POST_NEWS",
         "PULLBACK",
     ])
@@ -65,7 +64,7 @@ class BacktestConfig:
         start = _parse_utc_datetime(env_str("BACKTEST_START", "2023-01-01T00:00:00+00:00"))
         end = _parse_utc_datetime(env_str("BACKTEST_END", "2023-03-01T00:00:00+00:00"))
         instruments = _parse_csv(env_str("BACKTEST_INSTRUMENTS", "EUR_USD,GBP_USD,USD_JPY"))
-        strategies = _parse_csv(env_str("BACKTEST_STRATEGIES", "SCALPER,TREND,REVERSAL,BREAKOUT,CARRY,ASIAN_FADE,POST_NEWS,PULLBACK"))
+        strategies = _parse_csv(env_str("BACKTEST_STRATEGIES", "SCALPER,TREND,REVERSAL,BREAKOUT,CARRY,POST_NEWS,PULLBACK"))
         return cls(
             start=start,
             end=end,

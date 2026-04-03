@@ -100,6 +100,26 @@ def _apply_calibration(strategy: str, instrument: str, session: Mapping[str, Any
     return selection_score, adjusted_threshold, adjustment
 
 
+def _finalize_opportunity(
+    result: dict[str, Any],
+    *,
+    session: Mapping[str, Any],
+    bias: str,
+    eff_threshold: float,
+    selection_score: float,
+) -> dict[str, Any]:
+    result.update({
+        "macro_bias": str(bias),
+        "effective_threshold": round(float(eff_threshold), 2),
+        "score_margin": round(float(selection_score) - float(eff_threshold), 2),
+        "session_name": str(session.get("name") or "UNKNOWN"),
+        "session_multiplier": float(session.get("multiplier") or 1.0),
+        "session_aggression": str(session.get("aggression") or "UNKNOWN"),
+        "session_is_overlap": bool(session.get("is_overlap", False)),
+    })
+    return result
+
+
 def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
     if _reject_if_news_paused("SCALPER", instrument, ctx):
         return None
@@ -175,7 +195,7 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.5:
         tp_pips = sl_pips * 1.5
-    return {
+    return _finalize_opportunity({
         "instrument": instrument,
         "score": round(score, 2),
         "selection_score": round(selection_score, 2),
@@ -197,7 +217,7 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
         "crossed_now": crossed_now or crossed_down_now,
         "entry_signal": "CROSSOVER" if crossed else ("VOL_SPIKE" if vol_ratio > 2 else "TREND"),
         "macd": macd,
-    }
+    }, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -270,7 +290,7 @@ def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
     sl_pips = max(8, price_to_pips(instrument, atr * settings["TREND_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     partial_tp_pips = max(10, price_to_pips(instrument, atr * settings["TREND_PARTIAL_TP_ATR"]))
-    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "partial_tp_pips": round(partial_tp_pips, 1), "trail_pips": settings["TREND_TRAIL_PIPS"], "entry_signal": "TREND_ALIGNED", "ema50_gap_4h": round(ema50_gap_4h * 100, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "partial_tp_pips": round(partial_tp_pips, 1), "trail_pips": settings["TREND_TRAIL_PIPS"], "entry_signal": "TREND_ALIGNED", "ema50_gap_4h": round(ema50_gap_4h * 100, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -333,7 +353,7 @@ def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     tp_pips = max(8, price_to_pips(instrument, atr * settings["REVERSAL_TP_ATR_MULT"]))
     sl_pips = max(5, price_to_pips(instrument, atr * settings["REVERSAL_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
-    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["REVERSAL_TRAIL_PIPS"], "entry_signal": "OVERSOLD_BOUNCE" if is_oversold else "OVERBOUGHT_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["REVERSAL_TRAIL_PIPS"], "entry_signal": "OVERSOLD_BOUNCE" if is_oversold else "OVERBOUGHT_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -386,7 +406,7 @@ def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     tp_pips = max(15, price_to_pips(instrument, atr * settings["BREAKOUT_TP_ATR_MULT"]))
     sl_pips = max(5, price_to_pips(instrument, atr * settings["BREAKOUT_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
-    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "squeeze_bars": squeeze["squeeze_bars"], "bb_percentile": round(squeeze["bb_percentile"], 1), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["BREAKOUT_TRAIL_PIPS"], "entry_signal": "BB_KC_SQUEEZE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "squeeze_bars": squeeze["squeeze_bars"], "bb_percentile": round(squeeze["bb_percentile"], 1), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["BREAKOUT_TRAIL_PIPS"], "entry_signal": "BB_KC_SQUEEZE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -448,7 +468,7 @@ def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
     tp_pips = max(15, price_to_pips(instrument, atr * settings["CARRY_TP_ATR_MULT"]))
     sl_pips = max(10, price_to_pips(instrument, atr * settings["CARRY_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, "LONG", "LONG_ONLY", ctx.vix_level)
-    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": "LONG", "rsi": round(rsi_4h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["CARRY_TRAIL_PIPS"], "entry_signal": "CARRY_YIELD", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "momentum_5d": round(momentum_5d, 4), "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": "LONG", "rsi": round(rsi_4h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["CARRY_TRAIL_PIPS"], "entry_signal": "CARRY_YIELD", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "momentum_5d": round(momentum_5d, 4), "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -516,7 +536,7 @@ def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyS
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.2:
         tp_pips = sl_pips * 1.2
-    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["ASIAN_FADE_TRAIL_PIPS"], "entry_signal": "ASIAN_RANGE_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["ASIAN_FADE_TRAIL_PIPS"], "entry_signal": "ASIAN_RANGE_FADE", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -578,7 +598,7 @@ def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategySc
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.5:
         tp_pips = sl_pips * 1.5
-    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["POST_NEWS_TRAIL_PIPS"], "entry_signal": "POST_NEWS_BREAKOUT", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["POST_NEWS_TRAIL_PIPS"], "entry_signal": "POST_NEWS_BREAKOUT", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
@@ -664,4 +684,4 @@ def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.5:
         tp_pips = sl_pips * 1.5
-    return {"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["PULLBACK_TRAIL_PIPS"], "entry_signal": "PULLBACK_REENTRY", "pullback_depth": round(pullback_depth, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["PULLBACK_TRAIL_PIPS"], "entry_signal": "PULLBACK_REENTRY", "pullback_depth": round(pullback_depth, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
