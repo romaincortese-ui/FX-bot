@@ -6,3 +6,4 @@ backtest_cache/
 backtest_macro/
 backtest_output/
 bot.log
+state.json

@@ -17,6 +17,7 @@ import collections
 import re
 import math
 import asyncio
+import socket
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
 import pandas as pd
@@ -48,6 +49,7 @@ from fxbot.pair_health import (
     pair_health_block_seconds,
 )
 from fxbot.risk import would_breach_correlation_limit
+from fxbot.runtime_status import build_runtime_status, publish_runtime_status
 from fxbot.strategies import StrategyScoringContext
 from fxbot.strategies import determine_direction as core_determine_direction
 from fxbot.strategies import score_asian_fade as core_score_asian_fade
@@ -302,6 +304,10 @@ MACRO_NEWS_FILE     = os.getenv("MACRO_NEWS_FILE", "macro_news.json")
 REDIS_URL           = os.getenv("REDIS_URL", "")
 REDIS_MACRO_STATE_KEY = os.getenv("REDIS_MACRO_STATE_KEY", "macro_state")
 REDIS_TRADE_CALIBRATION_KEY = os.getenv("REDIS_TRADE_CALIBRATION_KEY", "trade_calibration")
+REDIS_BOT_STATUS_KEY = os.getenv("REDIS_BOT_STATUS_KEY", "bot_runtime_status")
+BOT_STATUS_INTERVAL = int(os.getenv("BOT_STATUS_INTERVAL", "60"))
+BOT_STATUS_TTL = int(os.getenv("BOT_STATUS_TTL", "180"))
+IDLE_LOG_INTERVAL = int(os.getenv("IDLE_LOG_INTERVAL", "1800"))
 CALIBRATION_MAX_AGE_HOURS = float(os.getenv("CALIBRATION_MAX_AGE_HOURS", "72"))
 CALIBRATION_MIN_TOTAL_TRADES = int(os.getenv("CALIBRATION_MIN_TOTAL_TRADES", "50"))
 HTTP_RETRIES        = 3
@@ -342,6 +348,8 @@ if REDIS_URL:
 trade_history      = []
 open_trades        = []
 last_heartbeat_at  = 0
+last_runtime_status_at = 0
+last_idle_log_at = 0
 last_daily_summary = ""
 last_weekly_summary = ""
 
@@ -396,6 +404,70 @@ CORRELATION_GROUPS = {
 # ── Streaming thread control ───────────────────────────────────
 _stream_thread = None
 _stop_stream_event = threading.Event()
+
+
+def telegram_enabled() -> bool:
+    return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def publish_bot_runtime_status(state: str, balance: float | None = None, error: str | None = None, force: bool = False) -> bool:
+    global last_runtime_status_at
+    if REDIS_CLIENT is None:
+        return False
+    now = time.time()
+    if not force and now - last_runtime_status_at < BOT_STATUS_INTERVAL:
+        return False
+
+    session_name = "UNKNOWN"
+    try:
+        session_name = get_current_session().get("name", "UNKNOWN")
+    except Exception:
+        session_name = "UNKNOWN"
+
+    payload = build_runtime_status(
+        service="bot",
+        state=state,
+        hostname=socket.gethostname(),
+        pid=os.getpid(),
+        paper_trade=PAPER_TRADE,
+        paused=_paused,
+        session=session_name,
+        watchlist_size=len(DYNAMIC_PAIRS),
+        open_trades=len(open_trades),
+        balance=round(float(balance), 2) if balance is not None else None,
+        telegram_enabled=telegram_enabled(),
+        macro_state_key=REDIS_MACRO_STATE_KEY,
+        calibration_key=REDIS_TRADE_CALIBRATION_KEY,
+        last_scan_cycle_at=_last_scan_cycle_at or None,
+        scan_pool_mode=_last_scan_pool_status.get("mode", "primary"),
+        market_regime_mult=round(float(_market_regime_mult), 4),
+        error=error,
+    )
+    published = publish_runtime_status(REDIS_CLIENT, REDIS_BOT_STATUS_KEY, payload, BOT_STATUS_TTL)
+    if published:
+        last_runtime_status_at = now
+    return published
+
+
+def sleep_with_command_poll(total_seconds: int, poll_interval: int = 5) -> None:
+    deadline = time.time() + max(0, total_seconds)
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        poll_telegram_commands()
+        time.sleep(min(poll_interval, max(0.0, remaining)))
+
+
+def log_idle_state(reason: str, balance: float | None = None, sleep_seconds: int | None = None, force: bool = False) -> None:
+    global last_idle_log_at
+    now = time.time()
+    if not force and now - last_idle_log_at < IDLE_LOG_INTERVAL:
+        return
+    suffix = f" | next check {sleep_seconds}s" if sleep_seconds is not None else ""
+    balance_text = f" | balance {balance:,.2f}" if balance is not None else ""
+    log.info(f"⏸️ Bot idle: {reason}{balance_text}{suffix}")
+    last_idle_log_at = now
 
 # ═══════════════════════════════════════════════════════════════
 #  UTILITIES
@@ -1669,7 +1741,7 @@ def keltner_squeeze(df: pd.DataFrame, bb_period: int = 20, kc_period: int = 20,
 # ═══════════════════════════════════════════════════════════════
 
 def telegram(msg: str, parse_mode: str = "HTML"):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not telegram_enabled():
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(2):
@@ -1790,7 +1862,7 @@ _last_telegram_update = 0
 
 def poll_telegram_commands():
     global _last_telegram_update, _paused
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not telegram_enabled():
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -3148,6 +3220,7 @@ def send_heartbeat(balance: float):
     if time.time() - last_heartbeat_at < HEARTBEAT_INTERVAL:
         return
     last_heartbeat_at = time.time()
+    publish_bot_runtime_status("running", balance=balance, force=True)
     session = get_current_session()
     paused_pairs = get_paused_pairs_by_news(session["pairs_allowed"])
     paused_summary = ", ".join(paused_pairs[:4]) if paused_pairs else "none"
@@ -3204,7 +3277,7 @@ def send_daily_summary(balance: float):
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════════════
 
-def run():
+def _bootstrap_runtime() -> None:
     global open_trades, _market_regime_mult, _consecutive_losses
     global _session_loss_paused_until, _streak_paused_at, DYNAMIC_PAIRS
 
@@ -3237,6 +3310,9 @@ def run():
     acct = get_account_summary()
     balance = acct.get("balance", 0)
     log.info(f"✅ OANDA account access verified: {acct.get('currency', 'GBP')} balance {balance:,.2f}")
+    if not telegram_enabled():
+        log.warning("Telegram notifications disabled: set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID for /status and heartbeat messages.")
+    publish_bot_runtime_status("starting", balance=balance, force=True)
     telegram(
         f"🚀 <b>FX Bot Started</b>\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -3292,19 +3368,41 @@ def run():
 
     log.info(f"🔎 Macro proxy configuration: DXY proxy will be read from Redis, VIX from Redis")
     log.info(f"📰 Macro news file: {MACRO_NEWS_FILE}")
+    publish_bot_runtime_status("running", balance=balance, force=True)
+
+
+def run():
+    while True:
+        try:
+            _bootstrap_runtime()
+            break
+        except KeyboardInterrupt:
+            log.info("🛑 Stopped during startup.")
+            publish_bot_runtime_status("stopped", error="stopped during startup", force=True)
+            save_state()
+            telegram("🛑 <b>Bot stopped.</b> Check Railway.")
+            return
+        except Exception as e:
+            log.error(f"Fatal startup error: {e}", exc_info=True)
+            publish_bot_runtime_status("startup_error", error=str(e)[:200], force=True)
+            telegram(f"⚠️ <b>Bot startup error:</b> {str(e)[:200]}\nRetrying in 30s.")
+            time.sleep(30)
 
     while True:
         try:
-            if is_weekend():
-                log.debug("📅 Weekend — market closed. Sleeping 5min.")
-                time.sleep(300)
-                continue
-
             poll_telegram_commands()
+
+            if is_weekend():
+                publish_bot_runtime_status("idle_weekend", force=True)
+                log_idle_state("weekend market closed", sleep_seconds=300)
+                sleep_with_command_poll(300)
+                continue
 
             acct = get_account_summary()
             balance = acct.get("balance", 0)
+            publish_bot_runtime_status("running", balance=balance)
             if balance <= 0:
+                log_idle_state("zero balance", balance=balance, sleep_seconds=60)
                 log.warning("⚠️ Zero balance — sleeping 60s")
                 time.sleep(60)
                 continue
@@ -3543,11 +3641,13 @@ def run():
 
         except KeyboardInterrupt:
             log.info("🛑 Stopped.")
+            publish_bot_runtime_status("stopped", error="stopped by operator", force=True)
             save_state()
             telegram("🛑 <b>Bot stopped.</b> Check Railway.")
             break
         except Exception as e:
             log.error(f"Error: {e}", exc_info=True)
+            publish_bot_runtime_status("runtime_error", error=str(e)[:200], force=True)
             telegram(f"⚠️ <b>Bot error:</b> {str(e)[:200]}\nRetrying in 30s.")
             time.sleep(30)
 

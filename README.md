@@ -111,6 +111,9 @@ Useful environment variables:
 
 - `OANDA_API_KEY`, `OANDA_API_URL`
 - `REDIS_URL`, `REDIS_MACRO_STATE_KEY`, `REDIS_TRADE_CALIBRATION_KEY`
+- `REDIS_BOT_STATUS_KEY`, `REDIS_MACRO_STATUS_KEY`, `REDIS_CALIBRATION_STATUS_KEY`
+- `BOT_STATUS_INTERVAL`, `BOT_STATUS_TTL`, `IDLE_LOG_INTERVAL`
+- `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`
 - `CALIBRATION_MAX_AGE_HOURS`, `CALIBRATION_MIN_TOTAL_TRADES`
 - `BACKTEST_START`, `BACKTEST_END`
 - `BACKTEST_ROLLING_DAYS`, `BACKTEST_ROLLING_END_OFFSET_DAYS`
@@ -179,8 +182,9 @@ git push -u origin main
 Recommended layout:
 
 1. Create one Railway service for the trading bot.
-2. Create a second Railway service or scheduled job for `macro_engine.py`.
-3. Use the same repository for both services.
+2. Create a second Railway service or scheduled job for `run_macro_engine.py`.
+3. Create a third scheduled job for `run_daily_calibration.py` if you want Redis calibration refreshed automatically.
+4. Use the same repository for all processes.
 
 Bot service:
 
@@ -193,6 +197,8 @@ python main.py
 
 3. Add all required environment variables in Railway.
 4. Mount Redis if you want macro state shared through `REDIS_URL`.
+5. Set `TELEGRAM_TOKEN` and `TELEGRAM_CHAT_ID` on the bot service if you expect `/status`, `/metrics`, startup alerts, and heartbeat messages to work.
+6. Monitor `REDIS_BOT_STATUS_KEY` to verify the live worker is actually running even when Telegram is unavailable.
 
 Macro service:
 
@@ -200,10 +206,35 @@ Macro service:
 2. Set the start command to:
 
 ```text
-python macro_engine.py
+python run_macro_engine.py
 ```
 
 3. If you want it to run once per day, use a scheduled job or a separate worker process pattern.
+4. Monitor `REDIS_MACRO_STATUS_KEY` to confirm the macro process is running, sleeping, or failing.
+
+Calibration job:
+
+1. Reuse the same repository.
+2. Set the command to:
+
+```text
+python run_daily_calibration.py
+```
+
+3. Run it on a schedule and point it at the same `REDIS_URL` and `REDIS_TRADE_CALIBRATION_KEY` as the live bot.
+4. Monitor `REDIS_CALIBRATION_STATUS_KEY` for the last completed rolling window and trade count.
+
+Recommended Redis observability layout:
+
+- `macro_state`: latest macro filters and news consumed by the live bot.
+- `trade_calibration`: latest grouped calibration payload from the rolling backtest job.
+- `bot_runtime_status`: short-TTL liveness record for the live bot worker.
+- `macro_runtime_status`: long-TTL status for the macro process, including sleeping/idle states.
+- `calibration_runtime_status`: long-TTL status for the last rolling calibration job.
+
+If `trade_calibration` updates but `bot_runtime_status` is missing or stale, the scheduler is working but the live bot service is not.
+If `macro_runtime_status` is healthy but `macro_state` is stale, the macro runner is alive but failing to generate fresh state.
+During the FX weekend, the bot stays up but enters an idle loop. It now refreshes `bot_runtime_status` and writes periodic INFO logs while the market is closed so Railway does not look silent.
 
 ## Docker option
 
