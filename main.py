@@ -3372,6 +3372,8 @@ def _bootstrap_runtime() -> None:
 
 
 def run():
+    global _market_regime_mult, _consecutive_losses, _session_loss_paused_until, _streak_paused_at
+
     while True:
         try:
             _bootstrap_runtime()
