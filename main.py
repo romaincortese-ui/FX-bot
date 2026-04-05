@@ -352,6 +352,7 @@ last_runtime_status_at = 0
 last_idle_log_at = 0
 last_daily_summary = ""
 last_weekly_summary = ""
+_weekend_mode_active = False
 
 _paused              = False
 _adaptive_offsets     = {"SCALPER": 0.0, "TREND": 0.0, "REVERSAL": 0.0, "BREAKOUT": 0.0,
@@ -1138,6 +1139,20 @@ def is_weekend() -> bool:
     if now.weekday() == 6 and now.hour < 21:
         return True
     return False
+
+
+def next_market_reopen_utc(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    days_until_sunday = (6 - current.weekday()) % 7
+    reopen_at = (current + timedelta(days=days_until_sunday)).replace(
+        hour=21,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if reopen_at <= current:
+        reopen_at += timedelta(days=7)
+    return reopen_at
 
 # ═══════════════════════════════════════════════════════════════
 #  OANDA API
@@ -2130,6 +2145,7 @@ def save_state():
             "trade_history":         trade_history[-500:],
             "consecutive_losses":    _consecutive_losses,
             "streak_paused_at":      _streak_paused_at,
+            "weekend_mode_active":   _weekend_mode_active,
             "paused":                _paused,
             "adaptive_offsets":      _adaptive_offsets,
             "last_rebalance_count":  _last_rebalance_count,
@@ -2146,7 +2162,7 @@ def save_state():
         log.warning(f"State save failed: {e}")
 
 def load_state():
-    global open_trades, trade_history, _consecutive_losses, _streak_paused_at
+    global open_trades, trade_history, _consecutive_losses, _streak_paused_at, _weekend_mode_active
     global _paused, _adaptive_offsets, _last_rebalance_count, _pair_cooldowns, _pair_health, _pending_close_retries
     try:
         if not os.path.exists(STATE_FILE):
@@ -2160,6 +2176,7 @@ def load_state():
         trade_history       = d.get("trade_history", [])
         _consecutive_losses = d.get("consecutive_losses", 0)
         _streak_paused_at   = d.get("streak_paused_at", 0.0)
+        _weekend_mode_active = d.get("weekend_mode_active", False)
         _paused             = d.get("paused", False)
         _adaptive_offsets   = d.get("adaptive_offsets",
                                     {"SCALPER": 0.0, "TREND": 0.0, "REVERSAL": 0.0, "BREAKOUT": 0.0,
@@ -3372,7 +3389,7 @@ def _bootstrap_runtime() -> None:
 
 
 def run():
-    global _market_regime_mult, _consecutive_losses, _session_loss_paused_until, _streak_paused_at
+    global _market_regime_mult, _consecutive_losses, _session_loss_paused_until, _streak_paused_at, _weekend_mode_active
 
     while True:
         try:
@@ -3395,6 +3412,16 @@ def run():
             poll_telegram_commands()
 
             if is_weekend():
+                if not _weekend_mode_active:
+                    _weekend_mode_active = True
+                    reopen_at = next_market_reopen_utc()
+                    telegram(
+                        f"🌙 <b>Weekend market close</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"The weekend starts for FX markets now. No new trades will be entered until {reopen_at.strftime('%a %Y-%m-%d %H:%M UTC')}.\n"
+                        f"Open trades will continue to be monitored."
+                    )
+                    save_state()
                 acct = get_account_summary()
                 balance = acct.get("balance", 0)
                 send_heartbeat(balance, status="idle_weekend")
@@ -3412,6 +3439,15 @@ def run():
                 continue
 
             session = get_current_session()
+            if _weekend_mode_active:
+                _weekend_mode_active = False
+                telegram(
+                    f"▶️ <b>Markets reopened</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"Forex markets are open again. The bot can resume scanning for entries.\n"
+                    f"Current session: {session['name']} ({session['aggression']})"
+                )
+                save_state()
             filters_updated = refresh_macro_filters()
             news_updated = refresh_macro_news()
             calibration_updated = refresh_trade_calibration()
