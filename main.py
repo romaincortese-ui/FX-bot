@@ -353,6 +353,7 @@ last_idle_log_at = 0
 last_daily_summary = ""
 last_weekly_summary = ""
 _weekend_mode_active = False
+_entry_pause_reason = ""
 
 _paused              = False
 _adaptive_offsets     = {"SCALPER": 0.0, "TREND": 0.0, "REVERSAL": 0.0, "BREAKOUT": 0.0,
@@ -1154,6 +1155,114 @@ def next_market_reopen_utc(now: datetime | None = None) -> datetime:
         reopen_at += timedelta(days=7)
     return reopen_at
 
+
+def format_time_utc_and_local(dt: datetime) -> str:
+    utc_dt = dt.astimezone(timezone.utc)
+    local_dt = dt.astimezone()
+    local_tz = local_dt.tzname() or "LOCAL"
+    return (
+        f"{utc_dt.strftime('%a %Y-%m-%d %H:%M UTC')}"
+        f" / {local_dt.strftime('%a %Y-%m-%d %H:%M')} {local_tz}"
+    )
+
+
+def _categorize_entry_block_reason(reason: str) -> str:
+    normalized = _normalize_broker_reason(reason)
+    if not normalized:
+        return "unknown"
+    if _is_market_halted_reason(normalized):
+        return "broker_closed"
+    if "spread" in normalized:
+        return "spread_wide"
+    if any(term in normalized for term in ("missing bid/ask", "invalid price", "no candles", "no valid candle rows", "short candle history")):
+        return "pricing_unavailable"
+    if any(term in normalized for term in ("invalid instrument", "pricing request failed", "rejected instrument", "tradeable", "tradable", "close only")):
+        return "broker_unavailable"
+    return "other"
+
+
+def _sample_entry_blockers(pairs: list[str], limit: int = 3) -> str:
+    samples = []
+    for instrument in pairs:
+        reason = get_pair_health_reason(instrument)
+        if not reason:
+            continue
+        samples.append(f"{instrument}: {reason[:80]}")
+        if len(samples) >= limit:
+            break
+    return "; ".join(samples) if samples else "No broker detail available yet."
+
+
+def _build_entry_pause_notice(session: dict, active_pairs: list[str], empty_reason: str) -> tuple[str, str, str]:
+    pairs = list(active_pairs) or list(session.get("pairs_allowed", [])) or list(STATIC_ALL_PAIRS)
+    categorized = [
+        _categorize_entry_block_reason(get_pair_health_reason(instrument))
+        for instrument in pairs
+        if get_pair_health_reason(instrument)
+    ]
+    blocker_examples = _sample_entry_blockers(pairs)
+    session_text = f"Session: {session['name']} ({session['aggression']})"
+
+    if any(cat == "broker_closed" for cat in categorized):
+        return (
+            "broker_closed",
+            "⏸️ <b>Entries paused on OANDA</b>",
+            f"OANDA appears to have FX entries closed or in close-only mode right now. This can happen during bank holidays, market closures, or broker halts.\n"
+            f"{session_text}\n"
+            f"Examples: {blocker_examples}",
+        )
+
+    if any(cat == "pricing_unavailable" for cat in categorized):
+        return (
+            "pricing_unavailable",
+            "⏸️ <b>Entries paused on OANDA</b>",
+            f"The broker is not providing enough live pricing or candle data for safe entries across the scan universe. This can happen during bank holidays, market closures, or temporary OANDA issues.\n"
+            f"{session_text}\n"
+            f"Examples: {blocker_examples}",
+        )
+
+    if any(cat == "spread_wide" for cat in categorized):
+        return (
+            "spread_wide",
+            "⏸️ <b>Entries paused on OANDA</b>",
+            f"Prices are live, but spreads are still too wide for safe entries. This often happens around reopen, low-liquidity periods, or holiday-thinned trading.\n"
+            f"{session_text}\n"
+            f"Examples: {blocker_examples}",
+        )
+
+    return (
+        "pairs_blocked",
+        "⏸️ <b>Entries paused on OANDA</b>",
+        f"No tradable pairs are currently available on OANDA. This can happen during bank holidays, market closures, or temporary broker issues.\n"
+        f"{session_text}\n"
+        f"Scan status: {empty_reason}\n"
+        f"Examples: {blocker_examples}",
+    )
+
+
+def notify_entry_pause(reason: str, title: str, body: str) -> None:
+    global _entry_pause_reason
+    if _entry_pause_reason == reason:
+        return
+    _entry_pause_reason = reason
+    telegram(f"{title}\n━━━━━━━━━━━━━━━\n{body}")
+    save_state()
+
+
+def notify_entry_resume(session: dict, tradable_pairs: list[str]) -> None:
+    global _entry_pause_reason
+    if not _entry_pause_reason:
+        return
+    _entry_pause_reason = ""
+    telegram(
+        f"✅ <b>Entries available again</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"OANDA trading conditions have normalized enough for new entries again.\n"
+        f"Session: {session['name']} ({session['aggression']})\n"
+        f"Tradable pairs: {_format_pair_list(tradable_pairs)}"
+    )
+    save_state()
+
 # ═══════════════════════════════════════════════════════════════
 #  OANDA API
 # ═══════════════════════════════════════════════════════════════
@@ -1633,10 +1742,12 @@ def place_order(instrument: str, units: float, direction: str,
             log.error(f"[{label}] Order failed: {reject_message}")
         mark_pair_failure(instrument, reject_message[:200], "order", severity="hard" if hard_failure else "soft")
         if halted_market:
-            telegram(
-                f"⏸️ <b>{label} Entry Paused</b>\n"
-                f"{instrument} {direction}\n"
-                f"Market halted at broker. Pair temporarily blocked."
+            notify_entry_pause(
+                "broker_closed",
+                "⏸️ <b>Entries paused on OANDA</b>",
+                f"OANDA rejected a live order because the market is closed or in close-only mode. This can happen during bank holidays, weekend maintenance, or broker halts.\n"
+                f"Latest pair: {instrument} {direction}\n"
+                f"Reason: {reject_message[:160]}"
             )
         else:
             telegram(f"⚠️ <b>{label} Order Failed</b>\n{instrument} {direction}\n{reject_message[:200]}")
@@ -2145,6 +2256,7 @@ def save_state():
             "trade_history":         trade_history[-500:],
             "consecutive_losses":    _consecutive_losses,
             "streak_paused_at":      _streak_paused_at,
+            "entry_pause_reason":    _entry_pause_reason,
             "weekend_mode_active":   _weekend_mode_active,
             "paused":                _paused,
             "adaptive_offsets":      _adaptive_offsets,
@@ -2162,7 +2274,7 @@ def save_state():
         log.warning(f"State save failed: {e}")
 
 def load_state():
-    global open_trades, trade_history, _consecutive_losses, _streak_paused_at, _weekend_mode_active
+    global open_trades, trade_history, _consecutive_losses, _streak_paused_at, _weekend_mode_active, _entry_pause_reason
     global _paused, _adaptive_offsets, _last_rebalance_count, _pair_cooldowns, _pair_health, _pending_close_retries
     try:
         if not os.path.exists(STATE_FILE):
@@ -2176,7 +2288,8 @@ def load_state():
         trade_history       = d.get("trade_history", [])
         _consecutive_losses = d.get("consecutive_losses", 0)
         _streak_paused_at   = d.get("streak_paused_at", 0.0)
-        _weekend_mode_active = d.get("weekend_mode_active", False)
+        _entry_pause_reason = d.get("entry_pause_reason", "weekend" if d.get("weekend_mode_active", False) else "")
+        _weekend_mode_active = d.get("weekend_mode_active", _entry_pause_reason == "weekend")
         _paused             = d.get("paused", False)
         _adaptive_offsets   = d.get("adaptive_offsets",
                                     {"SCALPER": 0.0, "TREND": 0.0, "REVERSAL": 0.0, "BREAKOUT": 0.0,
@@ -3389,7 +3502,7 @@ def _bootstrap_runtime() -> None:
 
 
 def run():
-    global _market_regime_mult, _consecutive_losses, _session_loss_paused_until, _streak_paused_at, _weekend_mode_active
+    global _market_regime_mult, _consecutive_losses, _session_loss_paused_until, _streak_paused_at, _weekend_mode_active, _entry_pause_reason
 
     while True:
         try:
@@ -3415,13 +3528,12 @@ def run():
                 if not _weekend_mode_active:
                     _weekend_mode_active = True
                     reopen_at = next_market_reopen_utc()
-                    telegram(
-                        f"🌙 <b>Weekend market close</b>\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"The weekend starts for FX markets now. No new trades will be entered until {reopen_at.strftime('%a %Y-%m-%d %H:%M UTC')}.\n"
+                    notify_entry_pause(
+                        "weekend",
+                        "🌙 <b>Weekend market close</b>",
+                        f"The weekend starts for FX markets now. No new trades will be entered until {format_time_utc_and_local(reopen_at)}.\n"
                         f"Open trades will continue to be monitored."
                     )
-                    save_state()
                 acct = get_account_summary()
                 balance = acct.get("balance", 0)
                 send_heartbeat(balance, status="idle_weekend")
@@ -3441,13 +3553,6 @@ def run():
             session = get_current_session()
             if _weekend_mode_active:
                 _weekend_mode_active = False
-                telegram(
-                    f"▶️ <b>Markets reopened</b>\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"Forex markets are open again. The bot can resume scanning for entries.\n"
-                    f"Current session: {session['name']} ({session['aggression']})"
-                )
-                save_state()
             filters_updated = refresh_macro_filters()
             news_updated = refresh_macro_news()
             calibration_updated = refresh_trade_calibration()
@@ -3508,6 +3613,12 @@ def run():
                 skip_scalper = is_rollover_window()
                 active_pairs, health_pairs, tradable_pairs, empty_reason = get_effective_scan_pairs(session)
                 set_scan_cycle_summary(active_pairs, health_pairs, tradable_pairs)
+
+                if tradable_pairs:
+                    notify_entry_resume(session, tradable_pairs)
+                else:
+                    pause_reason, pause_title, pause_body = _build_entry_pause_notice(session, active_pairs, empty_reason)
+                    notify_entry_pause(pause_reason, pause_title, pause_body)
 
                 scalper_count  = sum(1 for t in open_trades if t["label"] == "SCALPER")
                 trend_count    = sum(1 for t in open_trades if t["label"] == "TREND")
