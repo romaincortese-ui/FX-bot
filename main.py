@@ -3215,12 +3215,12 @@ def update_adaptive_thresholds():
 #  HEARTBEAT & SUMMARIES
 # ═══════════════════════════════════════════════════════════════
 
-def send_heartbeat(balance: float):
+def send_heartbeat(balance: float, status: str = "running"):
     global last_heartbeat_at
     if time.time() - last_heartbeat_at < HEARTBEAT_INTERVAL:
         return
     last_heartbeat_at = time.time()
-    publish_bot_runtime_status("running", balance=balance, force=True)
+    publish_bot_runtime_status(status, balance=balance, force=True)
     session = get_current_session()
     paused_pairs = get_paused_pairs_by_news(session["pairs_allowed"])
     paused_summary = ", ".join(paused_pairs[:4]) if paused_pairs else "none"
@@ -3395,7 +3395,9 @@ def run():
             poll_telegram_commands()
 
             if is_weekend():
-                publish_bot_runtime_status("idle_weekend", force=True)
+                acct = get_account_summary()
+                balance = acct.get("balance", 0)
+                send_heartbeat(balance, status="idle_weekend")
                 log_idle_state("weekend market closed", sleep_seconds=300)
                 sleep_with_command_poll(300)
                 continue

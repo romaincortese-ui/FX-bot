@@ -36,3 +36,24 @@ def test_run_uses_global_loss_streak_state(monkeypatch) -> None:
     main._session_loss_paused_until = 0.0
 
     main.run()
+
+
+def test_run_sends_heartbeat_while_idle_on_weekend(monkeypatch) -> None:
+    main = importlib.import_module("main")
+    heartbeat_calls: list[tuple[float, str]] = []
+
+    monkeypatch.setattr(main, "_bootstrap_runtime", lambda: None)
+    monkeypatch.setattr(main, "poll_telegram_commands", lambda: None)
+    monkeypatch.setattr(main, "is_weekend", lambda: True)
+    monkeypatch.setattr(main, "get_account_summary", lambda: {"balance": 1234.5})
+    monkeypatch.setattr(main, "send_heartbeat", lambda balance, status="running": heartbeat_calls.append((balance, status)))
+    monkeypatch.setattr(main, "log_idle_state", lambda *args, **kwargs: None)
+
+    def stop_sleep(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(main, "sleep_with_command_poll", stop_sleep)
+
+    main.run()
+
+    assert heartbeat_calls == [(1234.5, "idle_weekend")]
