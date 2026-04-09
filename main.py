@@ -2191,7 +2191,7 @@ def _handle_status_command():
             pnl_pips = (entry_price - mark_price) / ps
         trade["unrealized_pnl"] = round(pnl_pips, 1)
         live_unrealized_pips += pnl_pips
-        live_unrealized += pnl_pips * pip_value(trade["instrument"], trade.get("units", 1))
+        live_unrealized += pnl_pips * pip_value(trade["instrument"], trade.get("units", 1), currency)
 
     broker_unrealized = float(acct.get("unrealizedPL", 0))
     currency = acct.get("currency", "GBP")
@@ -2353,15 +2353,16 @@ def _handle_metrics_command():
         strat_lines.append(f"  {s}: {d['total']} trades | {swr:.0f}% WR | {d['pnl']:+.2f}")
     long_pnl  = sum(t.get("pnl", 0) for t in trade_history if t.get("direction") == "LONG")
     short_pnl = sum(t.get("pnl", 0) for t in trade_history if t.get("direction") == "SHORT")
+    ccy = get_account_currency()
     telegram(
         f"📈 <b>Metrics</b> ({total} trades)\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Win rate: {wr:.1f}% ({wins}W/{losses}L)\n"
-        f"Total P&L: {total_pnl:+.2f}\n"
-        f"Avg win: {avg_win:+.2f} | Avg loss: {avg_loss:+.2f}\n"
+        f"Total P&L: {ccy}{total_pnl:+.2f}\n"
+        f"Avg win: {ccy}{avg_win:+.2f} | Avg loss: {ccy}{avg_loss:+.2f}\n"
         f"Profit factor: {pf:.2f}\n"
         f"Sharpe: {sharpe:.2f}\n"
-        f"Long P&L: {long_pnl:+.2f} | Short: {short_pnl:+.2f}\n"
+        f"Long P&L: {ccy}{long_pnl:+.2f} | Short: {ccy}{short_pnl:+.2f}\n"
         f"\n<b>By Strategy:</b>\n" + "\n".join(strat_lines)
     )
 
@@ -3385,7 +3386,7 @@ def close_trade_exit(trade: dict, reason: str):
             log.error(f"[{label}] Failed to close {instrument} — will retry{suffix}")
         return False
 
-    pnl = pnl_pips * pip_value(instrument, trade.get("units", 1))
+    pnl = pnl_pips * pip_value(instrument, trade.get("units", 1), get_account_currency())
     held_min = (time.time() - trade.get("opened_ts", time.time())) / 60
 
     history_entry = {
@@ -3505,10 +3506,11 @@ def send_heartbeat(balance: float, status: str = "running"):
     for t in open_trades:
         dir_e = "⬆️" if t["direction"] == "LONG" else "⬇️"
         open_str += f"\n  {dir_e} {t['instrument']} {t['label']} | {t.get('unrealized_pnl', 0):+.1f}p"
+    ccy = get_account_currency()
     telegram(
         f"💓 <b>Heartbeat</b>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"Balance: £{balance:,.2f}\n"
+        f"Balance: {ccy}{balance:,.2f}\n"
         f"Open: {len(open_trades)} trades{open_str}\n"
         f"Session: {session['name']} ({session['aggression']})\n"
         f"Regime: {regime} ({_market_regime_mult:.2f})\n"
@@ -3540,9 +3542,9 @@ def send_daily_summary(balance: float):
         f"📅 <b>Daily Summary</b> | {today}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Trades: {total} | {wins}W/{total-wins}L\n"
-        f"P&L: £{pnl:+.2f}\n"
-        f"Long: £{by_dir['LONG']:+.2f} | Short: £{by_dir['SHORT']:+.2f}\n"
-        f"Balance: £{balance:,.2f}"
+        f"P&L: {get_account_currency()}{pnl:+.2f}\n"
+        f"Long: {get_account_currency()}{by_dir['LONG']:+.2f} | Short: {get_account_currency()}{by_dir['SHORT']:+.2f}\n"
+        f"Balance: {get_account_currency()}{balance:,.2f}"
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -3592,7 +3594,7 @@ def _bootstrap_runtime() -> None:
         f"Mode: {'📝 Paper' if PAPER_TRADE else '💰 Live'} | {ACCOUNT_TYPE}\n"
         f"Watchlist: {len(DYNAMIC_PAIRS)} pairs\n"
         f"Session: {get_current_session()['name']}\n"
-        f"Strategies: SCALPER, TREND, REVERSAL, BREAKOUT, CARRY, ASIAN_FADE, POST_NEWS, PULLBACK\n"
+        f"Strategies: SCALPER, TREND, REVERSAL, CARRY, POST_NEWS, PULLBACK\n"
         f"Open trades {'restored from state' if PAPER_TRADE else 'synced from OANDA'}: {len(open_trades)}"
     )
 
@@ -3729,7 +3731,7 @@ def run():
             elif today_pnl < -(balance * SESSION_LOSS_PAUSE_PCT) and len(trade_history) >= 3:
                 _session_loss_paused_until = time.time() + SESSION_LOSS_PAUSE_MINS * 60
                 session_paused = True
-                telegram(f"🛑 <b>Session loss limit</b> | P&L £{today_pnl:.2f}\n"
+                telegram(f"🛑 <b>Session loss limit</b> | P&L {get_account_currency()}{today_pnl:.2f}\n"
                          f"Entries paused {SESSION_LOSS_PAUSE_MINS}min.")
 
             if streak_cb and not open_trades and _streak_paused_at > 0:
