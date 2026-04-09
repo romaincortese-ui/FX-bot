@@ -115,6 +115,7 @@ class TradeSimulator:
             "regime_multiplier": opp.get("regime_multiplier", 1.0),
             "news_active_at_entry": news_active,
             "execution_mode": execution_mode,
+            "breakeven_done": False,
         }
         self._copy_trade_diagnostics(trade, opp)
         if label == "TREND" and opp.get("partial_tp_pips"):
@@ -131,7 +132,14 @@ class TradeSimulator:
         if direction == "SHORT":
             pnl_pips *= -1
         pnl_pips -= self.config.round_trip_cost_pips
-        pnl = pnl_pips * abs(float(trade["units"])) * pip_size(trade["instrument"])
+        pnl_quote = pnl_pips * abs(float(trade["units"])) * pip_size(trade["instrument"])
+        # Convert PnL from quote currency to account currency (USD)
+        _, quote = trade["instrument"].split("_")
+        if quote == "USD":
+            pnl = pnl_quote
+        else:
+            # For USD_JPY etc., pnl_quote is in JPY — convert using exit price
+            pnl = pnl_quote / exit_price if exit_price > 0 else pnl_quote
         highest_price = float(trade.get("highest_price", trade["entry_price"]))
         lowest_price = float(trade.get("lowest_price", trade["entry_price"]))
         if direction == "LONG":
@@ -179,7 +187,7 @@ class TradeSimulator:
         buffer = pips_to_price(trade["instrument"], 2.0)
         trade["sl_price"] = trade["entry_price"] + buffer if trade["direction"] == "LONG" else trade["entry_price"] - buffer
 
-    def update_open_trades(self, current_time: datetime, bar_lookup: dict[str, dict[str, Any]], max_hours_map: dict[str, float], partial_tp_pct: float = 0.5) -> list[dict[str, Any]]:
+    def update_open_trades(self, current_time: datetime, bar_lookup: dict[str, dict[str, Any]], max_hours_map: dict[str, float], partial_tp_pct: float = 0.5, breakeven_atr_mult: float = 0.0, trail_atr_mult: float = 0.0) -> list[dict[str, Any]]:
         closed: list[dict[str, Any]] = []
         for trade in list(self.open_trades):
             bar = bar_lookup.get(trade["instrument"])
@@ -201,8 +209,34 @@ class TradeSimulator:
             if trade["label"] in {"TREND", "BREAKOUT"}:
                 self._apply_partial_take_profit(trade, bar, current_time, partial_tp_pct)
 
+            # --- Breakeven logic (mexc-bot2 inspired) ---
+            atr_val = float(trade.get("atr") or 0)
+            if breakeven_atr_mult > 0 and atr_val > 0 and trade["label"] == "TREND" and not trade.get("breakeven_done"):
+                breakeven_target = atr_val * breakeven_atr_mult
+                if trade["direction"] == "LONG":
+                    peak_gain = float(trade.get("highest_price", trade["entry_price"])) - trade["entry_price"]
+                else:
+                    peak_gain = trade["entry_price"] - float(trade.get("lowest_price", trade["entry_price"]))
+                if peak_gain >= breakeven_target:
+                    buffer = pips_to_price(trade["instrument"], 1.0)
+                    be_price = trade["entry_price"] + buffer if trade["direction"] == "LONG" else trade["entry_price"] - buffer
+                    if trade["direction"] == "LONG":
+                        trade["sl_price"] = max(float(trade["sl_price"]), be_price)
+                    else:
+                        trade["sl_price"] = min(float(trade["sl_price"]), be_price)
+                    trade["breakeven_done"] = True
+
+            # --- ATR-based trailing for TREND, fixed-pip trailing for others ---
             trail_pips = trade.get("trail_pips")
-            if trail_pips:
+            if trail_atr_mult > 0 and atr_val > 0 and trade["label"] == "TREND":
+                trail_distance = atr_val * trail_atr_mult
+                if trade["direction"] == "LONG":
+                    candidate = float(trade.get("highest_price", close)) - trail_distance
+                    trade["sl_price"] = max(float(trade["sl_price"]), candidate)
+                else:
+                    candidate = float(trade.get("lowest_price", close)) + trail_distance
+                    trade["sl_price"] = min(float(trade["sl_price"]), candidate)
+            elif trail_pips:
                 trail_distance = pips_to_price(trade["instrument"], float(trail_pips))
                 if trade["direction"] == "LONG":
                     trade["sl_price"] = max(float(trade["sl_price"]), float(trade.get("highest_price", close)) - trail_distance)
@@ -259,7 +293,13 @@ class TradeSimulator:
             pnl_pips = price_to_pips(trade["instrument"], current - trade["entry_price"])
             if trade["direction"] == "SHORT":
                 pnl_pips *= -1
-            unrealized += pnl_pips * abs(float(trade["units"])) * pip_size(trade["instrument"])
+            pnl_quote = pnl_pips * abs(float(trade["units"])) * pip_size(trade["instrument"])
+            # Convert PnL from quote currency to account currency (USD)
+            _, quote = trade["instrument"].split("_")
+            if quote == "USD":
+                unrealized += pnl_quote
+            else:
+                unrealized += pnl_quote / current if current > 0 else pnl_quote
         equity = self.balance + unrealized
         self.equity_curve.append({"time": timestamp.isoformat(), "balance": round(self.balance, 2), "equity": round(equity, 2)})
         return equity

@@ -128,6 +128,12 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
         ctx.reject("SCALPER", instrument, "spread too high")
         return None
 
+    # Scalpers need active sessions only — per Investopedia, scalping requires
+    # "high market liquidity" during "peak liquidity" to avoid slippage
+    if session.get("aggression") in ("MINIMAL", "LOW"):
+        ctx.reject("SCALPER", instrument, "session not active enough")
+        return None
+
     df_5m = ctx.fetch_candles(instrument, "M5", 60)
     if df_5m is None or len(df_5m) < 30:
         ctx.reject("SCALPER", instrument, "not enough M5 data")
@@ -149,20 +155,26 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
     crossed_now = float(ema9.iloc[-1]) > float(ema21.iloc[-1]) and float(ema9.iloc[-2]) <= float(ema21.iloc[-2])
     crossed_recent = float(ema9.iloc[-2]) > float(ema21.iloc[-2]) and float(ema9.iloc[-3]) <= float(ema21.iloc[-3])
     crossed_down_now = float(ema9.iloc[-1]) < float(ema21.iloc[-1]) and float(ema9.iloc[-2]) >= float(ema21.iloc[-2])
-    crossed = crossed_now or crossed_recent or crossed_down_now
+    crossed_down_recent = float(ema9.iloc[-2]) < float(ema21.iloc[-2]) and float(ema9.iloc[-3]) >= float(ema21.iloc[-3])
+    crossed = crossed_now or crossed_recent or crossed_down_now or crossed_down_recent
+
+    # HARD GATE: require an actual crossover — no crossover, no scalp trade
+    if not crossed:
+        ctx.reject("SCALPER", instrument, "no EMA crossover")
+        return None
 
     avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 1
     vol_ratio = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
     rsi_prev = calc_rsi(close.iloc[:-1])
     rsi_delta = rsi - rsi_prev if not np.isnan(rsi_prev) else 0
 
-    ma_score = 30 if crossed else (15 if float(ema9.iloc[-1]) != float(ema21.iloc[-1]) else 0)
+    ma_score = 30 if (crossed_now or crossed_down_now) else 20  # fresh cross > 1-bar-old cross
     rsi_score = max(0, 40 - min(rsi, 100 - rsi)) if rsi < 45 or rsi > 55 else 0
-    vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
-    confluence = settings["SCALPER_CONFLUENCE_BONUS"] if crossed and vol_ratio > 1.5 and abs(rsi_delta) > 2 else 0
+    vol_score = min(20, (vol_ratio - 1.2) * 15) if vol_ratio > 1.2 else 0
+    confluence = settings["SCALPER_CONFLUENCE_BONUS"] if vol_ratio > 1.5 and abs(rsi_delta) > 2 else 0
     macd = calc_macd(df_5m)
     macd_bonus = 5 if macd["cross_up"] or macd["cross_down"] else 0
-    spread_penalty = max(0, (spread_pips - 0.5) * 5)
+    spread_penalty = max(0, (spread_pips - 0.5) * 8)
     score = ma_score + rsi_score + vol_score + confluence + macd_bonus - spread_penalty
 
     direction = ctx.determine_direction(
@@ -174,7 +186,9 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
         dxy_gate_threshold=ctx.dxy_gate_threshold,
         apply_macro_directional_bias=ctx.apply_macro_directional_bias,
     )
-    if direction == "SHORT" and not (crossed_down_now or float(ema9.iloc[-1]) < float(ema21.iloc[-1])):
+    if direction == "SHORT" and not (crossed_down_now or crossed_down_recent):
+        score *= 0.5
+    elif direction == "LONG" and not (crossed_now or crossed_recent):
         score *= 0.5
     macro_ok, bias = _apply_directional_macro_gate("SCALPER", instrument, direction, ctx)
     if not macro_ok:
@@ -193,8 +207,8 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
     tp_pips = max(settings["SCALPER_TP_MIN_PIPS"], min(settings["SCALPER_TP_MAX_PIPS"], price_to_pips(instrument, atr * settings["SCALPER_TP_ATR_MULT"])))
     sl_pips = max(settings["SCALPER_SL_MIN_PIPS"], min(settings["SCALPER_SL_MAX_PIPS"], price_to_pips(instrument, atr * settings["SCALPER_SL_ATR_MULT"])))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
-    if tp_pips / sl_pips < 1.5:
-        tp_pips = sl_pips * 1.5
+    if tp_pips / sl_pips < 2.0:
+        tp_pips = sl_pips * 2.0
     return _finalize_opportunity({
         "instrument": instrument,
         "score": round(score, 2),
@@ -215,7 +229,7 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
         "calibration_risk_mult": calibration["risk_mult"],
         "calibration_source": calibration["source"],
         "crossed_now": crossed_now or crossed_down_now,
-        "entry_signal": "CROSSOVER" if crossed else ("VOL_SPIKE" if vol_ratio > 2 else "TREND"),
+        "entry_signal": "CROSSOVER" if (crossed_now or crossed_down_now) else "CROSSOVER_RECENT",
         "macd": macd,
     }, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
@@ -250,21 +264,61 @@ def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
         ctx.reject("TREND", instrument, "H1/H4 trend not aligned")
         return None
     direction = "LONG" if bullish_4h else "SHORT"
-    score = 25
-    ema50_gap_4h = abs(float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1)
-    score += min(20, ema50_gap_4h * 1000)
-    ema20_dist = abs(float(close_1h.iloc[-1]) / float(ema20_1h.iloc[-1]) - 1)
-    score += 15 if ema20_dist < 0.002 else 8 if ema20_dist < 0.005 else 0
-    rsi_1h = calc_rsi(close_1h)
-    if (direction == "LONG" and 40 < rsi_1h < 65) or (direction == "SHORT" and 35 < rsi_1h < 60):
+
+    # --- Require an entry trigger: pullback to EMA20 OR recent crossover ---
+    current_price = float(close_1h.iloc[-1])
+    ema20_val = float(ema20_1h.iloc[-1])
+    atr = calc_atr(df_1h, 14)
+    atr_pct = atr / current_price if current_price > 0 else 0
+
+    # Minimum volatility filter — avoid ranging/dead markets
+    if atr_pct < 0.0003:
+        ctx.reject("TREND", instrument, "volatility too low")
+        return None
+
+    # Pullback: price within 1x ATR of EMA20 on the correct side or slightly past
+    pullback_dist = abs(current_price - ema20_val)
+    is_pullback = pullback_dist <= atr * 1.5
+
+    # Recent crossover: EMA20 crossed above EMA50 within last 10 H1 bars
+    crossover_recent = False
+    for i in range(-10, -1):
+        try:
+            prev_above = float(ema20_1h.iloc[i - 1]) > float(ema50_1h.iloc[i - 1])
+            curr_above = float(ema20_1h.iloc[i]) > float(ema50_1h.iloc[i])
+            if curr_above != prev_above:
+                crossover_recent = True
+                break
+        except (IndexError, KeyError):
+            continue
+
+    if not is_pullback and not crossover_recent:
+        ctx.reject("TREND", instrument, "no pullback or recent crossover")
+        return None
+
+    score = 15  # reduced base score (was 25)
+
+    # Bonus for entry trigger quality
+    if crossover_recent and is_pullback:
+        score += 15  # both triggers = strong signal
+    elif crossover_recent:
         score += 10
+    elif is_pullback:
+        pullback_depth = pullback_dist / atr if atr > 0 else 0
+        score += 15 if 0.3 <= pullback_depth <= 1.0 else 8
+
+    ema50_gap_4h = abs(float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1)
+    score += min(15, ema50_gap_4h * 800)  # reduced from min(20, *1000)
+    rsi_1h = calc_rsi(close_1h)
+    if (direction == "LONG" and 45 < rsi_1h < 65) or (direction == "SHORT" and 35 < rsi_1h < 55):
+        score += 10  # tightened RSI range
     macd_1h = calc_macd(df_1h)
     if (direction == "LONG" and macd_1h["histogram"] > 0) or (direction == "SHORT" and macd_1h["histogram"] < 0):
         score += 10
     vol = df_1h["volume"]
     vol_ratio = float(vol.iloc[-1]) / float(vol.iloc[-20:-1].mean()) if len(vol) >= 21 else 1
-    if vol_ratio > 1.2:
-        score += 5
+    if vol_ratio > 1.5:
+        score += 5  # raised from 1.2 to 1.5
     if ctx.dxy_ema_gap is not None and "USD" in instrument:
         base, _ = instrument.split("_")
         usd_is_base = base == "USD"
@@ -272,8 +326,6 @@ def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
         dxy_short = ctx.dxy_ema_gap < -ctx.dxy_gate_threshold
         if (usd_is_base and direction == "LONG" and dxy_long) or (usd_is_base and direction == "SHORT" and dxy_short) or (not usd_is_base and direction == "SHORT" and dxy_long) or (not usd_is_base and direction == "LONG" and dxy_short):
             score += 10
-    atr = calc_atr(df_1h, 14)
-    atr_pct = atr / float(close_1h.iloc[-1])
     macro_ok, bias = _apply_directional_macro_gate("TREND", instrument, direction, ctx)
     if not macro_ok:
         return None
@@ -373,17 +425,28 @@ def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategySco
         ctx.reject("BREAKOUT", instrument, "not enough M15 data")
         return None
     squeeze = keltner_squeeze(df_15m)
-    if not squeeze["in_squeeze"] and squeeze["squeeze_bars"] < 5:
-        ctx.reject("BREAKOUT", instrument, "no squeeze")
+    min_squeeze = int(settings.get("BREAKOUT_MIN_SQUEEZE_BARS", 8))
+    if not squeeze["in_squeeze"] and squeeze["squeeze_bars"] < min_squeeze:
+        ctx.reject("BREAKOUT", instrument, "no squeeze or insufficient squeeze bars")
         return None
-    score = min(25, squeeze["squeeze_bars"] * 3)
-    score += 20 if squeeze["bb_percentile"] < 20 else 10 if squeeze["bb_percentile"] < 35 else 0
+    # Require BB compression — bb_percentile > 30 means Bollinger Bands are too wide (no real squeeze)
+    if squeeze["bb_percentile"] > 30:
+        ctx.reject("BREAKOUT", instrument, "BB not compressed enough")
+        return None
+    score = min(25, squeeze["squeeze_bars"] * 2)  # reduced multiplier
+    score += 20 if squeeze["bb_percentile"] < 10 else 10 if squeeze["bb_percentile"] < 20 else 0
     volume = df_15m["volume"]
     recent_vol = float(volume.iloc[-3:].mean())
     avg_vol = float(volume.iloc[-20:-3].mean()) if len(volume) >= 23 else 1
     vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1
-    if vol_ratio > 1.3:
+    # Require volume expansion to confirm breakout is real, not noise
+    if vol_ratio < 1.2:
+        ctx.reject("BREAKOUT", instrument, "insufficient volume for breakout")
+        return None
+    if vol_ratio > 1.5:
         score += 10
+    elif vol_ratio > 1.3:
+        score += 5
     macd = calc_macd(df_15m)
     hist_prev = float((df_15m["close"].ewm(span=12).mean() - df_15m["close"].ewm(span=26).mean() - (df_15m["close"].ewm(span=12).mean() - df_15m["close"].ewm(span=26).mean()).ewm(span=9).mean()).iloc[-2])
     if abs(macd["histogram"]) > abs(hist_prev):
@@ -468,7 +531,7 @@ def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
     tp_pips = max(15, price_to_pips(instrument, atr * settings["CARRY_TP_ATR_MULT"]))
     sl_pips = max(10, price_to_pips(instrument, atr * settings["CARRY_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, "LONG", "LONG_ONLY", ctx.vix_level)
-    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": "LONG", "rsi": round(rsi_4h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["CARRY_TRAIL_PIPS"], "entry_signal": "CARRY_YIELD", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "momentum_5d": round(momentum_5d, 4), "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": "LONG", "rsi": round(rsi_4h, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["CARRY_TRAIL_PIPS"], "entry_signal": "CARRY_YIELD", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "momentum_5d": round(momentum_5d, 4), "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias="LONG_ONLY", eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:

@@ -50,6 +50,7 @@ class BacktestEngine:
             ("PULLBACK", score_pullback),
         ]
         self._spread_profiles: dict[str, dict[str, float]] = {}
+        self._last_trade_close: dict[tuple[str, str], datetime] = {}  # (strategy, instrument) -> last close time
 
     def _load_series(self, instrument: str, granularity: str) -> pd.DataFrame | None:
         key = (instrument, granularity)
@@ -281,7 +282,17 @@ class BacktestEngine:
         }
         while current <= self.config.end:
             macro_state = self.macro_replay.get_state(current)
-            self.simulator.update_open_trades(current, {i: self._bar_at(i, self.config.granularity, current) for i in self.config.instruments}, max_hours_map, partial_tp_pct=float(self.settings["TREND_PARTIAL_TP_PCT"]))
+            closed_trades = self.simulator.update_open_trades(
+                current,
+                {i: self._bar_at(i, self.config.granularity, current) for i in self.config.instruments},
+                max_hours_map,
+                partial_tp_pct=float(self.settings["TREND_PARTIAL_TP_PCT"]),
+                breakeven_atr_mult=float(self.settings.get("TREND_BREAKEVEN_ATR_MULT", 0)),
+                trail_atr_mult=float(self.settings.get("TREND_TRAIL_ATR_MULT", 0)),
+            )
+            for ct in closed_trades:
+                key = (ct["label"], ct["instrument"])
+                self._last_trade_close[key] = current
             self.simulator.mark_equity(current, self._mark_prices(current))
 
             session = self._get_session(current)
@@ -297,6 +308,13 @@ class BacktestEngine:
                 for instrument in session["pairs_allowed"]:
                     if any(t["instrument"] == instrument for t in self.simulator.open_trades):
                         continue
+                    # Cooldown: skip if a trade for this strategy+instrument closed too recently
+                    cooldown_key = (label, instrument)
+                    cooldown_hours = float(self.settings.get(f"{label}_COOLDOWN_HOURS", 0))
+                    if cooldown_hours > 0 and cooldown_key in self._last_trade_close:
+                        hours_since = (current - self._last_trade_close[cooldown_key]).total_seconds() / 3600.0
+                        if hours_since < cooldown_hours:
+                            continue
                     spread_pips = self._estimate_spread_pips(instrument, current)
                     ctx = StrategyScoringContext(
                         get_spread_pips=lambda _i, sp=spread_pips: sp,
@@ -335,7 +353,14 @@ class BacktestEngine:
                 if bar is None:
                     continue
                 kelly_mult = self._kelly_multiplier(label, float(best_opp["score"]))
+                # Cap Kelly for scalper — per industry consensus, scalpers trade smaller positions
+                max_kelly = float(self.settings.get(f"{label}_MAX_KELLY", 0))
+                if max_kelly > 0:
+                    kelly_mult = min(kelly_mult, max_kelly)
                 units = self._position_units(best_opp["instrument"], float(bar["close"]), float(best_opp["sl_pips"]), self.simulator.balance, kelly_mult, "USD", current)
+                # Safety cap: never risk more than balance * leverage allows
+                max_units = abs(self.simulator.balance * self.config.leverage / float(bar["close"]))
+                units = min(units, max_units)
                 best_opp["kelly_mult"] = kelly_mult
                 news_active = self._is_pair_paused_by_news(macro_state, best_opp["instrument"], current)
                 self.simulator.open_trade(best_opp, label, current, float(bar["close"]), units, self._estimate_spread_pips(best_opp["instrument"], current), news_active, execution_bar=bar)
