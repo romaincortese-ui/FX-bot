@@ -223,13 +223,14 @@ class BacktestEngine:
     def _strategy_threshold(self, label: str) -> int:
         return int(self.settings.get(f"{label}_THRESHOLD", 40))
 
-    def _kelly_multiplier(self, label: str, score: float) -> float:
-        gap = score - self._strategy_threshold(label)
-        if gap >= 40:
+    def _kelly_multiplier(self, label: str, score: float, effective_threshold: float | None = None) -> float:
+        threshold = effective_threshold if effective_threshold is not None else self._strategy_threshold(label)
+        gap = score - threshold
+        if gap >= 30:
             return self.settings["KELLY_MULT_HIGH_CONF"]
-        if gap >= 25:
+        if gap >= 15:
             return self.settings["KELLY_MULT_STANDARD"]
-        if gap >= 10:
+        if gap >= 5:
             return self.settings["KELLY_MULT_SOLID"]
         return self.settings["KELLY_MULT_MARGINAL"]
 
@@ -352,7 +353,8 @@ class BacktestEngine:
                 bar = self._bar_at(best_opp["instrument"], self.config.granularity, current)
                 if bar is None:
                     continue
-                kelly_mult = self._kelly_multiplier(label, float(best_opp["score"]))
+                eff_thresh = float(best_opp.get("effective_threshold", 0)) or None
+                kelly_mult = self._kelly_multiplier(label, float(best_opp["score"]), eff_thresh)
                 # Cap Kelly for scalper — per industry consensus, scalpers trade smaller positions
                 max_kelly = float(self.settings.get(f"{label}_MAX_KELLY", 0))
                 if max_kelly > 0:

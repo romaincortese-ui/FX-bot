@@ -181,3 +181,94 @@ def test_run_announces_entries_available_again_when_tradable_pairs_return(monkey
     assert any("Entries available again" in message for message in telegram_messages)
     assert any("Tradable pairs: EUR_USD" in message for message in telegram_messages)
     assert main._entry_pause_reason == ""
+
+
+def test_build_fx_budget_snapshot_uses_shared_sleeve_state(monkeypatch, tmp_path) -> None:
+    main = importlib.import_module("main")
+
+    shared_budget = tmp_path / "shared_budget_state.json"
+    shared_budget.write_text(
+        '{"bots": {"fx": {"reserved_risk": 30.0}, "gold": {"reserved_risk": 12.5}}}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main, "REDIS_CLIENT", None)
+    monkeypatch.setattr(main, "SHARED_BUDGET_FILE", str(shared_budget))
+    monkeypatch.setattr(main, "FX_BUDGET_ALLOCATION", 0.5)
+    monkeypatch.setattr(main, "MAX_RISK_PER_TRADE", 0.01)
+    monkeypatch.setattr(main, "MAX_TOTAL_EXPOSURE", 0.15)
+
+    snapshot = main.build_fx_budget_snapshot(1000.0)
+
+    assert snapshot["fx_sleeve_balance"] == 500.0
+    assert snapshot["max_trade_risk_amount"] == 5.0
+    assert snapshot["max_total_risk_amount"] == 75.0
+    assert snapshot["reserved_fx_risk"] == 30.0
+    assert snapshot["sibling_gold_reserved_risk"] == 12.5
+    assert snapshot["available_fx_risk"] == 45.0
+
+
+def test_open_trade_entry_caps_risk_to_available_fx_sleeve(monkeypatch) -> None:
+    main = importlib.import_module("main")
+    captured: dict[str, float] = {}
+
+    monkeypatch.setattr(main, "get_account_summary", lambda: {"balance": 1000.0, "currency": "USD", "NAV": 1000.0})
+    monkeypatch.setattr(main, "get_current_session", lambda: {"name": "LONDON"})
+    monkeypatch.setattr(main, "get_strategy_entry_block_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "get_trade_calibration_adjustment", lambda *args, **kwargs: {"source": "test", "threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None})
+    monkeypatch.setattr(main, "get_entry_risk_multiplier", lambda *args, **kwargs: 1.0)
+    monkeypatch.setattr(
+        main,
+        "build_fx_budget_snapshot",
+        lambda balance: {
+            "account_balance": balance,
+            "fx_sleeve_balance": 500.0,
+            "max_trade_risk_amount": 5.0,
+            "max_total_risk_amount": 75.0,
+            "reserved_fx_risk": 72.0,
+            "sibling_gold_reserved_risk": 0.0,
+            "available_fx_risk": 3.0,
+        },
+    )
+    monkeypatch.setattr(main, "calculate_units_for_risk_amount", lambda instrument, risk_amount, sl_pips, account_currency=None: captured.setdefault("risk_amount", risk_amount) or 100)
+    monkeypatch.setattr(main, "get_current_price", lambda instrument: {"ask": 1.2, "bid": 1.1998})
+    monkeypatch.setattr(main, "uses_oanda_native_units", lambda: False)
+    monkeypatch.setattr(main, "pip_size", lambda instrument: 0.0001)
+    monkeypatch.setattr(main, "place_order", lambda *args, **kwargs: {"id": "trade-1", "price": 1.2, "units": 100})
+    monkeypatch.setattr(main, "save_state", lambda: None)
+    monkeypatch.setattr(main, "telegram", lambda *args, **kwargs: None)
+
+    main._pair_cooldowns = {}
+
+    trade = main.open_trade_entry(
+        {"instrument": "EUR_USD", "direction": "LONG", "score": 60, "sl_pips": 10.0, "tp_pips": 20.0},
+        "TREND",
+        1000.0,
+    )
+
+    assert captured["risk_amount"] == 3.0
+    assert trade is not None
+    assert trade["risk_amount"] == 3.0
+
+
+def test_estimate_fx_conversion_rate_prefers_supported_inverse_pair(monkeypatch) -> None:
+    main = importlib.import_module("main")
+    requested: list[str] = []
+
+    monkeypatch.setattr(main, "PAPER_TRADE", False)
+    monkeypatch.setattr(main, "OANDA_API_KEY", "token")
+    monkeypatch.setattr(main, "OANDA_ACCOUNT_ID", "acct")
+    monkeypatch.setattr(main, "get_supported_currency_pairs", lambda force=False: {"GBP_JPY"})
+
+    def fake_get_mid_price(instrument: str):
+        requested.append(instrument)
+        if instrument == "GBP_JPY":
+            return 200.0
+        return None
+
+    monkeypatch.setattr(main, "get_mid_price", fake_get_mid_price)
+
+    rate = main.estimate_fx_conversion_rate("JPY", "GBP")
+
+    assert requested == ["GBP_JPY"]
+    assert rate == 1.0 / 200.0

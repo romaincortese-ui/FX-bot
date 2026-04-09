@@ -113,6 +113,10 @@ DXY_REGIME_THRESHOLD = float(os.getenv("DXY_REGIME_THRESHOLD", "0.008"))
 # ── Spread betting min stake ──────────────────────────────────
 SPREAD_BET_MIN_STAKE = float(os.getenv("SPREAD_BET_MIN_STAKE", "0.10"))
 
+# ── Shared account sleeve split ───────────────────────────────
+FX_BUDGET_ALLOCATION = float(os.getenv("FX_BUDGET_ALLOCATION", "0.50"))
+GOLD_BUDGET_ALLOCATION = float(os.getenv("GOLD_BUDGET_ALLOCATION", "0.50"))
+
 # ── Capital allocation ───────────────────────────────────────
 SCALPER_ALLOCATION_PCT  = float(os.getenv("SCALPER_ALLOCATION_PCT",  "0.30"))
 TREND_ALLOCATION_PCT    = float(os.getenv("TREND_ALLOCATION_PCT",    "0.40"))
@@ -120,7 +124,7 @@ REVERSAL_ALLOCATION_PCT = float(os.getenv("REVERSAL_ALLOCATION_PCT", "0.15"))
 BREAKOUT_ALLOCATION_PCT = float(os.getenv("BREAKOUT_ALLOCATION_PCT", "0.15"))
 
 # ── Risk management ─────────────────────────────────────────
-MAX_RISK_PER_TRADE     = float(os.getenv("MAX_RISK_PER_TRADE",     "0.01"))
+MAX_RISK_PER_TRADE     = float(os.getenv("MAX_RISK_PER_TRADE",     "0.015"))
 MAX_RISK_PER_PAIR      = float(os.getenv("MAX_RISK_PER_PAIR",      "0.03"))
 MAX_TOTAL_EXPOSURE     = float(os.getenv("MAX_TOTAL_EXPOSURE",      "0.15"))
 MAX_CORRELATED_TRADES  = int(os.getenv("MAX_CORRELATED_TRADES",     "3"))
@@ -305,6 +309,8 @@ REDIS_URL           = os.getenv("REDIS_URL", "")
 REDIS_MACRO_STATE_KEY = os.getenv("REDIS_MACRO_STATE_KEY", "macro_state")
 REDIS_TRADE_CALIBRATION_KEY = os.getenv("REDIS_TRADE_CALIBRATION_KEY", "trade_calibration")
 REDIS_BOT_STATUS_KEY = os.getenv("REDIS_BOT_STATUS_KEY", "bot_runtime_status")
+SHARED_BUDGET_FILE = os.getenv("SHARED_BUDGET_FILE", os.getenv("FX_SHARED_BUDGET_FILE", "shared_budget_state.json"))
+SHARED_BUDGET_KEY = os.getenv("SHARED_BUDGET_KEY", os.getenv("FX_SHARED_BUDGET_KEY", "shared_budget_state"))
 BOT_STATUS_INTERVAL = int(os.getenv("BOT_STATUS_INTERVAL", "60"))
 BOT_STATUS_TTL = int(os.getenv("BOT_STATUS_TTL", "180"))
 IDLE_LOG_INTERVAL = int(os.getenv("IDLE_LOG_INTERVAL", "1800"))
@@ -448,7 +454,108 @@ def publish_bot_runtime_status(state: str, balance: float | None = None, error: 
     published = publish_runtime_status(REDIS_CLIENT, REDIS_BOT_STATUS_KEY, payload, BOT_STATUS_TTL)
     if published:
         last_runtime_status_at = now
+    publish_fx_shared_budget_state()
     return published
+
+
+def _estimate_fx_trade_reserved_risk(trade: dict) -> float:
+    explicit = trade.get("risk_amount")
+    if explicit is not None:
+        try:
+            return max(0.0, float(explicit))
+        except (TypeError, ValueError):
+            pass
+
+    sl_pips = float(trade.get("sl_pips", 0) or 0)
+    units = abs(float(trade.get("units", 0) or 0))
+    instrument = str(trade.get("instrument", "") or "")
+    if sl_pips <= 0 or units <= 0 or not instrument:
+        return 0.0
+    if ACCOUNT_TYPE == "spread_bet" and not uses_oanda_native_units():
+        return round(sl_pips * units, 2)
+    return round(sl_pips * pip_value(instrument, units, get_account_currency()), 2)
+
+
+def publish_fx_shared_budget_state() -> bool:
+    if REDIS_CLIENT is None and not SHARED_BUDGET_FILE:
+        return False
+
+    payload = {"bots": {}}
+    try:
+        if REDIS_CLIENT is not None and SHARED_BUDGET_KEY:
+            raw = REDIS_CLIENT.get(SHARED_BUDGET_KEY)
+            if raw:
+                payload = json.loads(raw)
+        elif SHARED_BUDGET_FILE and os.path.exists(SHARED_BUDGET_FILE):
+            with open(SHARED_BUDGET_FILE, encoding="utf-8") as handle:
+                payload = json.load(handle)
+    except Exception:
+        payload = {"bots": {}}
+
+    bots = payload.setdefault("bots", {})
+    fx = bots.setdefault("fx", {"reserved_risk": 0.0, "trades": {}})
+    trades = {}
+    reserved_total = 0.0
+    for trade in open_trades:
+        trade_id = str(trade.get("id", "") or "")
+        if not trade_id:
+            continue
+        risk_amount = _estimate_fx_trade_reserved_risk(trade)
+        trades[trade_id] = {
+            "risk_amount": risk_amount,
+            "instrument": trade.get("instrument"),
+            "label": trade.get("label"),
+        }
+        reserved_total += risk_amount
+    fx["reserved_risk"] = round(reserved_total, 2)
+    fx["trades"] = trades
+    fx["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        if REDIS_CLIENT is not None and SHARED_BUDGET_KEY:
+            REDIS_CLIENT.set(SHARED_BUDGET_KEY, json.dumps(payload))
+        if SHARED_BUDGET_FILE:
+            os.makedirs(os.path.dirname(SHARED_BUDGET_FILE) or ".", exist_ok=True)
+            with open(SHARED_BUDGET_FILE, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        return True
+    except Exception as exc:
+        log.debug(f"Shared budget publish failed: {exc}")
+        return False
+
+
+def _load_shared_budget_payload() -> dict:
+    payload = {"bots": {}}
+    try:
+        if REDIS_CLIENT is not None and SHARED_BUDGET_KEY:
+            raw = REDIS_CLIENT.get(SHARED_BUDGET_KEY)
+            if raw:
+                payload = json.loads(raw)
+        elif SHARED_BUDGET_FILE and os.path.exists(SHARED_BUDGET_FILE):
+            with open(SHARED_BUDGET_FILE, encoding="utf-8") as handle:
+                payload = json.load(handle)
+    except Exception:
+        payload = {"bots": {}}
+    return payload if isinstance(payload, dict) else {"bots": {}}
+
+
+def build_fx_budget_snapshot(account_balance: float) -> dict[str, float]:
+    payload = _load_shared_budget_payload()
+    bots = payload.get("bots", {}) if isinstance(payload, dict) else {}
+    fx_reserved = float(bots.get("fx", {}).get("reserved_risk", 0.0) or 0.0)
+    gold_reserved = float(bots.get("gold", {}).get("reserved_risk", 0.0) or 0.0)
+    fx_sleeve_balance = float(account_balance) * FX_BUDGET_ALLOCATION
+    max_trade_risk_amount = fx_sleeve_balance * MAX_RISK_PER_TRADE
+    max_total_risk_amount = fx_sleeve_balance * MAX_TOTAL_EXPOSURE
+    return {
+        "account_balance": float(account_balance),
+        "fx_sleeve_balance": fx_sleeve_balance,
+        "max_trade_risk_amount": max_trade_risk_amount,
+        "max_total_risk_amount": max_total_risk_amount,
+        "reserved_fx_risk": fx_reserved,
+        "sibling_gold_reserved_risk": gold_reserved,
+        "available_fx_risk": max(0.0, max_total_risk_amount - fx_reserved),
+    }
 
 
 def sleep_with_command_poll(total_seconds: int, poll_interval: int = 5) -> None:
@@ -1554,13 +1661,21 @@ def estimate_fx_conversion_rate(from_currency: str, to_currency: str, visited: s
         return None
     visited.add(key)
 
-    direct_mid = get_mid_price(f"{from_currency}_{to_currency}")
-    if direct_mid is not None:
-        return direct_mid
+    direct_pair = f"{from_currency}_{to_currency}"
+    inverse_pair = f"{to_currency}_{from_currency}"
+    supported_pairs = None
+    if not PAPER_TRADE and OANDA_API_KEY and OANDA_ACCOUNT_ID:
+        supported_pairs = get_supported_currency_pairs()
 
-    inverse_mid = get_mid_price(f"{to_currency}_{from_currency}")
-    if inverse_mid is not None and inverse_mid > 0:
-        return 1.0 / inverse_mid
+    if supported_pairs is None or direct_pair in supported_pairs:
+        direct_mid = get_mid_price(direct_pair)
+        if direct_mid is not None:
+            return direct_mid
+
+    if supported_pairs is None or inverse_pair in supported_pairs:
+        inverse_mid = get_mid_price(inverse_pair)
+        if inverse_mid is not None and inverse_mid > 0:
+            return 1.0 / inverse_mid
 
     for bridge in ("USD", "EUR", "JPY", "GBP", "AUD"):
         if bridge in {from_currency, to_currency}:
@@ -1668,6 +1783,11 @@ def calculate_units(instrument: str, balance: float, sl_pips: float,
                     risk_pct: float, kelly_mult: float = 1.0,
                     account_currency: str | None = None) -> float:
     risk_amount = balance * risk_pct * kelly_mult
+    return calculate_units_for_risk_amount(instrument, risk_amount, sl_pips, account_currency)
+
+
+def calculate_units_for_risk_amount(instrument: str, risk_amount: float, sl_pips: float,
+                                    account_currency: str | None = None) -> float:
     if sl_pips <= 0:
         sl_pips = 10
     if ACCOUNT_TYPE == "spread_bet" and not uses_oanda_native_units():
@@ -2270,6 +2390,7 @@ def save_state():
         with open(tmp, "w") as f:
             json.dump(payload, f, default=str)
         os.replace(tmp, STATE_FILE)
+        publish_fx_shared_budget_state()
     except Exception as e:
         log.warning(f"State save failed: {e}")
 
@@ -2969,20 +3090,35 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
 
     calibration = get_trade_calibration_adjustment(label, instrument, session_name)
 
-    kelly_gap = opp["score"] - {"SCALPER": SCALPER_THRESHOLD, "TREND": TREND_THRESHOLD,
-                                 "REVERSAL": REVERSAL_THRESHOLD, "BREAKOUT": BREAKOUT_THRESHOLD,
-                                 "CARRY": CARRY_THRESHOLD, "ASIAN_FADE": ASIAN_FADE_THRESHOLD,
-                                 "POST_NEWS": POST_NEWS_THRESHOLD, "PULLBACK": PULLBACK_THRESHOLD}.get(label, 40)
-    kelly_mult = (KELLY_MULT_HIGH_CONF if kelly_gap >= 40
-                  else KELLY_MULT_STANDARD if kelly_gap >= 25
-                  else KELLY_MULT_SOLID if kelly_gap >= 10
+    eff_threshold = float(opp.get("effective_threshold", 0) or 0)
+    if eff_threshold > 0:
+        kelly_gap = opp["score"] - eff_threshold
+    else:
+        kelly_gap = opp["score"] - {"SCALPER": SCALPER_THRESHOLD, "TREND": TREND_THRESHOLD,
+                                     "REVERSAL": REVERSAL_THRESHOLD, "BREAKOUT": BREAKOUT_THRESHOLD,
+                                     "CARRY": CARRY_THRESHOLD, "ASIAN_FADE": ASIAN_FADE_THRESHOLD,
+                                     "POST_NEWS": POST_NEWS_THRESHOLD, "PULLBACK": PULLBACK_THRESHOLD}.get(label, 40)
+    kelly_mult = (KELLY_MULT_HIGH_CONF if kelly_gap >= 30
+                  else KELLY_MULT_STANDARD if kelly_gap >= 15
+                  else KELLY_MULT_SOLID if kelly_gap >= 5
                   else KELLY_MULT_MARGINAL)
     risk_mult = get_entry_risk_multiplier(label, instrument, session_name)
     effective_kelly_mult = kelly_mult * risk_mult
 
     account_currency = acct.get("currency", get_account_currency())
-    units = calculate_units(instrument, balance, opp["sl_pips"],
-                           MAX_RISK_PER_TRADE, effective_kelly_mult, account_currency)
+    budget_snapshot = build_fx_budget_snapshot(balance)
+    risk_amount = min(
+        budget_snapshot["max_trade_risk_amount"] * effective_kelly_mult,
+        budget_snapshot["available_fx_risk"],
+    )
+    if risk_amount <= 0:
+        log.info(
+            f"[{label}] Skip {instrument} {direction} — FX sleeve risk exhausted "
+            f"({budget_snapshot['reserved_fx_risk']:.2f}/{budget_snapshot['max_total_risk_amount']:.2f})"
+        )
+        return None
+
+    units = calculate_units_for_risk_amount(instrument, risk_amount, opp["sl_pips"], account_currency)
 
     price_data = get_current_price(instrument)
     entry_price = price_data["ask"] if direction == "LONG" else price_data["bid"]
@@ -2995,8 +3131,13 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         budget_preview = estimate_trade_budget(instrument, units, entry_price, account_currency)
         margin_required = budget_preview.get("margin_account")
         margin_available = float(acct.get("marginAvailable", 0) or 0)
-        if margin_required is not None and margin_available > 0 and margin_required > margin_available:
-            log.info(f"[{label}] Skip {instrument} {direction} — insufficient margin available ({margin_required:.2f} > {margin_available:.2f} {account_currency})")
+        sleeve_margin_cap = budget_snapshot["fx_sleeve_balance"]
+        effective_margin_available = min(margin_available, sleeve_margin_cap) if margin_available > 0 else sleeve_margin_cap
+        if margin_required is not None and effective_margin_available > 0 and margin_required > effective_margin_available:
+            log.info(
+                f"[{label}] Skip {instrument} {direction} — insufficient FX sleeve margin "
+                f"({margin_required:.2f} > {effective_margin_available:.2f} {account_currency})"
+            )
             return None
 
     ps = pip_size(instrument)
@@ -3039,6 +3180,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         "spread_at_entry": opp.get("spread_pips", 0),
         "session_at_entry": session_name,
         "kelly_mult":     effective_kelly_mult,
+        "risk_amount":    risk_amount,
         "news_risk_mult": risk_mult,
         "calibration_source": calibration.get("source"),
         "calibration_threshold_offset": calibration.get("threshold_offset", 0.0),
@@ -3059,7 +3201,6 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     account_currency = acct.get("currency", account_currency)
     nav_value = float(acct.get("NAV", balance) or balance or 0)
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
-    risk_amount = balance * MAX_RISK_PER_TRADE * effective_kelly_mult
     trail_text = f"{trail_pips}p" if trail_pips else "None"
     rsi_text = f"{opp.get('rsi', 0):.1f}" if opp.get("rsi") is not None else "n/a"
     vol_text = f"{opp.get('vol_ratio', 0):.2f}x" if opp.get("vol_ratio") is not None else "n/a"
@@ -3085,6 +3226,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         f"SL: {sl_price:.5f} (-{opp['sl_pips']:.1f} pips)\n"
         f"Trail: {trail_text}\n"
         f"Units: {unit_text} | Risk model: {account_currency} {risk_amount:.2f}\n"
+        f"FX sleeve: {account_currency} {budget_snapshot['fx_sleeve_balance']:.2f} | Reserved: {budget_snapshot['reserved_fx_risk']:.2f}\n"
         f"Notional: {notional_text}\n"
         f"Budget est. (margin @{LEVERAGE:.0f}x): {margin_text}\n"
         f"Effective leverage: {effective_leverage_text}\n"

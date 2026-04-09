@@ -40,7 +40,7 @@ class BacktestConfig:
     use_bid_ask_data: bool = True
     max_open_trades: int = 8
     max_correlated_trades: int = 3
-    max_risk_per_trade: float = 0.01
+    max_risk_per_trade: float = 0.015
     leverage: float = 30.0
     macro_rates_file: str = ""
     macro_momentum_file: str = ""
@@ -53,7 +53,6 @@ class BacktestConfig:
         "SCALPER",
         "TREND",
         "REVERSAL",
-        "BREAKOUT",
         "CARRY",
         "POST_NEWS",
         "PULLBACK",
@@ -64,7 +63,7 @@ class BacktestConfig:
         start = _parse_utc_datetime(env_str("BACKTEST_START", "2023-01-01T00:00:00+00:00"))
         end = _parse_utc_datetime(env_str("BACKTEST_END", "2023-03-01T00:00:00+00:00"))
         instruments = _parse_csv(env_str("BACKTEST_INSTRUMENTS", "EUR_USD,GBP_USD,USD_JPY"))
-        strategies = _parse_csv(env_str("BACKTEST_STRATEGIES", "SCALPER,TREND,REVERSAL,BREAKOUT,CARRY,POST_NEWS,PULLBACK"))
+        strategies = _parse_csv(env_str("BACKTEST_STRATEGIES", "SCALPER,TREND,REVERSAL,CARRY,POST_NEWS,PULLBACK"))
         return cls(
             start=start,
             end=end,
@@ -83,7 +82,7 @@ class BacktestConfig:
             use_bid_ask_data=env_str("BACKTEST_USE_BID_ASK_DATA", "true").lower() == "true",
             max_open_trades=env_int("BACKTEST_MAX_OPEN_TRADES", env_int("MAX_OPEN_TRADES", 8)),
             max_correlated_trades=env_int("BACKTEST_MAX_CORRELATED_TRADES", env_int("MAX_CORRELATED_TRADES", 3)),
-            max_risk_per_trade=env_float("BACKTEST_MAX_RISK_PER_TRADE", env_float("MAX_RISK_PER_TRADE", 0.01)),
+            max_risk_per_trade=env_float("BACKTEST_MAX_RISK_PER_TRADE", env_float("MAX_RISK_PER_TRADE", 0.015)),
             leverage=env_float("BACKTEST_LEVERAGE", env_float("LEVERAGE", 30.0)),
             macro_rates_file=env_str("BACKTEST_MACRO_RATES_FILE", ""),
             macro_momentum_file=env_str("BACKTEST_MACRO_MOMENTUM_FILE", ""),
@@ -117,8 +116,8 @@ class BacktestConfig:
             "TREND_SL_ATR_MULT": env_float("TREND_SL_ATR_MULT", 2.0),
             "TREND_PARTIAL_TP_ATR": env_float("TREND_PARTIAL_TP_ATR", 2.0),
             "TREND_TRAIL_PIPS": env_float("TREND_TRAIL_PIPS", 15.0),
-            "TREND_TRAIL_ATR_MULT": env_float("TREND_TRAIL_ATR_MULT", 1.5),
-            "TREND_BREAKEVEN_ATR_MULT": env_float("TREND_BREAKEVEN_ATR_MULT", 1.0),
+            "TREND_TRAIL_ATR_MULT": env_float("TREND_TRAIL_ATR_MULT", 1.3),
+            "TREND_BREAKEVEN_ATR_MULT": env_float("TREND_BREAKEVEN_ATR_MULT", 0.8),
             "TREND_MAX_HOURS": env_int("TREND_MAX_HOURS", 72),
             "TREND_PARTIAL_TP_PCT": env_float("TREND_PARTIAL_TP_PCT", 0.5),
             "TREND_COOLDOWN_HOURS": env_float("TREND_COOLDOWN_HOURS", 6.0),
@@ -183,8 +182,8 @@ class BacktestConfig:
             "NY_CLOSE_UTC": env_int("NY_CLOSE_UTC", 21),
             "KELLY_MULT_HIGH_CONF": env_float("KELLY_MULT_HIGH_CONF", 2.5),
             "KELLY_MULT_STANDARD": env_float("KELLY_MULT_STANDARD", 1.8),
-            "KELLY_MULT_SOLID": env_float("KELLY_MULT_SOLID", 1.2),
-            "KELLY_MULT_MARGINAL": env_float("KELLY_MULT_MARGINAL", 0.8),
+            "KELLY_MULT_SOLID": env_float("KELLY_MULT_SOLID", 1.3),
+            "KELLY_MULT_MARGINAL": env_float("KELLY_MULT_MARGINAL", 1.0),
         }
         return settings
 

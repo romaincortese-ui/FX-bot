@@ -17,6 +17,8 @@ The monolithic bot logic in `main.py` was partially decomposed into a shared pac
 
 The live bot still uses `main.py` as the orchestrator, but its core reusable logic now lives outside the runtime loop and can be tested independently.
 
+The FX bot is intended to share the same OANDA account with Gold-bot using a fixed account-level sleeve split: `50% FX / 50% Gold` by default. FX now publishes its reserved risk into the shared budget state and also sizes new FX entries against only the FX sleeve instead of full account NAV.
+
 ## Current structure
 
 - `main.py`: live OANDA FX bot runtime
@@ -109,6 +111,8 @@ If you want the backtest to fetch historical candles from OANDA locally, add `OA
 
 Useful environment variables:
 
+- `FX_BUDGET_ALLOCATION`, `GOLD_BUDGET_ALLOCATION`
+- `FX_SHARED_BUDGET_FILE`, `FX_SHARED_BUDGET_KEY`
 - `OANDA_API_KEY`, `OANDA_API_URL`
 - `REDIS_URL`, `REDIS_MACRO_STATE_KEY`, `REDIS_TRADE_CALIBRATION_KEY`
 - `REDIS_BOT_STATUS_KEY`, `REDIS_MACRO_STATUS_KEY`, `REDIS_CALIBRATION_STATUS_KEY`

@@ -63,6 +63,8 @@ def env_csv(name: str, default: str) -> list[str]:
 class MainRuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    fx_budget_allocation: float = Field(alias="FX_BUDGET_ALLOCATION", ge=0.0, le=1.0)
+    gold_budget_allocation: float = Field(alias="GOLD_BUDGET_ALLOCATION", ge=0.0, le=1.0)
     scalper_allocation_pct: float = Field(alias="SCALPER_ALLOCATION_PCT", ge=0.0, le=1.0)
     trend_allocation_pct: float = Field(alias="TREND_ALLOCATION_PCT", ge=0.0, le=1.0)
     reversal_allocation_pct: float = Field(alias="REVERSAL_ALLOCATION_PCT", ge=0.0, le=1.0)
@@ -85,6 +87,9 @@ class MainRuntimeConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_allocations(self) -> "MainRuntimeConfig":
+        sleeve_total = self.fx_budget_allocation + self.gold_budget_allocation
+        if abs(sleeve_total - 1.0) > 0.01:
+            raise ValueError(f"FX_BUDGET_ALLOCATION and GOLD_BUDGET_ALLOCATION must sum to 1.0, got {sleeve_total:.4f}")
         total = (
             self.scalper_allocation_pct
             + self.trend_allocation_pct
