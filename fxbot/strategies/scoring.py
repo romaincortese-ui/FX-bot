@@ -338,11 +338,19 @@ def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
     if selection_score < eff_threshold:
         ctx.reject("TREND", instrument, f"score {selection_score:.0f} < {eff_threshold:.0f}")
         return None
+    # --- Entry signal label (informational) ---
+    if crossover_recent and is_pullback:
+        entry_signal = "TREND_CONFLUENCE"
+    elif crossover_recent:
+        entry_signal = "TREND_CROSSOVER"
+    else:
+        entry_signal = "TREND_PULLBACK"
     tp_pips = max(15, price_to_pips(instrument, atr * settings["TREND_TP_ATR_MULT"]))
     sl_pips = max(8, price_to_pips(instrument, atr * settings["TREND_SL_ATR_MULT"]))
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     partial_tp_pips = max(10, price_to_pips(instrument, atr * settings["TREND_PARTIAL_TP_ATR"]))
-    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "partial_tp_pips": round(partial_tp_pips, 1), "trail_pips": settings["TREND_TRAIL_PIPS"], "entry_signal": "TREND_ALIGNED", "ema50_gap_4h": round(ema50_gap_4h * 100, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
+    pullback_depth = pullback_dist / atr if atr > 0 else 0
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi_1h, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "partial_tp_pips": round(partial_tp_pips, 1), "trail_pips": settings["TREND_TRAIL_PIPS"], "entry_signal": entry_signal, "ema50_gap_4h": round(ema50_gap_4h * 100, 2), "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"], "pullback_depth": round(pullback_depth, 3), "crossed_now": crossover_recent}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:

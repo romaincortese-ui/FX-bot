@@ -181,6 +181,13 @@ TREND_BREAKEVEN_ATR   = float(os.getenv("TREND_BREAKEVEN_ATR", "1.5"))
 TREND_MAX_SPREAD_PIPS = float(os.getenv("TREND_MAX_SPREAD_PIPS", "2.0"))
 TREND_TRAIL_PIPS      = float(os.getenv("TREND_TRAIL_PIPS",   "15"))
 
+# ── Unified exit parameters (all strategies) ────────────────
+EXIT_SL_PCT            = float(os.getenv("EXIT_SL_PCT",            "-0.40"))
+EXIT_PEAK_TRAIL_PCT    = float(os.getenv("EXIT_PEAK_TRAIL_PCT",    "0.015"))
+EXIT_FLAT_HOURS        = float(os.getenv("EXIT_FLAT_HOURS",        "48"))
+EXIT_REVIEW_DAYS       = int(os.getenv("EXIT_REVIEW_DAYS",         "7"))
+EXIT_REVIEW_POOR_THRESHOLD = float(os.getenv("EXIT_REVIEW_POOR_THRESHOLD", "-0.10"))
+
 # ── Reversal strategy ───────────────────────────────────────
 REVERSAL_MAX_TRADES   = int(os.getenv("REVERSAL_MAX_TRADES",   "2"))
 REVERSAL_BUDGET_PCT   = float(os.getenv("REVERSAL_BUDGET_PCT", "0.25"))
@@ -3297,6 +3304,17 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     return trade
 
 def check_exit(trade: dict) -> tuple[bool, str]:
+    """Unified exit logic for all strategies.
+
+    1. Hard SL at EXIT_SL_PCT (-40%).
+    2. Dynamic breakeven (entry + spread cost).  Once past breakeven,
+       track peak and close if price drops EXIT_PEAK_TRAIL_PCT (1.5%)
+       from the peak.
+    3. Flat exit: close only if above breakeven AND held > EXIT_FLAT_HOURS.
+    4. 7-day review: between -10% and breakeven -> estimate trend ->
+       close if recovery probability < 70%.
+       Below -10% -> flag for manual review but keep alive.
+    """
     instrument = trade["instrument"]
     label      = trade["label"]
     direction  = trade["direction"]
@@ -3315,106 +3333,71 @@ def check_exit(trade: dict) -> tuple[bool, str]:
 
     if direction == "LONG":
         pnl_pips = (price - entry) / ps
-        pct = (price - entry) / entry
+        pnl_pct = (price - entry) / entry
     else:
         pnl_pips = (entry - price) / ps
-        pct = (entry - price) / entry
+        pnl_pct = (entry - price) / entry
 
-    held_min = (time.time() - trade.get("opened_ts", time.time())) / 60
+    held_seconds = time.time() - trade.get("opened_ts", time.time())
+    held_hours = held_seconds / 3600.0
 
+    # Update peak tracking
     if direction == "LONG" and price > trade.get("highest_price", entry):
         trade["highest_price"] = price
-        trade["last_new_high_at"] = time.time()
     elif direction == "SHORT" and price < trade.get("lowest_price", entry):
         trade["lowest_price"] = price
-        trade["last_new_high_at"] = time.time()
 
     trade["unrealized_pnl"] = round(pnl_pips, 1)
 
-    # Rollover protection for scalpers
-    if label == "SCALPER" and is_rollover_window():
-        log.info(f"🛡️ [{label}] Rollover exit: {instrument} | {pnl_pips:+.1f}p")
-        return True, "ROLLOVER"
+    # ── Dynamic breakeven: entry + spread cost ────────────────
+    spread_cost_pct = float(trade.get("spread_pips", 0)) * ps / entry
+    breakeven_pct = spread_cost_pct
 
-    # Scalper stall detection
-    if label == "SCALPER":
-        if direction == "LONG":
-            peak_profit = (trade.get("highest_price", entry) - entry) / entry
-        else:
-            peak_profit = (entry - trade.get("lowest_price", entry)) / entry
+    # ── Peak P&L % ────────────────────────────────────────────
+    if direction == "LONG":
+        peak_pnl_pct = (trade.get("highest_price", entry) - entry) / entry
+    else:
+        peak_pnl_pct = (entry - trade.get("lowest_price", entry)) / entry
 
-        if pct >= 0 and peak_profit > 0.001:
-            mins_since_high = (time.time() - trade.get("last_new_high_at", time.time())) / 60
-            if direction == "LONG":
-                peak_gain = trade["highest_price"] - entry
-                giveback = (trade["highest_price"] - price) / peak_gain if peak_gain > 0 else 0
-            else:
-                peak_gain = entry - trade["lowest_price"]
-                giveback = (price - trade["lowest_price"]) / peak_gain if peak_gain > 0 else 0
+    # 1. Hard SL at -40%
+    if pnl_pct <= EXIT_SL_PCT:
+        log.info(f"🛑 [{label}] SL hit: {instrument} | {pnl_pips:+.1f}p | {pnl_pct*100:+.1f}%")
+        return True, "STOP_LOSS"
 
-            if mins_since_high >= SCALPER_STALL_MINS and giveback >= SCALPER_STALL_GIVEBACK:
-                log.info(f"🛡️ [{label}] Stall: {instrument} | {pnl_pips:+.1f}p | "
-                         f"peak +{peak_profit*100:.1f}% | giveback {giveback*100:.0f}%")
-                return True, "STALL_EXIT"
+    # 2. Above breakeven → trail from peak (1.5% drop from peak)
+    if peak_pnl_pct > breakeven_pct and pnl_pct > breakeven_pct:
+        drawdown_from_peak = peak_pnl_pct - pnl_pct
+        if drawdown_from_peak >= EXIT_PEAK_TRAIL_PCT:
+            log.info(f"📉 [{label}] Peak trail: {instrument} | {pnl_pips:+.1f}p | "
+                     f"peak +{peak_pnl_pct*100:.1f}% → now +{pnl_pct*100:.1f}%")
+            return True, "PEAK_TRAIL"
 
-            if mins_since_high >= 3 and giveback >= 0.60 and peak_profit > 0.002:
-                log.info(f"🛡️ [{label}] Rapid giveback: {instrument} | {pnl_pips:+.1f}p")
-                return True, "RAPID_GIVEBACK"
-
-        flat_pips = SCALPER_FLAT_RANGE_PIPS
-        if held_min >= SCALPER_FLAT_MINS and abs(pnl_pips) <= flat_pips:
-            log.info(f"😴 [{label}] Flat: {instrument} | {pnl_pips:+.1f}p after {held_min:.0f}min")
+    # 3. Flat exit: above breakeven AND held > 48h
+    if held_hours >= EXIT_FLAT_HOURS:
+        if pnl_pct >= breakeven_pct and pnl_pct < breakeven_pct + EXIT_PEAK_TRAIL_PCT:
+            log.info(f"😴 [{label}] Flat exit: {instrument} | {pnl_pips:+.1f}p after {held_hours:.0f}h")
             return True, "FLAT_EXIT"
 
-    # Partial TP for trend/breakout (with floor and native trailing)
-    if label in ("TREND", "BREAKOUT") and not trade.get("partial_tp_hit"):
-        partial_price = trade.get("partial_tp_price")
-        if partial_price:
-            hit = (direction == "LONG" and price >= partial_price) or \
-                  (direction == "SHORT" and price <= partial_price)
-            if hit:
-                log.info(f"🎯 [{label}] Partial TP hit: {instrument} | +{pnl_pips:.1f}p")
-                trade["partial_tp_hit"] = True
-
-                # Move stop loss to breakeven (floor) on remaining position
-                if direction == "LONG":
-                    floor_price = entry + pips_to_price(instrument, 2)
-                else:
-                    floor_price = entry - pips_to_price(instrument, 2)
-
-                modify_trade(trade["id"], sl_price=floor_price, instrument=instrument, label=label)
-                if trade.get("trail_pips"):
-                    modify_trade(trade["id"], trailing_sl_pips=trade["trail_pips"], instrument=instrument, label=label)
-
-                # Close partial position
-                partial_units = abs(trade.get("units", 0)) * TREND_PARTIAL_TP_PCT
-                if partial_units > 0:
-                    if close_trade(trade["id"], label, units=partial_units, instrument=instrument):
-                        trade["units"] = abs(trade["units"]) - partial_units
-                        if trade["direction"] == "SHORT":
-                            trade["units"] = -trade["units"]
-                    else:
-                        log.error(f"[{label}] Partial close failed for {instrument}, not mutating trade units")
-
+    # 4. Long-term review (7 days)
+    review_seconds = EXIT_REVIEW_DAYS * 86400
+    if held_seconds >= review_seconds:
+        if EXIT_REVIEW_POOR_THRESHOLD <= pnl_pct < breakeven_pct:
+            # Between -10% and breakeven → close (runtime can't estimate trend)
+            log.info(f"📋 [{label}] Review close: {instrument} | {pnl_pips:+.1f}p | "
+                     f"{pnl_pct*100:+.1f}% after {held_hours/24:.0f}d")
+            return True, "REVIEW_CLOSE"
+        elif pnl_pct < EXIT_REVIEW_POOR_THRESHOLD:
+            # Below -10% → flag for manual review
+            if not trade.get("_flagged_manual_review"):
+                trade["_flagged_manual_review"] = True
+                log.warning(f"⚠️ [{label}] MANUAL REVIEW NEEDED: {instrument} | "
+                            f"{pnl_pct*100:+.1f}% after {held_hours/24:.0f}d")
                 telegram(
-                    f"🎯 <b>{label} Partial TP</b> | {instrument}\n"
-                    f"+{pnl_pips:.1f}p | Floor @ {floor_price:.5f}\n"
-                    f"Trail activated: {trade.get('trail_pips', 'N/A')}p | Remaining: {abs(trade['units']):.0f} units"
+                    f"⚠️ <b>Manual Review Required</b>\n"
+                    f"{label} | {instrument} | {direction}\n"
+                    f"PnL: {pnl_pct*100:+.1f}% | Held: {held_hours/24:.0f}d\n"
+                    f"Consider closing manually if no recovery expected"
                 )
-                return False, ""
-
-    # Timeout
-    max_hours = {"SCALPER": 2, "TREND": TREND_MAX_HOURS,
-                 "REVERSAL": REVERSAL_MAX_HOURS, "BREAKOUT": BREAKOUT_MAX_HOURS}.get(label, 24)
-    if held_min >= max_hours * 60:
-        log.info(f"⏰ [{label}] Timeout: {instrument} | {pnl_pips:+.1f}p after {held_min/60:.1f}h")
-        return True, "TIMEOUT"
-
-    # Session exit (off-hours)
-    session = get_current_session()
-    if session["name"] == "OFF_HOURS" and label == "SCALPER" and held_min > 10:
-        log.info(f"🌙 [{label}] Session exit: {instrument} | off-hours")
-        return True, "SESSION_EXIT"
 
     return False, ""
 

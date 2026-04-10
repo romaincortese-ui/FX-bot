@@ -184,6 +184,16 @@ class BacktestConfig:
             "KELLY_MULT_STANDARD": env_float("KELLY_MULT_STANDARD", 1.8),
             "KELLY_MULT_SOLID": env_float("KELLY_MULT_SOLID", 1.3),
             "KELLY_MULT_MARGINAL": env_float("KELLY_MULT_MARGINAL", 1.0),
+            # ── Unified exit settings (all strategies) ──
+            "EXIT_SL_PCT": env_float("EXIT_SL_PCT", -0.40),
+            "EXIT_PEAK_TRAIL_PCT": env_float("EXIT_PEAK_TRAIL_PCT", 0.015),
+            "EXIT_FLAT_HOURS": env_float("EXIT_FLAT_HOURS", 48.0),
+            "EXIT_REVIEW_DAYS": env_int("EXIT_REVIEW_DAYS", 7),
+            "EXIT_REVIEW_POOR_THRESHOLD": env_float("EXIT_REVIEW_POOR_THRESHOLD", -0.10),
+            "EXIT_REVIEW_TREND_BARS": env_int("EXIT_REVIEW_TREND_BARS", 50),
+            # ── Dynamic leverage ──
+            "LEVERAGE_MIN": env_float("LEVERAGE_MIN", 10.0),
+            "LEVERAGE_MAX": env_float("LEVERAGE_MAX", 30.0),
         }
         return settings
 

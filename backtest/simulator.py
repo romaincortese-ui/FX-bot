@@ -187,102 +187,134 @@ class TradeSimulator:
         buffer = pips_to_price(trade["instrument"], 2.0)
         trade["sl_price"] = trade["entry_price"] + buffer if trade["direction"] == "LONG" else trade["entry_price"] - buffer
 
-    def update_open_trades(self, current_time: datetime, bar_lookup: dict[str, dict[str, Any]], max_hours_map: dict[str, float], partial_tp_pct: float = 0.5, breakeven_atr_mult: float = 0.0, trail_atr_mult: float = 0.0) -> list[dict[str, Any]]:
+    def update_open_trades(self, current_time: datetime, bar_lookup: dict[str, dict[str, Any]],
+                           sl_pct: float = -0.40, peak_trail_pct: float = 0.015,
+                           flat_hours: float = 48.0, review_days: int = 7,
+                           review_poor_threshold: float = -0.10,
+                           review_trend_bars: int = 50,
+                           candle_fetch: Any = None) -> list[dict[str, Any]]:
+        """Unified exit logic for all strategies.
+
+        1. Hard SL at ``sl_pct`` of entry (default -40%).
+        2. Dynamic breakeven = entry ± spread cost.  Once broken,
+           track the peak and close if price drops ``peak_trail_pct``
+           (1.5 %) from that peak.
+        3. Flat exit: close only if above breakeven AND held > ``flat_hours``.
+        4. 7-day review: between -10 % and breakeven → estimate trend →
+           close if probability of recovery < 70 %.
+           Below -10 % → flag for manual review but keep alive.
+        """
         closed: list[dict[str, Any]] = []
+        review_seconds = review_days * 86400
+
         for trade in list(self.open_trades):
             bar = bar_lookup.get(trade["instrument"])
             if not bar or trade["entry_time"] >= current_time:
                 continue
+
             high = float(bar["high"])
             low = float(bar["low"])
             close = float(bar["close"])
-            bid_high = float(bar.get("bid_high", 0) or 0)
-            bid_low = float(bar.get("bid_low", 0) or 0)
             bid_close = float(bar.get("bid_close", 0) or 0)
-            ask_high = float(bar.get("ask_high", 0) or 0)
-            ask_low = float(bar.get("ask_low", 0) or 0)
             ask_close = float(bar.get("ask_close", 0) or 0)
             has_bid_ask = bid_close > 0 and ask_close > 0
+
+            # Mark price for this bar
+            if trade["direction"] == "LONG":
+                mark = bid_close if has_bid_ask else close
+            else:
+                mark = ask_close if has_bid_ask else close
+
             trade["highest_price"] = max(float(trade.get("highest_price", trade["entry_price"])), high)
             trade["lowest_price"] = min(float(trade.get("lowest_price", trade["entry_price"])), low)
 
-            if trade["label"] in {"TREND", "BREAKOUT"}:
-                self._apply_partial_take_profit(trade, bar, current_time, partial_tp_pct)
+            entry = trade["entry_price"]
+            held_seconds = current_time.timestamp() - trade["opened_ts"]
+            held_hours = held_seconds / 3600.0
 
-            # --- Breakeven logic (mexc-bot2 inspired) ---
-            atr_val = float(trade.get("atr") or 0)
-            if breakeven_atr_mult > 0 and atr_val > 0 and trade["label"] == "TREND" and not trade.get("breakeven_done"):
-                breakeven_target = atr_val * breakeven_atr_mult
-                if trade["direction"] == "LONG":
-                    peak_gain = float(trade.get("highest_price", trade["entry_price"])) - trade["entry_price"]
-                else:
-                    peak_gain = trade["entry_price"] - float(trade.get("lowest_price", trade["entry_price"]))
-                if peak_gain >= breakeven_target:
-                    buffer = pips_to_price(trade["instrument"], 1.0)
-                    be_price = trade["entry_price"] + buffer if trade["direction"] == "LONG" else trade["entry_price"] - buffer
-                    if trade["direction"] == "LONG":
-                        trade["sl_price"] = max(float(trade["sl_price"]), be_price)
-                    else:
-                        trade["sl_price"] = min(float(trade["sl_price"]), be_price)
-                    trade["breakeven_done"] = True
+            # ── P&L % relative to entry ───────────────────────────
+            if trade["direction"] == "LONG":
+                pnl_pct = (mark - entry) / entry
+            else:
+                pnl_pct = (entry - mark) / entry
 
-            # --- ATR-based trailing for TREND, fixed-pip trailing for others ---
-            trail_pips = trade.get("trail_pips")
-            if trail_atr_mult > 0 and atr_val > 0 and trade["label"] == "TREND":
-                trail_distance = atr_val * trail_atr_mult
-                if trade["direction"] == "LONG":
-                    candidate = float(trade.get("highest_price", close)) - trail_distance
-                    trade["sl_price"] = max(float(trade["sl_price"]), candidate)
-                else:
-                    candidate = float(trade.get("lowest_price", close)) + trail_distance
-                    trade["sl_price"] = min(float(trade["sl_price"]), candidate)
-            elif trail_pips:
-                trail_distance = pips_to_price(trade["instrument"], float(trail_pips))
-                if trade["direction"] == "LONG":
-                    trade["sl_price"] = max(float(trade["sl_price"]), float(trade.get("highest_price", close)) - trail_distance)
-                else:
-                    trade["sl_price"] = min(float(trade["sl_price"]), float(trade.get("lowest_price", close)) + trail_distance)
+            # ── Dynamic breakeven: entry + spread cost ────────────
+            spread_cost_pct = float(trade.get("spread_pips", 0)) * pip_size(trade["instrument"]) / entry
+            breakeven_pct = spread_cost_pct  # above this = profitable
+
+            # ── Track peak P&L % since entry ──────────────────────
+            if trade["direction"] == "LONG":
+                peak_pnl_pct = (float(trade["highest_price"]) - entry) / entry
+            else:
+                peak_pnl_pct = (entry - float(trade["lowest_price"])) / entry
 
             exit_reason = None
-            raw_exit_price = None
-            if trade["direction"] == "LONG":
-                trigger_low = bid_low if has_bid_ask else low
-                trigger_high = bid_high if has_bid_ask else high
-                if trigger_low <= float(trade["sl_price"]):
-                    exit_reason = "STOP_LOSS"
-                    raw_exit_price = float(trade["sl_price"])
-                elif trigger_high >= float(trade["tp_price"]):
-                    exit_reason = "TAKE_PROFIT"
-                    raw_exit_price = float(trade["tp_price"])
-            else:
-                trigger_high = ask_high if has_bid_ask else high
-                trigger_low = ask_low if has_bid_ask else low
-                if trigger_high >= float(trade["sl_price"]):
-                    exit_reason = "STOP_LOSS"
-                    raw_exit_price = float(trade["sl_price"])
-                elif trigger_low <= float(trade["tp_price"]):
-                    exit_reason = "TAKE_PROFIT"
-                    raw_exit_price = float(trade["tp_price"])
+            raw_exit_price = mark
 
-            max_hours = max_hours_map.get(trade["label"], 24.0)
-            held_hours = (current_time.timestamp() - trade["opened_ts"]) / 3600.0
-            if exit_reason is None and held_hours >= max_hours:
-                exit_reason = "TIMEOUT"
-                raw_exit_price = bid_close if has_bid_ask and trade["direction"] == "LONG" else ask_close if has_bid_ask else close
+            # 1. Hard SL at -40%
+            if pnl_pct <= sl_pct:
+                exit_reason = "STOP_LOSS"
 
-            if exit_reason is None or raw_exit_price is None:
+            # 2. Above breakeven → trail from peak
+            if exit_reason is None and peak_pnl_pct > breakeven_pct and pnl_pct > breakeven_pct:
+                # We have been above breakeven.  Check giveback from peak.
+                drawdown_from_peak = peak_pnl_pct - pnl_pct
+                if drawdown_from_peak >= peak_trail_pct:
+                    exit_reason = "PEAK_TRAIL"
+
+            # 3. Flat exit: above breakeven AND held > flat_hours
+            if exit_reason is None and held_hours >= flat_hours:
+                if pnl_pct >= breakeven_pct and pnl_pct < breakeven_pct + peak_trail_pct:
+                    exit_reason = "FLAT_EXIT"
+
+            # 4. Long-term review (7 days)
+            if exit_reason is None and held_seconds >= review_seconds:
+                if review_poor_threshold <= pnl_pct < breakeven_pct:
+                    # Between -10% and breakeven → estimate trend probability
+                    recovery_prob = self._estimate_recovery_probability(
+                        trade, bar_lookup, candle_fetch, review_trend_bars)
+                    if recovery_prob < 0.70:
+                        exit_reason = "REVIEW_CLOSE"
+                elif pnl_pct < review_poor_threshold:
+                    # Below -10% → flag but keep alive
+                    trade["_flagged_manual_review"] = True
+
+            if exit_reason is None:
                 continue
 
+            # Fill
             if has_bid_ask:
                 if trade["direction"] == "LONG":
-                    fill_price = raw_exit_price - pips_to_price(trade["instrument"], self.config.slippage_pips)
+                    fill_price = mark - pips_to_price(trade["instrument"], self.config.slippage_pips)
                 else:
-                    fill_price = raw_exit_price + pips_to_price(trade["instrument"], self.config.slippage_pips)
+                    fill_price = mark + pips_to_price(trade["instrument"], self.config.slippage_pips)
             else:
-                fill_price = self._exit_fill_price(trade["instrument"], trade["direction"], raw_exit_price, trade["spread_pips"], self.config.slippage_pips)
+                fill_price = self._exit_fill_price(trade["instrument"], trade["direction"],
+                                                   mark, trade["spread_pips"], self.config.slippage_pips)
             self.open_trades.remove(trade)
             closed.append(self._record_closed_trade(trade, current_time, fill_price, exit_reason))
         return closed
+
+    def _estimate_recovery_probability(self, trade: dict[str, Any],
+                                       bar_lookup: dict[str, dict[str, Any]],
+                                       candle_fetch: Any,
+                                       trend_bars: int) -> float:
+        """Simple trend-direction check: what fraction of recent bars
+        moved favourably?  Returns 0.0-1.0."""
+        if candle_fetch is None:
+            return 0.5  # no data → neutral, won't trigger close
+        try:
+            df = candle_fetch(trade["instrument"], "H1", trend_bars)
+        except Exception:
+            return 0.5
+        if df is None or len(df) < 10:
+            return 0.5
+        closes = df["close"].values
+        if trade["direction"] == "LONG":
+            favourable = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i - 1])
+        else:
+            favourable = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i - 1])
+        return favourable / (len(closes) - 1)
 
     def mark_equity(self, timestamp: datetime, mark_prices: dict[str, float]) -> float:
         unrealized = 0.0

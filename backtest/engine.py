@@ -268,28 +268,34 @@ class BacktestEngine:
                 marks[instrument] = float(bar["close"])
         return marks
 
+    def _compute_effective_leverage(self, regime_mult: float) -> float:
+        """Scale leverage inversely with regime multiplier.
+
+        regime_mult > 1 means volatile / uncertain → lower leverage.
+        regime_mult < 1 means stable / trending → higher leverage.
+        """
+        lev_min = float(self.settings.get("LEVERAGE_MIN", 10.0))
+        lev_max = float(self.settings.get("LEVERAGE_MAX", 30.0))
+        # regime_mult typically 0.75 .. 2.0.  Map to leverage range.
+        # 0.75 (calm + trending) → lev_max, 2.0 (volatile) → lev_min
+        t = max(0.0, min(1.0, (regime_mult - 0.75) / (2.0 - 0.75)))
+        return round(lev_max - t * (lev_max - lev_min), 2)
+
     def run(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         current = self.config.start
         step = timedelta(minutes=5) if self.config.granularity == "M5" else timedelta(minutes=15)
-        max_hours_map = {
-            "SCALPER": 2.0,
-            "TREND": float(self.settings["TREND_MAX_HOURS"]),
-            "REVERSAL": float(self.settings["REVERSAL_MAX_HOURS"]),
-            "BREAKOUT": float(self.settings["BREAKOUT_MAX_HOURS"]),
-            "CARRY": float(self.settings["CARRY_MAX_HOURS"]),
-            "ASIAN_FADE": 8.0,
-            "POST_NEWS": 6.0,
-            "PULLBACK": 24.0,
-        }
         while current <= self.config.end:
             macro_state = self.macro_replay.get_state(current)
             closed_trades = self.simulator.update_open_trades(
                 current,
                 {i: self._bar_at(i, self.config.granularity, current) for i in self.config.instruments},
-                max_hours_map,
-                partial_tp_pct=float(self.settings["TREND_PARTIAL_TP_PCT"]),
-                breakeven_atr_mult=float(self.settings.get("TREND_BREAKEVEN_ATR_MULT", 0)),
-                trail_atr_mult=float(self.settings.get("TREND_TRAIL_ATR_MULT", 0)),
+                sl_pct=float(self.settings.get("EXIT_SL_PCT", -0.40)),
+                peak_trail_pct=float(self.settings.get("EXIT_PEAK_TRAIL_PCT", 0.015)),
+                flat_hours=float(self.settings.get("EXIT_FLAT_HOURS", 48.0)),
+                review_days=int(self.settings.get("EXIT_REVIEW_DAYS", 7)),
+                review_poor_threshold=float(self.settings.get("EXIT_REVIEW_POOR_THRESHOLD", -0.10)),
+                review_trend_bars=int(self.settings.get("EXIT_REVIEW_TREND_BARS", 50)),
+                candle_fetch=lambda i, g, c, now=current: self._fetch_candles_until(i, g, c, now),
             )
             for ct in closed_trades:
                 key = (ct["label"], ct["instrument"])
@@ -360,8 +366,9 @@ class BacktestEngine:
                 if max_kelly > 0:
                     kelly_mult = min(kelly_mult, max_kelly)
                 units = self._position_units(best_opp["instrument"], float(bar["close"]), float(best_opp["sl_pips"]), self.simulator.balance, kelly_mult, "USD", current)
-                # Safety cap: never risk more than balance * leverage allows
-                max_units = abs(self.simulator.balance * self.config.leverage / float(bar["close"]))
+                # Dynamic leverage: scale with market regime
+                effective_leverage = self._compute_effective_leverage(regime_mult)
+                max_units = abs(self.simulator.balance * effective_leverage / float(bar["close"]))
                 units = min(units, max_units)
                 best_opp["kelly_mult"] = kelly_mult
                 news_active = self._is_pair_paused_by_news(macro_state, best_opp["instrument"], current)

@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 from backtest.simulator import SimulatorConfig, TradeSimulator
 
 
-def test_simulator_closes_long_trade_at_take_profit():
+def test_simulator_closes_long_trade_at_stop_loss():
+    """Trade hits -40% P&L → STOP_LOSS exit."""
     simulator = TradeSimulator(
         SimulatorConfig(
             initial_balance=10_000.0,
@@ -34,25 +35,29 @@ def test_simulator_closes_long_trade_at_take_profit():
         news_active=False,
     )
 
+    # Entry price ≈ 1.1006.  40% drop → price ≈ 0.66, but for FX we
+    # simulate a bar whose close is far below to trigger -40%.
+    entry = simulator.open_trades[0]["entry_price"]
+    crash_price = entry * 0.58  # well below -40%
     closed = simulator.update_open_trades(
         datetime(2024, 1, 1, 10, 5, tzinfo=timezone.utc),
         {
             "EUR_USD": {
-                "open": 1.1000,
-                "high": 1.1015,
-                "low": 1.0998,
-                "close": 1.1010,
+                "open": entry,
+                "high": entry,
+                "low": crash_price,
+                "close": crash_price,
             }
         },
-        max_hours_map={"SCALPER": 2.0},
     )
 
     assert len(closed) == 1
-    assert closed[0]["reason"] == "TAKE_PROFIT"
+    assert closed[0]["reason"] == "STOP_LOSS"
     assert simulator.open_trades == []
 
 
-def test_simulator_uses_bid_ask_bar_for_entry_and_exit():
+def test_simulator_uses_bid_ask_bar_for_entry_and_peak_trail():
+    """Trade enters via bid/ask, then trails from peak and closes on 1.5% drop."""
     simulator = TradeSimulator(
         SimulatorConfig(
             initial_balance=10_000.0,
@@ -88,27 +93,40 @@ def test_simulator_uses_bid_ask_bar_for_entry_and_exit():
     assert trade["entry_price"] == 1.1001
     assert trade["execution_mode"] == "bid_ask"
 
-    closed = simulator.update_open_trades(
-        datetime(2024, 1, 1, 10, 5, tzinfo=timezone.utc),
+    entry = trade["entry_price"]
+    # First bar: push price up 3% to establish a peak
+    peak = entry * 1.03
+    simulator.update_open_trades(
+        datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
         {
             "EUR_USD": {
-                "open": 1.1000,
-                "high": 1.1012,
-                "low": 1.0998,
-                "close": 1.1010,
-                "bid_high": 1.1012,
-                "bid_low": 1.1000,
-                "bid_close": 1.1011,
-                "ask_high": 1.1014,
-                "ask_low": 1.1002,
-                "ask_close": 1.1013,
+                "open": entry, "high": peak, "low": entry,
+                "close": peak,
+                "bid_high": peak, "bid_low": entry,
+                "bid_close": peak,
+                "ask_high": peak * 1.0002, "ask_low": entry * 1.0002,
+                "ask_close": peak * 1.0002,
             }
         },
-        max_hours_map={"SCALPER": 2.0},
+    )
+    # Second bar: drop 2% from peak (>1.5% trail threshold)
+    drop_price = peak * 0.98
+    closed = simulator.update_open_trades(
+        datetime(2024, 1, 1, 14, 0, tzinfo=timezone.utc),
+        {
+            "EUR_USD": {
+                "open": peak, "high": peak, "low": drop_price,
+                "close": drop_price,
+                "bid_high": peak, "bid_low": drop_price,
+                "bid_close": drop_price,
+                "ask_high": peak * 1.0002, "ask_low": drop_price * 1.0002,
+                "ask_close": drop_price * 1.0002,
+            }
+        },
     )
 
     assert len(closed) == 1
-    assert closed[0]["reason"] == "TAKE_PROFIT"
+    assert closed[0]["reason"] == "PEAK_TRAIL"
 
 
 def test_simulator_records_trade_diagnostics_and_excursions():
@@ -154,6 +172,7 @@ def test_simulator_records_trade_diagnostics_and_excursions():
     )
 
     assert trade is not None
+    # Push to flat exit: above breakeven, held > 48 hours via flat_hours=0.1
     closed = simulator.update_open_trades(
         datetime(2024, 1, 1, 10, 15, tzinfo=timezone.utc),
         {
@@ -164,11 +183,11 @@ def test_simulator_records_trade_diagnostics_and_excursions():
                 "close": 1.1014,
             }
         },
-        max_hours_map={"TREND": 0.1},
+        flat_hours=0.1,  # very short for testing
     )
 
     assert len(closed) == 1
-    assert closed[0]["reason"] == "TIMEOUT"
+    assert closed[0]["reason"] == "FLAT_EXIT"
     assert closed[0]["selection_score"] == 58.0
     assert closed[0]["effective_threshold"] == 47.0
     assert closed[0]["score_margin"] == 11.0
