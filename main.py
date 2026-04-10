@@ -11,6 +11,7 @@ import logging.handlers
 import requests
 import json
 import os
+import copy
 import redis
 import threading
 import collections
@@ -397,6 +398,7 @@ _pair_cooldowns      = {}
 _thread_local        = threading.local()
 _live_prices         = {}
 _price_lock          = threading.Lock()
+_open_trades_lock    = threading.Lock()
 _supported_currency_pairs_cache = set()
 _supported_currency_pairs_cache_at = 0.0
 _unsupported_instruments = set()
@@ -481,23 +483,12 @@ def publish_fx_shared_budget_state() -> bool:
     if REDIS_CLIENT is None and not SHARED_BUDGET_FILE:
         return False
 
-    payload = {"bots": {}}
-    try:
-        if REDIS_CLIENT is not None and SHARED_BUDGET_KEY:
-            raw = REDIS_CLIENT.get(SHARED_BUDGET_KEY)
-            if raw:
-                payload = json.loads(raw)
-        elif SHARED_BUDGET_FILE and os.path.exists(SHARED_BUDGET_FILE):
-            with open(SHARED_BUDGET_FILE, encoding="utf-8") as handle:
-                payload = json.load(handle)
-    except Exception:
-        payload = {"bots": {}}
-
-    bots = payload.setdefault("bots", {})
-    fx = bots.setdefault("fx", {"reserved_risk": 0.0, "trades": {}})
+    # Build the FX slot from current open_trades
     trades = {}
     reserved_total = 0.0
-    for trade in open_trades:
+    with _open_trades_lock:
+        snapshot = list(open_trades)
+    for trade in snapshot:
         trade_id = str(trade.get("id", "") or "")
         if not trade_id:
             continue
@@ -508,21 +499,54 @@ def publish_fx_shared_budget_state() -> bool:
             "label": trade.get("label"),
         }
         reserved_total += risk_amount
-    fx["reserved_risk"] = round(reserved_total, 2)
-    fx["trades"] = trades
-    fx["updated_at"] = datetime.now(timezone.utc).isoformat()
+    fx_slot = {
+        "reserved_risk": round(reserved_total, 2),
+        "trades": trades,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
-    try:
-        if REDIS_CLIENT is not None and SHARED_BUDGET_KEY:
-            REDIS_CLIENT.set(SHARED_BUDGET_KEY, json.dumps(payload))
-        if SHARED_BUDGET_FILE:
+    # Atomic merge via Redis WATCH/MULTI (only updates FX slot, preserves Gold)
+    if REDIS_CLIENT is not None and SHARED_BUDGET_KEY:
+        for attempt in range(3):
+            try:
+                pipe = REDIS_CLIENT.pipeline(True)
+                pipe.watch(SHARED_BUDGET_KEY)
+                raw = pipe.get(SHARED_BUDGET_KEY)
+                payload = json.loads(raw) if raw else {"bots": {}}
+                if not isinstance(payload, dict):
+                    payload = {"bots": {}}
+                bots = payload.setdefault("bots", {})
+                bots["fx"] = fx_slot
+                pipe.multi()
+                pipe.set(SHARED_BUDGET_KEY, json.dumps(payload))
+                pipe.execute()
+                break
+            except redis.WatchError:
+                log.debug("Shared budget WATCH conflict (attempt %d/3)", attempt + 1)
+                continue
+            except Exception as exc:
+                log.debug(f"Shared budget Redis publish failed: {exc}")
+                break
+
+    # Also write to file
+    if SHARED_BUDGET_FILE:
+        try:
+            payload_file = {"bots": {}}
+            if os.path.exists(SHARED_BUDGET_FILE):
+                with open(SHARED_BUDGET_FILE, encoding="utf-8") as handle:
+                    payload_file = json.load(handle)
+                    if not isinstance(payload_file, dict):
+                        payload_file = {"bots": {}}
+            payload_file.setdefault("bots", {})["fx"] = fx_slot
             os.makedirs(os.path.dirname(SHARED_BUDGET_FILE) or ".", exist_ok=True)
-            with open(SHARED_BUDGET_FILE, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2)
-        return True
-    except Exception as exc:
-        log.debug(f"Shared budget publish failed: {exc}")
-        return False
+            tmp = SHARED_BUDGET_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload_file, handle, indent=2)
+            os.replace(tmp, SHARED_BUDGET_FILE)
+        except Exception as exc:
+            log.debug(f"Shared budget file publish failed: {exc}")
+            return False
+    return True
 
 
 def _load_shared_budget_payload() -> dict:
@@ -891,8 +915,9 @@ def process_pending_close_retries() -> None:
             continue
         log.info(f"🔁 Retrying forced close for {trade['instrument']} ({trade_id})")
         if close_trade_exit(trade, "FORCED_CLOSE_RETRY"):
-            if trade in open_trades:
-                open_trades.remove(trade)
+            with _open_trades_lock:
+                if trade in open_trades:
+                    open_trades.remove(trade)
             clear_close_retry(trade_id)
         else:
             schedule_close_retry(trade, get_pair_health_reason(trade["instrument"]) or pending.get("reason", "close retry failed"))
@@ -1589,7 +1614,8 @@ def sync_open_trades_with_oanda(reason: str = "manual") -> bool:
         return False
 
     broker_trades = fetch_open_trades_from_oanda()
-    existing_by_id = {str(t.get("id")): t for t in open_trades if t.get("id")}
+    with _open_trades_lock:
+        existing_by_id = {str(t.get("id")): t for t in open_trades if t.get("id")}
     synced_trades = []
     for raw_trade in broker_trades:
         trade_id = str(raw_trade.get("id", ""))
@@ -1608,7 +1634,8 @@ def sync_open_trades_with_oanda(reason: str = "manual") -> bool:
                 break
 
     if changed:
-        open_trades = synced_trades
+        with _open_trades_lock:
+            open_trades = synced_trades
         save_state()
         log.info(f"🔄 Synced open trades from OANDA ({reason}): {len(open_trades)} open")
     return changed
@@ -2376,8 +2403,10 @@ def _handle_metrics_command():
 
 def save_state():
     try:
+        with _open_trades_lock:
+            trades_snapshot = copy.deepcopy(open_trades)
         payload = {
-            "open_trades":           open_trades,
+            "open_trades":           trades_snapshot,
             "trade_history":         trade_history[-500:],
             "consecutive_losses":    _consecutive_losses,
             "streak_paused_at":      _streak_paused_at,
@@ -2410,7 +2439,8 @@ def load_state():
         age = (datetime.now(timezone.utc) -
                datetime.fromisoformat(d.get("saved_at", "2000-01-01T00:00:00+00:00"))
                ).total_seconds()
-        open_trades         = d.get("open_trades", [])
+        with _open_trades_lock:
+            open_trades         = d.get("open_trades", [])
         trade_history       = d.get("trade_history", [])
         _consecutive_losses = d.get("consecutive_losses", 0)
         _streak_paused_at   = d.get("streak_paused_at", 0.0)
@@ -3468,8 +3498,9 @@ def close_all_open_positions(reason: str = "MANUAL_CLOSE") -> tuple[int, int]:
     failed_count = 0
     for trade in open_trades[:]:
         if close_trade_exit(trade, reason):
-            if trade in open_trades:
-                open_trades.remove(trade)
+            with _open_trades_lock:
+                if trade in open_trades:
+                    open_trades.remove(trade)
             closed_count += 1
         else:
             failed_count += 1
@@ -3784,7 +3815,8 @@ def run():
                 should_exit, reason = check_exit(trade)
                 if should_exit:
                     if close_trade_exit(trade, reason):
-                        open_trades.remove(trade)
+                        with _open_trades_lock:
+                            open_trades.remove(trade)
 
             # Entry scans
             if entries_allowed and len(open_trades) < MAX_OPEN_TRADES:
@@ -3814,7 +3846,8 @@ def run():
                                     f"{best_scalper['direction']} | RSI: {best_scalper['rsi']:.0f}")
                         trade = open_trade_entry(best_scalper, "SCALPER", balance)
                         if trade:
-                            open_trades.append(trade)
+                            with _open_trades_lock:
+                                open_trades.append(trade)
                         else:
                             reason = get_strategy_entry_block_reason("SCALPER", best_scalper["instrument"], best_scalper["direction"], opp=best_scalper, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("SCALPER", best_scalper["instrument"], reason, "🚫")
@@ -3830,7 +3863,8 @@ def run():
                                     f"Score: {best_trend['score']:.0f} | {best_trend['direction']}")
                         trade = open_trade_entry(best_trend, "TREND", balance)
                         if trade:
-                            open_trades.append(trade)
+                            with _open_trades_lock:
+                                open_trades.append(trade)
                         else:
                             reason = get_strategy_entry_block_reason("TREND", best_trend["instrument"], best_trend["direction"], opp=best_trend, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("TREND", best_trend["instrument"], reason, "🚫")
@@ -3846,7 +3880,8 @@ def run():
                                     f"Score: {best_reversal['score']:.0f} | {best_reversal['direction']}")
                         trade = open_trade_entry(best_reversal, "REVERSAL", balance)
                         if trade:
-                            open_trades.append(trade)
+                            with _open_trades_lock:
+                                open_trades.append(trade)
                         else:
                             reason = get_strategy_entry_block_reason("REVERSAL", best_reversal["instrument"], best_reversal["direction"], opp=best_reversal, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("REVERSAL", best_reversal["instrument"], reason, "🚫")
@@ -3862,7 +3897,8 @@ def run():
                                     f"Score: {best_breakout['score']:.0f} | {best_breakout['direction']}")
                         trade = open_trade_entry(best_breakout, "BREAKOUT", balance)
                         if trade:
-                            open_trades.append(trade)
+                            with _open_trades_lock:
+                                open_trades.append(trade)
                         else:
                             reason = get_strategy_entry_block_reason("BREAKOUT", best_breakout["instrument"], best_breakout["direction"], opp=best_breakout, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("BREAKOUT", best_breakout["instrument"], reason, "🚫")
@@ -3880,7 +3916,8 @@ def run():
                                     f"Score: {best_carry['score']:.0f} | {best_carry['direction']}")
                         trade = open_trade_entry(best_carry, "CARRY", balance)
                         if trade:
-                            open_trades.append(trade)
+                            with _open_trades_lock:
+                                open_trades.append(trade)
                         else:
                             reason = get_strategy_entry_block_reason("CARRY", best_carry["instrument"], best_carry["direction"], opp=best_carry, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("CARRY", best_carry["instrument"], reason, "🚫")
@@ -3897,7 +3934,8 @@ def run():
                                     f"Score: {best_asian['score']:.0f} | {best_asian['direction']}")
                         trade = open_trade_entry(best_asian, "ASIAN_FADE", balance)
                         if trade:
-                            open_trades.append(trade)
+                            with _open_trades_lock:
+                                open_trades.append(trade)
                         else:
                             reason = get_strategy_entry_block_reason("ASIAN_FADE", best_asian["instrument"], best_asian["direction"], opp=best_asian, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("ASIAN", best_asian["instrument"], reason, "🚫")
@@ -3914,7 +3952,8 @@ def run():
                                     f"Score: {best_pn['score']:.0f} | {best_pn['direction']}")
                         trade = open_trade_entry(best_pn, "POST_NEWS", balance)
                         if trade:
-                            open_trades.append(trade)
+                            with _open_trades_lock:
+                                open_trades.append(trade)
                         else:
                             reason = get_strategy_entry_block_reason("POST_NEWS", best_pn["instrument"], best_pn["direction"], opp=best_pn, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("POST_NEWS", best_pn["instrument"], reason, "🚫")
@@ -3931,7 +3970,8 @@ def run():
                                     f"Score: {best_pb['score']:.0f} | {best_pb['direction']}")
                         trade = open_trade_entry(best_pb, "PULLBACK", balance)
                         if trade:
-                            open_trades.append(trade)
+                            with _open_trades_lock:
+                                open_trades.append(trade)
                         else:
                             reason = get_strategy_entry_block_reason("PULLBACK", best_pb["instrument"], best_pb["direction"], opp=best_pb, session_name=session["name"]) or "entry blocked"
                             record_scan_decision("PULLBACK", best_pb["instrument"], reason, "🚫")
