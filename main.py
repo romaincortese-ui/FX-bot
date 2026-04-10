@@ -2136,7 +2136,7 @@ def poll_telegram_commands():
                 _paused = False
                 save_state()
                 telegram("▶️ <b>Bot resumed.</b> Entries enabled.")
-            elif text == "/close":
+            elif text == "/close" or text == "/closeall":
                 closed_count, failed_count = close_all_open_positions(reason="MANUAL_CLOSE")
                 if closed_count == 0 and failed_count == 0:
                     telegram("📭 <b>No open positions.</b>")
@@ -2162,7 +2162,7 @@ def poll_telegram_commands():
                     "/status — Open trades & account\n"
                     "/metrics — Win rate, PF, Sharpe\n"
                     "/session — Current trading session\n"
-                    "/close — Close all open positions\n"
+                    "/close / /closeall — Close all open positions\n"
                     "/pause — Stop new entries\n"
                     "/resume — Resume entries\n"
                     "/help — This message"
