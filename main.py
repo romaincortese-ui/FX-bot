@@ -942,9 +942,12 @@ def _extract_invalid_instrument_from_http_error(exc: requests.HTTPError) -> str:
     return _extract_invalid_instrument_text(detail)
 
 
-def _fetch_pricing_chunk(chunk: list[str]) -> list[dict]:
+def _fetch_pricing_chunk(chunk: list[str], _depth: int = 0) -> list[dict]:
     cleaned_chunk = filter_supported_pairs(chunk, "pricing request")
     if not cleaned_chunk:
+        return []
+    if _depth > 10:
+        log.warning("_fetch_pricing_chunk recursion limit reached, skipping chunk")
         return []
 
     try:
@@ -962,14 +965,14 @@ def _fetch_pricing_chunk(chunk: list[str]) -> list[dict]:
         invalid = _extract_invalid_instrument_from_http_error(exc)
         if invalid and invalid in cleaned_chunk:
             _mark_unsupported_instrument(invalid, "pricing endpoint rejected instrument")
-            return _fetch_pricing_chunk([pair for pair in cleaned_chunk if pair != invalid])
+            return _fetch_pricing_chunk([pair for pair in cleaned_chunk if pair != invalid], _depth + 1)
 
         if len(cleaned_chunk) == 1:
             _mark_unsupported_instrument(cleaned_chunk[0], "pricing request failed")
             return []
 
         midpoint = len(cleaned_chunk) // 2
-        return _fetch_pricing_chunk(cleaned_chunk[:midpoint]) + _fetch_pricing_chunk(cleaned_chunk[midpoint:])
+        return _fetch_pricing_chunk(cleaned_chunk[:midpoint], _depth + 1) + _fetch_pricing_chunk(cleaned_chunk[midpoint:], _depth + 1)
 
 def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: float = MAX_SPREAD_FILTER_PIPS) -> list:
     """Fetch all currency pairs, filter by spread, rank by ATR%, return top N."""
@@ -1793,7 +1796,7 @@ def calculate_units_for_risk_amount(instrument: str, risk_amount: float, sl_pips
         sl_pips = 10
     if ACCOUNT_TYPE == "spread_bet" and not uses_oanda_native_units():
         stake = risk_amount / sl_pips
-        return max(SPREAD_BET_MIN_STAKE, round(stake, 2))
+        return max(SPREAD_BET_MIN_STAKE, math.floor(stake * 100) / 100)  # round DOWN to never exceed intended risk
     else:
         currency = account_currency or get_account_currency()
         pip_value_per_unit = pip_value(instrument, 1.0, currency)
@@ -2960,7 +2963,7 @@ def compute_market_regime(df: pd.DataFrame) -> float:
         elif _vix_level < VIX_LOW_THRESHOLD:
             vix_regime = 0.75
     dxy_regime = 1.20 if abs(_dxy_ema_gap or 0.0) > DXY_REGIME_THRESHOLD else 1.0
-    mult = regime_atr_mult * vix_regime * dxy_regime
+    mult = max(0.5, min(1.5, regime_atr_mult * vix_regime * dxy_regime))  # cap regime multiplier
     return round(mult, 3)
 
 
@@ -3356,10 +3359,12 @@ def check_exit(trade: dict) -> tuple[bool, str]:
                 # Close partial position
                 partial_units = abs(trade.get("units", 0)) * TREND_PARTIAL_TP_PCT
                 if partial_units > 0:
-                    close_trade(trade["id"], label, units=partial_units, instrument=instrument)
-                    trade["units"] = abs(trade["units"]) - partial_units
-                    if trade["direction"] == "SHORT":
-                        trade["units"] = -trade["units"]
+                    if close_trade(trade["id"], label, units=partial_units, instrument=instrument):
+                        trade["units"] = abs(trade["units"]) - partial_units
+                        if trade["direction"] == "SHORT":
+                            trade["units"] = -trade["units"]
+                    else:
+                        log.error(f"[{label}] Partial close failed for {instrument}, not mutating trade units")
 
                 telegram(
                     f"🎯 <b>{label} Partial TP</b> | {instrument}\n"
