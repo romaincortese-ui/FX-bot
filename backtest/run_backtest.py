@@ -47,8 +47,8 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
     calibration = build_trade_calibration(trades)
     export_backtest_artifacts(config.output_dir, equity_curve, trades, report)
     publish_trade_calibration(
-        env_str("REDIS_URL", ""),
-        env_str("REDIS_TRADE_CALIBRATION_KEY", "trade_calibration"),
+        env_str("REDIS_URL", "").strip(),
+        env_str("REDIS_TRADE_CALIBRATION_KEY", "trade_calibration").strip(),
         calibration,
     )
     return report

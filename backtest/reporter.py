@@ -105,11 +105,34 @@ def build_trade_calibration(trades: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def publish_trade_calibration(redis_url: str, redis_key: str, calibration: dict[str, Any]) -> bool:
-    if not redis_url or not redis_key or redis is None:
+    import logging
+    import os
+    import time
+    log = logging.getLogger(__name__)
+    if not redis_key or redis is None:
         return False
-    client = redis.from_url(redis_url)
-    client.set(redis_key, json.dumps(calibration))
-    return True
+    urls_to_try = []
+    for url in (redis_url, os.getenv("REDIS_PUBLIC_URL", "").strip()):
+        if url and url not in urls_to_try:
+            urls_to_try.append(url)
+    if not urls_to_try:
+        log.warning("No Redis URL available – skipping calibration publish")
+        return False
+    for url in urls_to_try:
+        for attempt in range(1, 4):
+            try:
+                client = redis.from_url(url, socket_connect_timeout=5, socket_timeout=5)
+                client.set(redis_key, json.dumps(calibration))
+                host = url.split("@")[-1] if "@" in url else url.split("//")[-1]
+                log.info("Published calibration to Redis key %s via %s", redis_key, host)
+                return True
+            except Exception as exc:
+                host = url.split("@")[-1] if "@" in url else url.split("//")[-1]
+                log.warning("Redis publish attempt %d/3 failed (%s): %s", attempt, host, exc)
+                if attempt < 3:
+                    time.sleep(2.0 * attempt)
+    log.warning("All Redis publish attempts failed – calibration written to file only")
+    return False
 
 
 def export_backtest_artifacts(output_dir: str, equity_curve: list[dict[str, Any]], trades: list[dict[str, Any]], report: dict[str, Any]) -> None:

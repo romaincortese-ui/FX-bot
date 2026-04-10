@@ -446,6 +446,7 @@ def publish_bot_runtime_status(state: str, balance: float | None = None, error: 
         telegram_enabled=telegram_enabled(),
         macro_state_key=REDIS_MACRO_STATE_KEY,
         calibration_key=REDIS_TRADE_CALIBRATION_KEY,
+        calibration=_calibration_summary(),
         last_scan_cycle_at=_last_scan_cycle_at or None,
         scan_pool_mode=_last_scan_pool_status.get("mode", "primary"),
         market_regime_mult=round(float(_market_regime_mult), 4),
@@ -2450,6 +2451,28 @@ def _count_calibration_trades(data: dict) -> int:
     return 0
 
 
+def _calibration_summary() -> dict:
+    """Build a compact calibration summary for status payloads and heartbeat."""
+    if not trade_calibration:
+        return {"active": False}
+    by_strategy = trade_calibration.get("by_strategy", {})
+    return {
+        "active": True,
+        "generated_at": trade_calibration.get("generated_at"),
+        "total_trades": _count_calibration_trades(trade_calibration),
+        "pair_entries": _count_calibration_pairs(trade_calibration),
+        "strategies": {
+            name: {
+                "trades": int(stats.get("trades", 0) or 0),
+                "win_rate": float(stats.get("win_rate", 0) or 0),
+                "profit_factor": float(stats.get("profit_factor", 0) or 0),
+            }
+            for name, stats in by_strategy.items()
+            if isinstance(stats, dict)
+        },
+    }
+
+
 def _parse_iso_utc(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -3507,6 +3530,12 @@ def send_heartbeat(balance: float, status: str = "running"):
         dir_e = "⬆️" if t["direction"] == "LONG" else "⬇️"
         open_str += f"\n  {dir_e} {t['instrument']} {t['label']} | {t.get('unrealized_pnl', 0):+.1f}p"
     ccy = get_account_currency()
+    cal = _calibration_summary()
+    if cal.get("active"):
+        cal_parts = [f"{cal.get('total_trades', 0)} trades", f"{cal.get('pair_entries', 0)} pairs"]
+        cal_text = " | ".join(cal_parts)
+    else:
+        cal_text = "none loaded"
     telegram(
         f"💓 <b>Heartbeat</b>\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -3517,6 +3546,7 @@ def send_heartbeat(balance: float, status: str = "running"):
         f"DXY gap: {f'{_dxy_ema_gap*100:+.2f}%' if _dxy_ema_gap is not None else 'unknown'} | "
         f"VIX: {f'{_vix_level:.1f}' if _vix_level is not None else 'unknown'}\n"
         f"News-paused pairs: {paused_summary}\n"
+        f"📊 Calibration: {cal_text}\n"
         f"Today: {len([t for t in trade_history if t.get('closed_at', '').startswith(datetime.now(timezone.utc).strftime('%Y-%m-%d'))])} trades"
     )
 
