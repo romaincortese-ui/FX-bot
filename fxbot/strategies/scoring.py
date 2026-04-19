@@ -190,6 +190,20 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
         score *= 0.5
     elif direction == "LONG" and not (crossed_now or crossed_recent):
         score *= 0.5
+    # H1 trend alignment gate: pro scalpers only take the M5 cross in the
+    # direction of the H1 trend. Counter-trend scalps during strong
+    # H1 momentum get chopped up by retracements.
+    if settings.get("SCALPER_REQUIRE_H1_ALIGNMENT", True) and df_1h is not None and len(df_1h) >= 50:
+        close_1h = df_1h["close"]
+        ema20_1h = calc_ema(close_1h, 20)
+        ema50_1h = calc_ema(close_1h, 50)
+        h1_bullish = float(ema20_1h.iloc[-1]) > float(ema50_1h.iloc[-1])
+        if direction == "LONG" and not h1_bullish:
+            ctx.reject("SCALPER", instrument, "H1 trend not aligned (long vs H1 down)")
+            return None
+        if direction == "SHORT" and h1_bullish:
+            ctx.reject("SCALPER", instrument, "H1 trend not aligned (short vs H1 up)")
+            return None
     macro_ok, bias = _apply_directional_macro_gate("SCALPER", instrument, direction, ctx)
     if not macro_ok:
         return None
@@ -698,7 +712,8 @@ def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     ema50_4h = calc_ema(close_4h, 50)
     bullish_4h = float(ema20_4h.iloc[-1]) > float(ema50_4h.iloc[-1])
     ema50_gap = abs(float(close_4h.iloc[-1]) / float(ema50_4h.iloc[-1]) - 1)
-    if ema50_gap < 0.002:
+    min_trend_gap = float(settings.get("PULLBACK_MIN_4H_TREND_GAP", 0.002))
+    if ema50_gap < min_trend_gap:
         ctx.reject("PULLBACK", instrument, "4H trend too weak")
         return None
     direction = "LONG" if bullish_4h else "SHORT"

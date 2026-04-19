@@ -96,7 +96,7 @@ class BacktestConfig:
 
     def strategy_settings(self) -> dict[str, Any]:
         settings: dict[str, Any] = {
-            "SCALPER_MAX_SPREAD_PIPS": env_float("SCALPER_MAX_SPREAD_PIPS", 1.2),
+            "SCALPER_MAX_SPREAD_PIPS": env_float("SCALPER_MAX_SPREAD_PIPS", 1.5),
             "SCALPER_MAX_RSI": env_int("SCALPER_MAX_RSI", 70),
             "SCALPER_MIN_RSI": env_int("SCALPER_MIN_RSI", 30),
             "SCALPER_CONFLUENCE_BONUS": env_float("SCALPER_CONFLUENCE_BONUS", 15.0),
@@ -110,6 +110,7 @@ class BacktestConfig:
             "SCALPER_TRAIL_PIPS": env_float("SCALPER_TRAIL_PIPS", 10.0),
             "SCALPER_COOLDOWN_HOURS": env_float("SCALPER_COOLDOWN_HOURS", 2.0),
             "SCALPER_MAX_KELLY": env_float("SCALPER_MAX_KELLY", 1.0),
+            "SCALPER_REQUIRE_H1_ALIGNMENT": env_str("SCALPER_REQUIRE_H1_ALIGNMENT", "true").lower() == "true",
             "TREND_MAX_SPREAD_PIPS": env_float("TREND_MAX_SPREAD_PIPS", 2.0),
             "TREND_THRESHOLD": env_int("TREND_THRESHOLD", 65),
             "TREND_TP_ATR_MULT": env_float("TREND_TP_ATR_MULT", 3.5),
@@ -159,6 +160,7 @@ class BacktestConfig:
             "POST_NEWS_WINDOW_MINS": env_int("POST_NEWS_WINDOW_MINS", 15),
             "PULLBACK_MAX_SPREAD_PIPS": env_float("PULLBACK_MAX_SPREAD_PIPS", 2.5),
             "PULLBACK_THRESHOLD": env_int("PULLBACK_THRESHOLD", 37),
+            "PULLBACK_MIN_4H_TREND_GAP": env_float("PULLBACK_MIN_4H_TREND_GAP", 0.0012),
             "PULLBACK_TP_ATR_MULT": env_float("PULLBACK_TP_ATR_MULT", 2.5),
             "PULLBACK_SL_ATR_MULT": env_float("PULLBACK_SL_ATR_MULT", 1.2),
             "PULLBACK_TRAIL_PIPS": env_float("PULLBACK_TRAIL_PIPS", 10.0),
@@ -185,7 +187,6 @@ class BacktestConfig:
             "KELLY_MULT_SOLID": env_float("KELLY_MULT_SOLID", 1.3),
             "KELLY_MULT_MARGINAL": env_float("KELLY_MULT_MARGINAL", 1.0),
             # ── Unified exit settings (all strategies) ──
-            "EXIT_SL_PCT": env_float("EXIT_SL_PCT", -0.40),
             "EXIT_PEAK_TRAIL_PCT": env_float("EXIT_PEAK_TRAIL_PCT", 0.015),
             "EXIT_FLAT_HOURS": env_float("EXIT_FLAT_HOURS", 48.0),
             "EXIT_REVIEW_DAYS": env_int("EXIT_REVIEW_DAYS", 7),
