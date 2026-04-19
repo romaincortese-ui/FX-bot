@@ -104,9 +104,10 @@ STATIC_ALL_PAIRS = STATIC_CORE_PAIRS + STATIC_EXTENDED_PAIRS
 # ── Dynamic watchlist settings ────────────────────────────────
 DYNAMIC_PAIRS = []                 # will be filled at runtime
 LAST_WATCHLIST_UPDATE = 0
-WATCHLIST_UPDATE_INTERVAL = int(os.getenv("WATCHLIST_UPDATE_INTERVAL", "14400"))  # 4 hours
+WATCHLIST_UPDATE_INTERVAL = int(os.getenv("WATCHLIST_UPDATE_INTERVAL", "3600"))  # 1 hour (was 4h; off-hours spread snapshots stale too long)
 MAX_WATCHLIST_SIZE = int(os.getenv("MAX_WATCHLIST_SIZE", "8"))
-MAX_SPREAD_FILTER_PIPS = float(os.getenv("MAX_SPREAD_FILTER_PIPS", "1.5"))
+MAX_SPREAD_FILTER_PIPS = float(os.getenv("MAX_SPREAD_FILTER_PIPS", "2.5"))  # raised from 1.5 — practice spreads widen off-hours
+ALWAYS_INCLUDE_CORE_PAIRS = os.getenv("ALWAYS_INCLUDE_CORE_PAIRS", "true").strip().lower() in {"1", "true", "yes", "on"}
 SUPPORTED_PAIR_CACHE_SECS = int(os.getenv("SUPPORTED_PAIR_CACHE_SECS", "21600"))
 NEWS_WINDOW_RISK_MULT = float(os.getenv("NEWS_WINDOW_RISK_MULT", "0.5"))
 DXY_REGIME_THRESHOLD = float(os.getenv("DXY_REGIME_THRESHOLD", "0.008"))
@@ -1048,6 +1049,15 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
 
         log.info(f"📊 {len(spread_ok)} pairs passed spread filter. Ranking by volatility...")
 
+        # Guard-rail: if the spread filter captured fewer than 3 pairs (typical of off-hours
+        # snapshots or a widened DXY regime), seed the ranking pool with STATIC_CORE_PAIRS so
+        # the bot cannot end up trading only exotics. Per-trade spread checks still apply.
+        if ALWAYS_INCLUDE_CORE_PAIRS and len(spread_ok) < 3:
+            for pair in STATIC_CORE_PAIRS:
+                if pair not in spread_ok and is_pair_tradeable(pair):
+                    spread_ok.append(pair)
+            log.info(f"📊 Seeded spread_ok with STATIC_CORE_PAIRS -> {len(spread_ok)} pairs for volatility ranking")
+
         # Rank by ATR%
         pair_volatility = {}
         for pair in spread_ok:
@@ -1062,6 +1072,13 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
 
         sorted_pairs = sorted(pair_volatility.items(), key=lambda x: x[1], reverse=True)
         top_pairs = [p for p, _ in sorted_pairs[:top_n]]
+        # Always retain STATIC_CORE_PAIRS even if their current spread snapshot was wide.
+        # Per-trade SCALPER/TREND_MAX_SPREAD_PIPS checks still gate entries live.
+        if ALWAYS_INCLUDE_CORE_PAIRS:
+            core_to_add = [p for p in STATIC_CORE_PAIRS if p not in top_pairs and is_pair_tradeable(p)]
+            if core_to_add:
+                top_pairs = top_pairs + core_to_add
+                log.info(f"🔄 Union with STATIC_CORE_PAIRS added: {core_to_add}")
         log.info(f"🔄 Dynamic watchlist built: {top_pairs}")
         return filter_supported_pairs(top_pairs, "dynamic watchlist") or top_pairs
 
