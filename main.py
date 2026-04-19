@@ -108,6 +108,12 @@ WATCHLIST_UPDATE_INTERVAL = int(os.getenv("WATCHLIST_UPDATE_INTERVAL", "3600")) 
 MAX_WATCHLIST_SIZE = int(os.getenv("MAX_WATCHLIST_SIZE", "8"))
 MAX_SPREAD_FILTER_PIPS = float(os.getenv("MAX_SPREAD_FILTER_PIPS", "2.5"))  # raised from 1.5 — practice spreads widen off-hours
 ALWAYS_INCLUDE_CORE_PAIRS = os.getenv("ALWAYS_INCLUDE_CORE_PAIRS", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Restrict the dynamic watchlist universe to the operator's configured pair list
+# (STATIC_ALL_PAIRS). Without this, the 68-pair OANDA scan can surface exotics
+# like HKD_JPY or TRY_JPY on weekends when majors' spreads temporarily widen --
+# they pass the spread filter on stale quotes and end up ranked above G10 crosses.
+# Set to false to opt into the full OANDA universe for scanning.
+WATCHLIST_ALLOWLIST_ONLY = os.getenv("WATCHLIST_ALLOWLIST_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"}
 SUPPORTED_PAIR_CACHE_SECS = int(os.getenv("SUPPORTED_PAIR_CACHE_SECS", "21600"))
 NEWS_WINDOW_RISK_MULT = float(os.getenv("NEWS_WINDOW_RISK_MULT", "0.5"))
 DXY_REGIME_THRESHOLD = float(os.getenv("DXY_REGIME_THRESHOLD", "0.008"))
@@ -183,7 +189,6 @@ TREND_MAX_SPREAD_PIPS = float(os.getenv("TREND_MAX_SPREAD_PIPS", "2.0"))
 TREND_TRAIL_PIPS      = float(os.getenv("TREND_TRAIL_PIPS",   "15"))
 
 # ── Unified exit parameters (all strategies) ────────────────
-EXIT_SL_PCT            = float(os.getenv("EXIT_SL_PCT",            "-0.40"))
 EXIT_PEAK_TRAIL_PCT    = float(os.getenv("EXIT_PEAK_TRAIL_PCT",    "0.015"))
 EXIT_FLAT_HOURS        = float(os.getenv("EXIT_FLAT_HOURS",        "48"))
 EXIT_REVIEW_DAYS       = int(os.getenv("EXIT_REVIEW_DAYS",         "7"))
@@ -1020,6 +1025,17 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
             return filter_supported_pairs(STATIC_ALL_PAIRS, "static watchlist") or STATIC_ALL_PAIRS
 
         log.info(f"📊 Found {len(fx_pairs)} currency pairs. Checking spreads...")
+
+        # Restrict the scan universe to the operator's configured allowlist so exotics
+        # (HKD_JPY, TRY_JPY, etc.) can't sneak in via a lucky weekend spread snapshot.
+        if WATCHLIST_ALLOWLIST_ONLY:
+            allowlist = {p for p in STATIC_ALL_PAIRS}
+            filtered = [p for p in fx_pairs if p in allowlist]
+            if filtered:
+                log.info(f"📊 Allowlist filter kept {len(filtered)}/{len(fx_pairs)} pairs: {filtered}")
+                fx_pairs = filtered
+            else:
+                log.warning("Allowlist filter left 0 pairs; falling back to full OANDA scan.")
 
         # Filter by spread
         chunk_size = 40
@@ -3323,7 +3339,8 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
 def check_exit(trade: dict) -> tuple[bool, str]:
     """Unified exit logic for all strategies.
 
-    1. Hard SL at EXIT_SL_PCT (-40%).
+    1. Dynamic SL derived from the trade's own sl_pips (set by the
+       strategy scorer at entry).  Aligns position sizing with exit stop.
     2. Dynamic breakeven (entry + spread cost).  Once past breakeven,
        track peak and close if price drops EXIT_PEAK_TRAIL_PCT (1.5%)
        from the peak.
@@ -3370,15 +3387,24 @@ def check_exit(trade: dict) -> tuple[bool, str]:
     spread_cost_pct = float(trade.get("spread_pips", 0)) * ps / entry
     breakeven_pct = spread_cost_pct
 
+    # ── Dynamic SL from trade's own sl_pips ─────────────────
+    if "dynamic_sl_pct" not in trade:
+        sl_pips_val = float(trade.get("sl_pips") or 0)
+        if sl_pips_val > 0 and entry > 0:
+            trade["dynamic_sl_pct"] = -(sl_pips_val * ps) / entry
+        else:
+            trade["dynamic_sl_pct"] = -0.01  # fallback -1%
+    dynamic_sl_pct = trade["dynamic_sl_pct"]
+
     # ── Peak P&L % ────────────────────────────────────────────
     if direction == "LONG":
         peak_pnl_pct = (trade.get("highest_price", entry) - entry) / entry
     else:
         peak_pnl_pct = (entry - trade.get("lowest_price", entry)) / entry
 
-    # 1. Hard SL at -40%
-    if pnl_pct <= EXIT_SL_PCT:
-        log.info(f"🛑 [{label}] SL hit: {instrument} | {pnl_pips:+.1f}p | {pnl_pct*100:+.1f}%")
+    # 1. Dynamic SL
+    if pnl_pct <= dynamic_sl_pct:
+        log.info(f"🛑 [{label}] SL hit: {instrument} | {pnl_pips:+.1f}p | {pnl_pct*100:+.1f}% (SL={dynamic_sl_pct*100:.2f}%)")
         return True, "STOP_LOSS"
 
     # 2. Above breakeven → trail from peak (1.5% drop from peak)
