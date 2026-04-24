@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from collections import defaultdict, deque
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
+
+import os
 
 import pandas as pd
 import requests
@@ -13,10 +15,29 @@ from fxbot.strategies import StrategyScoringContext
 from fxbot.strategies import determine_direction
 from fxbot.strategies import score_asian_fade, score_breakout, score_carry, score_post_news, score_pullback, score_reversal, score_scalper, score_trend
 
+# Tier 1v2 §7.2 — overlay modules, now exercised from the backtest harness
+# instead of main.py only. Without these the backtest was measuring the
+# pre-Tier-1 baseline (see third-memo §7.1).
+from fxbot.cost_model import compute_net_rr
+from fxbot.correlation_risk import would_breach_portfolio_cap
+from fxbot.decision_day import decision_day_follow_through
+from fxbot.flow_strategies import active_flow_window, instrument_is_flow_eligible
+from fxbot.kill_switch import evaluate_drawdown_kill
+from fxbot.news_impact import NewsImpact, classify_news_impact
+from fxbot.percentile_sizing import size_by_percentile
+from fxbot.regime import Regime, classify_regime, is_strategy_enabled
+from fxbot.regime_dwell import RegimeDwellFilter
+from fxbot.seasonality import seasonal_risk_multiplier
+from fxbot.strategy_reconciliation import Signal, StrategyReconciliation
+
 from .config import BacktestConfig
 from .data import HistoricalDataProvider
 from .macro_sim import MacroReplay, MacroState
 from .simulator import SimulatorConfig, TradeSimulator
+
+
+def _flag(name: str, default: str = "true") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class BacktestEngine:
@@ -51,6 +72,45 @@ class BacktestEngine:
         ]
         self._spread_profiles: dict[str, dict[str, float]] = {}
         self._last_trade_close: dict[tuple[str, str], datetime] = {}  # (strategy, instrument) -> last close time
+
+        # ── Tier 1v2 overlay state ─────────────────────────────────────────
+        # Feature flags — default ON so the backtest mirrors the live path.
+        # Set BACKTEST_TIER*_*_ENABLED=0 to isolate any single overlay.
+        self._tier1_net_rr_enabled = _flag("BACKTEST_TIER1_NET_RR_ENABLED", "true")
+        self._tier1_net_rr_min = float(os.getenv("BACKTEST_TIER1_NET_RR_MIN", "1.8"))
+        self._tier2_regime_veto_enabled = _flag("BACKTEST_TIER2_REGIME_VETO_ENABLED", "true")
+        self._tier2_kill_switch_enabled = _flag("BACKTEST_TIER2_KILL_SWITCH_ENABLED", "true")
+        self._tier2_portfolio_cap_enabled = _flag("BACKTEST_TIER2_PORTFOLIO_CAP_ENABLED", "true")
+        self._tier2_portfolio_cap_pct = float(os.getenv("BACKTEST_TIER2_PORTFOLIO_CAP_PCT", "0.08"))
+        self._tier2_percentile_sizing_enabled = _flag("BACKTEST_TIER2_PERCENTILE_SIZING_ENABLED", "true")
+        self._tier3_news_impact_enabled = _flag("BACKTEST_TIER3_NEWS_IMPACT_ENABLED", "true")
+        self._tier3_flow_enabled = _flag("BACKTEST_TIER3_FLOW_ENABLED", "true")
+        self._tier3_seasonality_enabled = _flag("BACKTEST_TIER3_SEASONALITY_ENABLED", "true")
+        self._tier3_reconciliation_enabled = _flag("BACKTEST_TIER3_RECONCILIATION_ENABLED", "true")
+        self._tier5_decision_day_enabled = _flag("BACKTEST_TIER5_DECISION_DAY_ENABLED", "false")
+
+        # Rolling observables fed into classify_regime() on every step.
+        self._dxy_closes: deque[float] = deque(maxlen=60)
+        self._vix_history: deque[float] = deque(maxlen=120)
+        self._spy_closes: deque[float] = deque(maxlen=60)
+        self._regime_dwell = RegimeDwellFilter(min_dwell_bars=int(os.getenv("BACKTEST_REGIME_DWELL_BARS", "4")))
+        self._current_regime: Regime = Regime.CHOP
+
+        # Score percentile history per strategy — replaces pure Kelly multiplier
+        # for all trades after a 20-sample warm-up.
+        self._score_history: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=500))
+
+        # Daily PnL tracking for the 30d/90d kill switch.
+        self._daily_pnl_pct: deque[float] = deque(maxlen=180)
+        self._last_day: date | None = None
+        self._last_day_equity: float = config.initial_balance
+
+        # Opposite-direction veto (Tier 3 §3).
+        self._reconciliation = StrategyReconciliation()
+
+        # Telemetry: per-cycle overlay block counters so the reporter can
+        # attribute where the backtest mirrors third-memo §3 gates.
+        self.overlay_block_counts: dict[str, int] = defaultdict(int)
 
     def _load_series(self, instrument: str, granularity: str) -> pd.DataFrame | None:
         key = (instrument, granularity)
@@ -260,6 +320,175 @@ class BacktestEngine:
             return 0.0
         return max(1.0, risk_amount / (sl_pips * pip_value_per_unit))
 
+    # ── Tier 1v2 overlay helpers ──────────────────────────────────────────
+
+    def _tick_overlay_observations(self, now: datetime, macro_state: MacroState) -> None:
+        """Append rolling macro observables so classify_regime() has history."""
+        if macro_state.vix_value is not None:
+            self._vix_history.append(float(macro_state.vix_value))
+        # DXY proxy: track EUR_USD close inverted (a rough but stable proxy
+        # when a dedicated DXY series is unavailable in the backtest feed).
+        bar = self._bar_at("EUR_USD", self.config.granularity, now)
+        if bar:
+            # Inverted close so "DXY rises" => value rises.
+            self._dxy_closes.append(1.0 / float(bar["close"]) if float(bar["close"]) > 0 else 0.0)
+        spy = self._bar_at("SPX500_USD", self.config.granularity, now)
+        if spy:
+            self._spy_closes.append(float(spy["close"]))
+
+        # Classify regime every step; RegimeDwellFilter smooths out flicker.
+        try:
+            raw = classify_regime(
+                dxy_closes=list(self._dxy_closes) or None,
+                vix_history=list(self._vix_history) or None,
+                spy_closes=list(self._spy_closes) or None,
+            ).regime
+        except Exception:
+            raw = Regime.CHOP
+        self._current_regime = self._regime_dwell.observe(raw)
+
+    def _regime_blocks(self, strategy: str) -> bool:
+        if not self._tier2_regime_veto_enabled:
+            return False
+        return not is_strategy_enabled(strategy, self._current_regime)
+
+    def _news_impact_for(self, instrument: str, macro_state: MacroState, now: datetime) -> NewsImpact:
+        """Return the worst NewsImpact across active + imminent events."""
+        if not self._tier3_news_impact_enabled or not macro_state.news_events:
+            return NewsImpact.PASS
+        worst = NewsImpact.PASS
+        lookahead_min = int(os.getenv("BACKTEST_NEWS_IMPACT_LOOKAHEAD_MIN", "30"))
+        for event in macro_state.news_events:
+            event_time = self._parse_event_time(event.get("pause_end") or event.get("time"))
+            if event_time is None:
+                continue
+            # Consider events that are imminent or were just released.
+            if not (now - timedelta(minutes=lookahead_min) <= event_time <= now + timedelta(minutes=lookahead_min)):
+                continue
+            decision = classify_news_impact(
+                event_title=str(event.get("title", "")),
+                event_currency=str(event.get("currency", "")),
+                instrument=instrument,
+            )
+            if decision.impact == NewsImpact.BLOCK:
+                return NewsImpact.BLOCK
+            if decision.impact == NewsImpact.REDUCE:
+                worst = NewsImpact.REDUCE
+        return worst
+
+    def _flow_risk_multiplier(self, instrument: str, now: datetime) -> float:
+        if not self._tier3_flow_enabled:
+            return 1.0
+        window = active_flow_window(now)
+        if not window.in_window:
+            return 1.0
+        if not instrument_is_flow_eligible(instrument, window.event):
+            return 1.0
+        return float(window.risk_multiplier)
+
+    def _seasonal_mult(self, strategy: str, instrument: str, now: datetime) -> float:
+        if not self._tier3_seasonality_enabled:
+            return 1.0
+        return float(seasonal_risk_multiplier(strategy, instrument, now))
+
+    def _decision_day_mult(self, instrument: str, macro_state: MacroState, now: datetime) -> float:
+        if not self._tier5_decision_day_enabled or not macro_state.news_events:
+            return 1.0
+        signal = decision_day_follow_through(
+            instrument=instrument,
+            events=macro_state.news_events,
+            now=now,
+        )
+        return float(signal.risk_multiplier) if signal.in_window else 1.0
+
+    def _percentile_risk_multiplier(self, strategy: str, score: float) -> float:
+        if not self._tier2_percentile_sizing_enabled:
+            return 1.0
+        hist = self._score_history[strategy]
+        decision = size_by_percentile(score=score, history=list(hist), min_samples=20)
+        return float(decision.multiplier)
+
+    def _net_rr_passes(self, opp: dict, entry_spread_pips: float) -> tuple[bool, float]:
+        if not self._tier1_net_rr_enabled:
+            return True, 0.0
+        sl = float(opp.get("sl_pips", 0.0) or 0.0)
+        tp = float(opp.get("tp_pips", 0.0) or 0.0)
+        if sl <= 0 or tp <= 0:
+            return True, 0.0
+        breakdown = compute_net_rr(
+            sl_pips=sl,
+            tp_pips=tp,
+            entry_spread_pips=float(entry_spread_pips),
+            slippage_pips=float(self.config.slippage_pips),
+            financing_pips=0.0,
+            min_net_rr=self._tier1_net_rr_min,
+        )
+        return bool(breakdown.passed), float(breakdown.net_rr)
+
+    def _portfolio_cap_blocks(self, instrument: str, direction: str) -> bool:
+        if not self._tier2_portfolio_cap_enabled:
+            return False
+        decision = would_breach_portfolio_cap(
+            open_trades=[
+                {
+                    "instrument": t.get("instrument"),
+                    "direction": t.get("direction"),
+                    "risk_pct": float(t.get("risk_pct", self.config.max_risk_per_trade) or self.config.max_risk_per_trade),
+                }
+                for t in self.simulator.open_trades
+            ],
+            candidate_instrument=instrument,
+            candidate_direction=direction,
+            candidate_risk_pct=float(self.config.max_risk_per_trade),
+            cap_pct=self._tier2_portfolio_cap_pct,
+        )
+        return not decision.allowed
+
+    def _reconciliation_blocks(self, strategy: str, instrument: str, direction: str, score: float, now: datetime) -> bool:
+        if not self._tier3_reconciliation_enabled:
+            return False
+        decision = self._reconciliation.check(
+            strategy=strategy,
+            instrument=instrument,
+            direction=direction,
+            score=float(score),
+            now_utc=now,
+        )
+        return not decision.allowed
+
+    def _update_daily_pnl_and_kill(self, now: datetime) -> tuple[bool, float]:
+        """Return (hard_halt, risk_scale) after rolling daily PnL history."""
+        today = now.date()
+        current_balance = float(self.simulator.balance)
+        if self._last_day is None:
+            self._last_day = today
+            self._last_day_equity = current_balance
+        elif today != self._last_day:
+            # Close-of-day snapshot for every calendar day we rolled past.
+            days_elapsed = (today - self._last_day).days
+            if self._last_day_equity > 0 and days_elapsed >= 1:
+                pct = (current_balance - self._last_day_equity) / self._last_day_equity
+                # One data point per calendar day; if the engine skips days
+                # (weekends), distribute 0% for missing days so the 30d/90d
+                # lookback windows remain calendar-consistent.
+                self._daily_pnl_pct.append(pct)
+                for _ in range(days_elapsed - 1):
+                    self._daily_pnl_pct.append(0.0)
+            self._last_day = today
+            self._last_day_equity = current_balance
+
+        if not self._tier2_kill_switch_enabled or len(self._daily_pnl_pct) < 5:
+            return False, 1.0
+        decision = evaluate_drawdown_kill(daily_pnl_pct=list(self._daily_pnl_pct))
+        if decision.hard_halt:
+            return True, 0.0
+        if decision.soft_cut and decision.risk_per_trade_override is not None:
+            # `risk_per_trade_override` is already a multiplier ∈ [0, 1] on
+            # top of the base per-trade risk (see fxbot/kill_switch.py).
+            return False, max(0.0, min(1.0, float(decision.risk_per_trade_override)))
+        return False, 1.0
+
+
     def _mark_prices(self, now: datetime) -> dict[str, float]:
         marks = {}
         for instrument in self.config.instruments:
@@ -302,6 +531,16 @@ class BacktestEngine:
                 self._last_trade_close[key] = current
             self.simulator.mark_equity(current, self._mark_prices(current))
 
+            # ── Tier 1v2 overlay tick ─────────────────────────────────────
+            self._tick_overlay_observations(current, macro_state)
+            hard_halt, kill_risk_scale = self._update_daily_pnl_and_kill(current)
+            if hard_halt:
+                # 90d DD ≥ 10% → skip all new entries for this bar. Exits
+                # continue via the simulator.update_open_trades call above.
+                self.overlay_block_counts["hard_halt"] += 1
+                current += step
+                continue
+
             session = self._get_session(current)
             regime_mult = self._compute_market_regime(current, macro_state)
             adaptive_offsets = defaultdict(float)
@@ -311,6 +550,10 @@ class BacktestEngine:
                     continue
                 if not self.simulator.can_open_trade():
                     break
+                # Tier 2 §2 — regime veto runs ONCE per strategy per bar.
+                if self._regime_blocks(label):
+                    self.overlay_block_counts[f"regime_veto:{label}"] += 1
+                    continue
                 best_opp = None
                 for instrument in session["pairs_allowed"]:
                     if any(t["instrument"] == instrument for t in self.simulator.open_trades):
@@ -322,6 +565,12 @@ class BacktestEngine:
                         hours_since = (current - self._last_trade_close[cooldown_key]).total_seconds() / 3600.0
                         if hours_since < cooldown_hours:
                             continue
+                    # Tier 3 §6 — impact-weighted news block (supersedes the
+                    # legacy symmetric blackout for major events).
+                    news_impact = self._news_impact_for(instrument, macro_state, current)
+                    if news_impact == NewsImpact.BLOCK:
+                        self.overlay_block_counts["news_block"] += 1
+                        continue
                     spread_pips = self._estimate_spread_pips(instrument, current)
                     ctx = StrategyScoringContext(
                         get_spread_pips=lambda _i, sp=spread_pips: sp,
@@ -346,10 +595,25 @@ class BacktestEngine:
                     opp = scorer(instrument, session, ctx, self.settings)
                     if opp is None:
                         continue
+                    # Tier 1 §9 — net-of-cost R:R gate.
+                    rr_ok, _ = self._net_rr_passes(opp, spread_pips)
+                    if not rr_ok:
+                        self.overlay_block_counts["net_rr_fail"] += 1
+                        continue
+                    # Tier 3 §3 — opposite-direction reconciliation.
+                    if self._reconciliation_blocks(label, instrument, opp["direction"], opp.get("score", 0.0), current):
+                        self.overlay_block_counts["reconciliation"] += 1
+                        continue
+                    # Tier 2 §8 — portfolio vol cap (8% default) on top of the
+                    # legacy correlated-count cap.
+                    if self._portfolio_cap_blocks(instrument, opp["direction"]):
+                        self.overlay_block_counts["portfolio_cap"] += 1
+                        continue
                     breached, _, _ = would_breach_correlation_limit(self.simulator.open_trades, opp["instrument"], opp["direction"], self.config.max_correlated_trades)
                     if breached:
                         continue
                     opp["session_name"] = session["name"]
+                    opp["_news_impact"] = news_impact.value if hasattr(news_impact, "value") else str(news_impact)
                     current_score = float(opp.get("selection_score", opp.get("score", 0.0)) or 0.0)
                     best_score = float(best_opp.get("selection_score", best_opp.get("score", 0.0)) or 0.0) if best_opp is not None else float("-inf")
                     if best_opp is None or current_score > best_score:
@@ -365,13 +629,45 @@ class BacktestEngine:
                 max_kelly = float(self.settings.get(f"{label}_MAX_KELLY", 0))
                 if max_kelly > 0:
                     kelly_mult = min(kelly_mult, max_kelly)
-                units = self._position_units(best_opp["instrument"], float(bar["close"]), float(best_opp["sl_pips"]), self.simulator.balance, kelly_mult, "USD", current)
+
+                # ── Tier 1v2 composite sizing multiplier ──
+                #   percentile  (Tier 2 §5) × flow (Tier 3 §7) × seasonality
+                #   (Tier 3 §8) × decision-day (Tier 5 §8) × kill-switch soft
+                #   cut (Tier 2 §9) × news REDUCE (Tier 3 §6).
+                percentile_mult = self._percentile_risk_multiplier(label, float(best_opp["score"]))
+                flow_mult = self._flow_risk_multiplier(best_opp["instrument"], current)
+                seasonal_mult = self._seasonal_mult(label, best_opp["instrument"], current)
+                decision_mult = self._decision_day_mult(best_opp["instrument"], macro_state, current)
+                news_reduce = 0.5 if best_opp.get("_news_impact") == "REDUCE" else 1.0
+                overlay_scale = percentile_mult * flow_mult * seasonal_mult * decision_mult * news_reduce * kill_risk_scale
+                # Clip the overlay stack to a [0.1x, 3.5x] envelope so a single
+                # extreme multiplier cannot blow out sizing.
+                overlay_scale = max(0.1, min(3.5, overlay_scale))
+                effective_kelly = kelly_mult * overlay_scale
+                units = self._position_units(best_opp["instrument"], float(bar["close"]), float(best_opp["sl_pips"]), self.simulator.balance, effective_kelly, "USD", current)
                 # Dynamic leverage: scale with market regime
                 effective_leverage = self._compute_effective_leverage(regime_mult)
                 max_units = abs(self.simulator.balance * effective_leverage / float(bar["close"]))
                 units = min(units, max_units)
-                best_opp["kelly_mult"] = kelly_mult
+                best_opp["kelly_mult"] = effective_kelly
+                best_opp["overlay_scale"] = round(overlay_scale, 4)
+                best_opp["regime_at_entry"] = str(getattr(self._current_regime, "value", self._current_regime))
                 news_active = self._is_pair_paused_by_news(macro_state, best_opp["instrument"], current)
                 self.simulator.open_trade(best_opp, label, current, float(bar["close"]), units, self._estimate_spread_pips(best_opp["instrument"], current), news_active, execution_bar=bar)
+
+                # Record signal for the reconciliation veto on future bars,
+                # and extend the score history used by size_by_percentile.
+                if self._tier3_reconciliation_enabled:
+                    try:
+                        self._reconciliation.record(Signal(
+                            strategy=label,
+                            instrument=best_opp["instrument"],
+                            direction=best_opp["direction"],
+                            score=float(best_opp["score"]),
+                            bar_ts_utc=current,
+                        ))
+                    except Exception:
+                        pass
+                self._score_history[label].append(float(best_opp["score"]))
             current += step
         return self.simulator.equity_curve, self.simulator.closed_trades
