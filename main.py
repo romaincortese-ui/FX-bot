@@ -51,6 +51,25 @@ from fxbot.pair_health import (
     pair_health_block_seconds,
 )
 from fxbot.risk import would_breach_correlation_limit
+# Tier 2 consultant-assessment integrations.
+from fxbot.bayesian_weighting import (
+    StrategyPosterior,
+    allocate_weights as bayesian_allocate_weights,
+    new_posterior as bayesian_new_posterior,
+    update_posterior as bayesian_update_posterior,
+)
+from fxbot.correlation_risk import (
+    default_correlation_matrix,
+    would_breach_portfolio_cap,
+)
+from fxbot.financing import FinancingCache, is_carry_favourable
+from fxbot.kill_switch import evaluate_drawdown_kill
+from fxbot.percentile_sizing import size_by_percentile
+from fxbot.regime import Regime, is_strategy_enabled as regime_is_strategy_enabled
+from fxbot.slippage import get_default_logger as get_default_slippage_logger
+from fxbot.strategy_reconciliation import (
+    get_default_reconciliation as get_default_strategy_reconciliation,
+)
 from fxbot.runtime_status import build_runtime_status, publish_runtime_status
 from fxbot.strategies import StrategyScoringContext
 from fxbot.strategies import determine_direction as core_determine_direction
@@ -328,6 +347,30 @@ NET_RR_SLIPPAGE_PIPS = float(os.getenv("NET_RR_SLIPPAGE_PIPS", "0.3"))
 NET_RR_FINANCING_PIPS = float(os.getenv("NET_RR_FINANCING_PIPS", "0.0"))
 PAIR_HEALTH_FAILURE_COOLDOWN_SECS = int(os.getenv("PAIR_HEALTH_FAILURE_COOLDOWN_SECS", "60"))
 PAIR_HEALTH_SUCCESS_COOLDOWN_SECS = int(os.getenv("PAIR_HEALTH_SUCCESS_COOLDOWN_SECS", "30"))
+# Tier 2 §12/13/15/16/18/19/20/21/22 — feature flags and thresholds.
+TIER2_PERCENTILE_SIZING_ENABLED = os.getenv("TIER2_PERCENTILE_SIZING_ENABLED", "1") not in ("0", "", "false", "False")
+TIER2_PERCENTILE_LOOKBACK = int(os.getenv("TIER2_PERCENTILE_LOOKBACK", "60"))
+TIER2_PERCENTILE_FLOOR = float(os.getenv("TIER2_PERCENTILE_FLOOR", "0.5"))
+TIER2_PERCENTILE_CAP = float(os.getenv("TIER2_PERCENTILE_CAP", "2.0"))
+TIER2_PORTFOLIO_VOL_CAP_PCT = float(os.getenv("TIER2_PORTFOLIO_VOL_CAP_PCT", "0.03"))
+TIER2_PORTFOLIO_VOL_ENABLED = os.getenv("TIER2_PORTFOLIO_VOL_ENABLED", "1") not in ("0", "", "false", "False")
+TIER2_REGIME_GATE_ENABLED = os.getenv("TIER2_REGIME_GATE_ENABLED", "1") not in ("0", "", "false", "False")
+TIER2_STRATEGY_DEDUP_ENABLED = os.getenv("TIER2_STRATEGY_DEDUP_ENABLED", "1") not in ("0", "", "false", "False")
+TIER2_FINANCING_ENABLED = os.getenv("TIER2_FINANCING_ENABLED", "1") not in ("0", "", "false", "False")
+TIER2_FINANCING_REFRESH_SECS = int(os.getenv("TIER2_FINANCING_REFRESH_SECS", str(12 * 3600)))
+TIER2_CARRY_MIN_BPS_PER_DAY = float(os.getenv("TIER2_CARRY_MIN_BPS_PER_DAY", "0.5"))
+TIER2_SLIPPAGE_LOG_ENABLED = os.getenv("TIER2_SLIPPAGE_LOG_ENABLED", "1") not in ("0", "", "false", "False")
+TIER2_SLIPPAGE_CSV_PATH = os.getenv("TIER2_SLIPPAGE_CSV_PATH", "slippage.csv")
+TIER2_DRAWDOWN_KILL_ENABLED = os.getenv("TIER2_DRAWDOWN_KILL_ENABLED", "1") not in ("0", "", "false", "False")
+TIER2_DD_SOFT_CUT_DAYS = int(os.getenv("TIER2_DD_SOFT_CUT_DAYS", "30"))
+TIER2_DD_HARD_HALT_DAYS = int(os.getenv("TIER2_DD_HARD_HALT_DAYS", "90"))
+TIER2_DD_SOFT_CUT_PCT = float(os.getenv("TIER2_DD_SOFT_CUT_PCT", "0.06"))
+TIER2_DD_HARD_HALT_PCT = float(os.getenv("TIER2_DD_HARD_HALT_PCT", "0.12"))
+TIER2_DD_SOFT_CUT_RISK_SCALE = float(os.getenv("TIER2_DD_SOFT_CUT_RISK_SCALE", "0.5"))
+TIER2_BAYESIAN_WEIGHTING_ENABLED = os.getenv("TIER2_BAYESIAN_WEIGHTING_ENABLED", "1") not in ("0", "", "false", "False")
+TIER2_BAYESIAN_MIN_WEIGHT = float(os.getenv("TIER2_BAYESIAN_MIN_WEIGHT", "0.25"))
+TIER2_BAYESIAN_MAX_WEIGHT = float(os.getenv("TIER2_BAYESIAN_MAX_WEIGHT", "2.0"))
+SHARED_BUDGET_STRICT_REDIS = os.getenv("SHARED_BUDGET_STRICT_REDIS", "0") not in ("0", "", "false", "False")
 PAIR_HEALTH_PROBE_INTERVAL_SECS = int(os.getenv("PAIR_HEALTH_PROBE_INTERVAL_SECS", "900"))
 PAIR_HEALTH_RECOVERY_SUCCESSES = int(os.getenv("PAIR_HEALTH_RECOVERY_SUCCESSES", "3"))
 PAIR_HEALTH_BLOCK_BASE_SECS = int(os.getenv("PAIR_HEALTH_BLOCK_BASE_SECS", "1800"))
@@ -447,7 +490,21 @@ _scan_reject_reasons = {}
 _pair_health         = {}
 _last_scan_pool_status = {"mode": "primary", "active": 0, "healthy": 0, "tradable": 0}
 _pending_close_retries = {}
-
+# Tier 2 runtime state.
+_strategy_score_history: dict[str, list[float]] = {}
+_strategy_posteriors: dict[str, "StrategyPosterior"] = {}
+_strategy_bayesian_weights: dict[str, float] = {}
+_drawdown_risk_scale: float = 1.0
+_drawdown_hard_halt: bool = False
+_drawdown_reason: str = ""
+_financing_cache = FinancingCache(ttl_seconds=TIER2_FINANCING_REFRESH_SECS)
+_last_financing_refresh_at: float = 0.0
+_slippage_logger = get_default_slippage_logger()
+try:
+    _slippage_logger._csv_path = TIER2_SLIPPAGE_CSV_PATH  # type: ignore[attr-defined]
+except Exception:
+    pass
+_strategy_reconciliation = get_default_strategy_reconciliation()
 _pair_cooldowns      = {}
 _thread_local        = threading.local()
 _live_prices         = {}
@@ -584,6 +641,16 @@ def publish_fx_shared_budget_state() -> bool:
 
     # Also write to file
     if SHARED_BUDGET_FILE:
+        if SHARED_BUDGET_STRICT_REDIS and REDIS_CLIENT is None:
+            log.warning(
+                "SHARED_BUDGET_STRICT_REDIS=1 but Redis is unavailable — "
+                "skipping file fallback write to avoid stale FX/Gold budget."
+            )
+            return False
+        if SHARED_BUDGET_STRICT_REDIS and REDIS_CLIENT is not None:
+            # Redis was the primary path; a file write is not required in
+            # strict-Redis mode. Keep it only when strict mode is off.
+            return True
         try:
             payload_file = {"bots": {}}
             if os.path.exists(SHARED_BUDGET_FILE):
@@ -611,6 +678,12 @@ def _load_shared_budget_payload() -> dict:
             if raw:
                 payload = json.loads(raw)
         elif SHARED_BUDGET_FILE and os.path.exists(SHARED_BUDGET_FILE):
+            if SHARED_BUDGET_STRICT_REDIS:
+                log.warning(
+                    "SHARED_BUDGET_STRICT_REDIS=1 but Redis is unavailable — "
+                    "refusing to read shared budget from file."
+                )
+                return {"bots": {}}
             with open(SHARED_BUDGET_FILE, encoding="utf-8") as handle:
                 payload = json.load(handle)
     except Exception:
@@ -2128,6 +2201,15 @@ def place_order(instrument: str, units: float, direction: str,
         fill_price = float(fill.get("price", 0))
         mark_pair_success(instrument, "order")
         log.info(f"[{label}] Order filled: {instrument} @ {fill_price} | trade_id={trade_id}")
+        _tier2_log_slippage(
+            instrument=instrument,
+            strategy=strategy or label,
+            direction=direction,
+            bid=bid,
+            ask=ask,
+            fill_price=fill_price,
+            label=label,
+        )
         return {
             "id": trade_id,
             "instrument": instrument,
@@ -2636,6 +2718,18 @@ def save_state():
             "pair_cooldowns":        _pair_cooldowns,
             "pair_health":           _pair_health,
             "pending_close_retries": _pending_close_retries,
+            "strategy_score_history": _strategy_score_history,
+            "strategy_posteriors": {
+                k: {
+                    "strategy": v.strategy,
+                    "alpha": v.alpha,
+                    "beta": v.beta,
+                    "trades": v.trades,
+                    "last_update_utc": v.last_update_utc.isoformat() if v.last_update_utc else None,
+                }
+                for k, v in _strategy_posteriors.items()
+            },
+            "strategy_bayesian_weights": _strategy_bayesian_weights,
             "saved_at":              datetime.now(timezone.utc).isoformat(),
         }
         tmp = STATE_FILE + ".tmp"
@@ -2649,6 +2743,7 @@ def save_state():
 def load_state():
     global open_trades, trade_history, _consecutive_losses, _streak_paused_at, _weekend_mode_active, _entry_pause_reason
     global _paused, _adaptive_offsets, _last_rebalance_count, _pair_cooldowns, _pair_health, _pending_close_retries
+    global _strategy_score_history, _strategy_posteriors, _strategy_bayesian_weights
     try:
         if not os.path.exists(STATE_FILE):
             return
@@ -2680,6 +2775,40 @@ def load_state():
             _pair_health[instrument] = merged
         log.info(f"📂 State loaded ({age/60:.0f}min old): "
                  f"{len(open_trades)} open, {len(trade_history)} history")
+        # Tier 2 state restoration.
+        raw_history = d.get("strategy_score_history", {})
+        if isinstance(raw_history, dict):
+            _strategy_score_history = {
+                str(k).upper(): [float(x) for x in (v or []) if isinstance(x, (int, float))]
+                for k, v in raw_history.items()
+            }
+        raw_posteriors = d.get("strategy_posteriors", {})
+        if isinstance(raw_posteriors, dict):
+            restored: dict[str, StrategyPosterior] = {}
+            for k, v in raw_posteriors.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    ts = v.get("last_update_utc")
+                    ts_parsed = datetime.fromisoformat(ts) if isinstance(ts, str) else None
+                    restored[str(k).upper()] = StrategyPosterior(
+                        strategy=str(v.get("strategy", k)).upper(),
+                        alpha=float(v.get("alpha", 5.0)),
+                        beta=float(v.get("beta", 5.0)),
+                        trades=int(v.get("trades", 0) or 0),
+                        last_update_utc=ts_parsed,
+                    )
+                except Exception:
+                    continue
+            _strategy_posteriors = restored
+        raw_weights = d.get("strategy_bayesian_weights", {})
+        if isinstance(raw_weights, dict):
+            _strategy_bayesian_weights = {
+                str(k).upper(): float(v)
+                for k, v in raw_weights.items()
+                if isinstance(v, (int, float))
+            }
+        _tier2_refresh_drawdown_state()
     except Exception as e:
         log.warning(f"State load failed ({e}) — starting fresh")
 
@@ -3288,7 +3417,298 @@ def score_pullback(instrument: str, session: dict) -> dict | None:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ENTRY & EXIT MANAGEMENT (unchanged)
+#  TIER 2 CONSULTANT-ASSESSMENT HELPERS (§12–§22)
+# ═══════════════════════════════════════════════════════════════
+
+def _tier2_record_score(label: str, score: float) -> None:
+    """Append a strategy score to the rolling history used by percentile sizing."""
+    if not label or score is None:
+        return
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return
+    key = str(label).upper()
+    history = _strategy_score_history.setdefault(key, [])
+    history.append(value)
+    lookback = max(20, int(TIER2_PERCENTILE_LOOKBACK))
+    # Keep twice the lookback so percentile estimates stay stable.
+    max_len = lookback * 2
+    if len(history) > max_len:
+        del history[: len(history) - max_len]
+
+
+def _tier2_percentile_mult(label: str, score: float) -> tuple[float, float | None, int]:
+    """Return (multiplier, percentile|None, samples) for the given candidate."""
+    if not TIER2_PERCENTILE_SIZING_ENABLED:
+        return 1.0, None, 0
+    key = str(label).upper()
+    history = _strategy_score_history.get(key, [])
+    decision = size_by_percentile(
+        score=float(score or 0.0),
+        history=history[-int(TIER2_PERCENTILE_LOOKBACK):],
+        floor=TIER2_PERCENTILE_FLOOR,
+        cap=TIER2_PERCENTILE_CAP,
+    )
+    return decision.multiplier, decision.percentile, decision.samples
+
+
+def _tier2_trade_risk_pct(trade: dict, nav: float) -> float:
+    """Approximate risk_pct used by the portfolio-vol correlation cap."""
+    risk_amount = float(trade.get("risk_amount", 0.0) or 0.0)
+    if nav <= 0 or risk_amount <= 0:
+        return 0.0
+    return risk_amount / nav
+
+
+def _tier2_portfolio_vol_breach(
+    instrument: str,
+    direction: str,
+    candidate_risk_amount: float,
+    nav: float,
+) -> str | None:
+    """Return a block reason if adding this trade would exceed the portfolio-vol cap."""
+    if not TIER2_PORTFOLIO_VOL_ENABLED or nav <= 0 or candidate_risk_amount <= 0:
+        return None
+    try:
+        with _open_trades_lock:
+            snapshot = [
+                {
+                    "instrument": t.get("instrument", ""),
+                    "direction": t.get("direction", ""),
+                    "risk_pct": _tier2_trade_risk_pct(t, nav),
+                }
+                for t in open_trades
+            ]
+        decision = would_breach_portfolio_cap(
+            open_trades=snapshot,
+            candidate_instrument=instrument,
+            candidate_direction=direction,
+            candidate_risk_pct=candidate_risk_amount / nav,
+            cap_pct=TIER2_PORTFOLIO_VOL_CAP_PCT,
+            correlation=default_correlation_matrix(),
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug(f"portfolio-vol check error: {exc}")
+        return None
+    if not decision.allowed:
+        return (
+            f"portfolio_vol {decision.portfolio_vol_after:.3%}"
+            f" > cap {decision.cap:.3%}"
+        )
+    return None
+
+
+# Per-pair 4h ATR ratio would be ideal for a live regime classifier; use the
+# existing _market_regime_mult as a lightweight proxy until the ATR feed is
+# wired into main.py.
+def _tier2_regime_label() -> "Regime":
+    """Derive a coarse Regime from currently-known macro scalars."""
+    dxy = _dxy_ema_gap
+    vix = _vix_level
+    if dxy is not None and abs(dxy) >= 0.015:
+        return Regime.USD_TREND
+    if vix is not None and vix >= 25.0:
+        return Regime.RISK_OFF
+    if vix is not None and vix <= 13.5:
+        return Regime.RISK_ON
+    return Regime.CHOP
+
+
+def _tier2_regime_block_reason(strategy: str) -> str | None:
+    if not TIER2_REGIME_GATE_ENABLED:
+        return None
+    regime = _tier2_regime_label()
+    if regime_is_strategy_enabled(strategy, regime):
+        return None
+    return f"regime_gate {regime.value} disables {strategy}"
+
+
+def _tier2_reconciliation_block(
+    strategy: str,
+    instrument: str,
+    direction: str,
+    score: float,
+) -> str | None:
+    if not TIER2_STRATEGY_DEDUP_ENABLED:
+        return None
+    decision = _strategy_reconciliation.check(
+        strategy=strategy,
+        instrument=instrument,
+        direction=direction,
+        score=float(score or 0.0),
+    )
+    if decision.allowed:
+        return None
+    return f"strategy_dedup: {decision.reason}"
+
+
+def _tier2_daily_pnl_series() -> list[float]:
+    """Aggregate trade_history into daily P&L-as-fraction-of-NAV series."""
+    by_day: dict[str, float] = {}
+    for trade in trade_history:
+        closed_at = trade.get("closed_at", "")
+        if not closed_at or len(closed_at) < 10:
+            continue
+        day = closed_at[:10]
+        by_day[day] = by_day.get(day, 0.0) + float(trade.get("pnl_pct", 0.0) or 0.0) / 100.0
+    ordered = [by_day[d] for d in sorted(by_day.keys())]
+    lookback = max(TIER2_DD_HARD_HALT_DAYS, TIER2_DD_SOFT_CUT_DAYS) + 5
+    return ordered[-lookback:]
+
+
+def _tier2_refresh_drawdown_state() -> None:
+    global _drawdown_risk_scale, _drawdown_hard_halt, _drawdown_reason
+    if not TIER2_DRAWDOWN_KILL_ENABLED:
+        _drawdown_risk_scale = 1.0
+        _drawdown_hard_halt = False
+        _drawdown_reason = ""
+        return
+    series = _tier2_daily_pnl_series()
+    decision = evaluate_drawdown_kill(
+        daily_pnl_pct=series,
+        soft_cut_lookback_days=TIER2_DD_SOFT_CUT_DAYS,
+        hard_halt_lookback_days=TIER2_DD_HARD_HALT_DAYS,
+        soft_cut_threshold_pct=TIER2_DD_SOFT_CUT_PCT,
+        hard_halt_threshold_pct=TIER2_DD_HARD_HALT_PCT,
+        soft_cut_risk_scale=TIER2_DD_SOFT_CUT_RISK_SCALE,
+    )
+    _drawdown_hard_halt = decision.hard_halt
+    _drawdown_reason = decision.reason
+    if decision.hard_halt:
+        _drawdown_risk_scale = 0.0
+    elif decision.soft_cut:
+        _drawdown_risk_scale = max(
+            0.0, min(1.0, decision.risk_per_trade_override or TIER2_DD_SOFT_CUT_RISK_SCALE)
+        )
+    else:
+        _drawdown_risk_scale = 1.0
+
+
+def _tier2_drawdown_block_reason() -> str | None:
+    if not TIER2_DRAWDOWN_KILL_ENABLED:
+        return None
+    if _drawdown_hard_halt:
+        return f"drawdown_hard_halt ({_drawdown_reason})"
+    return None
+
+
+def _tier2_get_bayesian_weight(label: str) -> float:
+    if not TIER2_BAYESIAN_WEIGHTING_ENABLED:
+        return 1.0
+    weights = _strategy_bayesian_weights
+    if not weights:
+        return 1.0
+    key = str(label).upper()
+    if key not in weights:
+        return 1.0
+    mean = sum(weights.values()) / max(1, len(weights))
+    if mean <= 0:
+        return 1.0
+    raw = weights[key] / mean
+    return max(TIER2_BAYESIAN_MIN_WEIGHT, min(TIER2_BAYESIAN_MAX_WEIGHT, raw))
+
+
+def _tier2_rebuild_bayesian_weights() -> None:
+    if not TIER2_BAYESIAN_WEIGHTING_ENABLED:
+        _strategy_bayesian_weights.clear()
+        return
+    posteriors = list(_strategy_posteriors.values())
+    if not posteriors:
+        _strategy_bayesian_weights.clear()
+        return
+    weights = bayesian_allocate_weights(posteriors)
+    _strategy_bayesian_weights.clear()
+    _strategy_bayesian_weights.update(weights)
+
+
+def _tier2_update_posteriors(label: str, win: bool) -> None:
+    if not TIER2_BAYESIAN_WEIGHTING_ENABLED or not label:
+        return
+    key = str(label).upper()
+    existing = _strategy_posteriors.get(key) or bayesian_new_posterior(key)
+    _strategy_posteriors[key] = bayesian_update_posterior(existing, win=win)
+    # Rebuild weights every PERF_REBALANCE_TRADES closes.
+    total_trades = sum(p.trades for p in _strategy_posteriors.values())
+    if total_trades and total_trades % max(1, PERF_REBALANCE_TRADES) == 0:
+        _tier2_rebuild_bayesian_weights()
+
+
+def _tier2_refresh_financing(account_id: str, fetch) -> int:
+    global _last_financing_refresh_at
+    if not TIER2_FINANCING_ENABLED or not account_id or fetch is None:
+        return 0
+    now = time.time()
+    if not _financing_cache.is_stale() and (now - _last_financing_refresh_at) < TIER2_FINANCING_REFRESH_SECS:
+        return 0
+    try:
+        loaded = _financing_cache.refresh(fetch, account_id)
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug(f"financing refresh error: {exc}")
+        return 0
+    _last_financing_refresh_at = now
+    if loaded:
+        log.info(f"💱 Financing rates refreshed: {loaded} instruments")
+    return loaded
+
+
+def _tier2_carry_block_reason(label: str, instrument: str, direction: str) -> str | None:
+    if not TIER2_FINANCING_ENABLED:
+        return None
+    if str(label).upper() != "CARRY":
+        return None
+    quote = _financing_cache.get(instrument)
+    if quote is None:
+        return None  # Cache miss — don't hard-block legacy CARRY pathway.
+    if not is_carry_favourable(
+        quote=quote,
+        direction=direction,
+        min_bps_per_day=TIER2_CARRY_MIN_BPS_PER_DAY,
+    ):
+        return (
+            f"carry_unfavourable long={quote.long_bps_per_day:.2f}bps/day"
+            f" short={quote.short_bps_per_day:.2f}bps/day"
+        )
+    return None
+
+
+def _tier2_log_slippage(
+    *,
+    instrument: str,
+    strategy: str,
+    direction: str,
+    bid: float | None,
+    ask: float | None,
+    fill_price: float,
+    session: str = "",
+    label: str = "",
+) -> None:
+    if not TIER2_SLIPPAGE_LOG_ENABLED or fill_price is None:
+        return
+    try:
+        b = float(bid or 0.0)
+        a = float(ask or 0.0)
+        if b <= 0 or a <= 0:
+            signal_mid = float(fill_price)
+        else:
+            signal_mid = 0.5 * (b + a)
+        ps = pip_size(instrument)
+        _slippage_logger.log(
+            instrument=instrument,
+            strategy=strategy or label,
+            direction=direction,
+            signal_mid=signal_mid,
+            fill_price=float(fill_price),
+            pip_size=ps,
+            session=session,
+            label=label,
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug(f"slippage log error: {exc}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ENTRY & EXIT MANAGEMENT
 # ═══════════════════════════════════════════════════════════════
 
 def _would_breach_correlation_limit(instrument: str, direction: str) -> tuple[bool, int, int]:
@@ -3318,6 +3738,9 @@ def get_entry_block_reason(instrument: str, direction: str) -> str | None:
     breached, _, _ = _would_breach_correlation_limit(instrument, direction)
     if breached:
         return "correlation limit"
+    dd_block = _tier2_drawdown_block_reason()
+    if dd_block is not None:
+        return dd_block
     price_data = get_current_price(instrument)
     entry_price = price_data["ask"] if direction == "LONG" else price_data["bid"]
     if entry_price <= 0:
@@ -3366,6 +3789,21 @@ def get_strategy_entry_block_reason(strategy: str, instrument: str, direction: s
             log.debug(f"net_rr gate error: {e}")
     if is_pair_paused_by_news(instrument) and strategy != "CARRY":
         return "pre-news risk window"
+    regime_block = _tier2_regime_block_reason(strategy)
+    if regime_block is not None:
+        return regime_block
+    carry_block = _tier2_carry_block_reason(strategy, instrument, direction)
+    if carry_block is not None:
+        return carry_block
+    if opp is not None:
+        recon_block = _tier2_reconciliation_block(
+            strategy,
+            instrument,
+            direction,
+            float(opp.get("score", 0.0) or 0.0),
+        )
+        if recon_block is not None:
+            return recon_block
     return None
 
 
@@ -3374,7 +3812,8 @@ def get_entry_risk_multiplier(strategy: str, instrument: str, session_name: str 
         session_name = get_current_session()["name"]
     risk_mult = NEWS_WINDOW_RISK_MULT if is_pair_paused_by_news(instrument) else 1.0
     calibration = get_trade_calibration_adjustment(strategy, instrument, session_name)
-    return round(max(CALIBRATION_RISK_FLOOR, risk_mult * calibration["risk_mult"]), 3)
+    dd_scale = float(_drawdown_risk_scale) if TIER2_DRAWDOWN_KILL_ENABLED else 1.0
+    return round(max(CALIBRATION_RISK_FLOOR, risk_mult * calibration["risk_mult"] * dd_scale), 3)
 
 def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     instrument = opp["instrument"]
@@ -3405,6 +3844,14 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     risk_mult = get_entry_risk_multiplier(label, instrument, session_name)
     effective_kelly_mult = kelly_mult * risk_mult
 
+    # Tier 2 §12 — score-percentile sizing. Scale risk by where the current
+    # score sits in the per-strategy rolling distribution. Default is a no-op
+    # when fewer than TIER2_PERCENTILE_LOOKBACK trades of history exist.
+    percentile_mult, percentile_value, percentile_samples = _tier2_percentile_mult(label, opp.get("score", 0.0))
+    # Tier 2 §22 — Bayesian posterior-weight scaling.
+    bayesian_weight = _tier2_get_bayesian_weight(label)
+    effective_kelly_mult *= percentile_mult * bayesian_weight
+
     account_currency = acct.get("currency", get_account_currency())
     budget_snapshot = build_fx_budget_snapshot(balance)
     risk_amount = min(
@@ -3416,6 +3863,13 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
             f"[{label}] Skip {instrument} {direction} — FX sleeve risk exhausted "
             f"({budget_snapshot['reserved_fx_risk']:.2f}/{budget_snapshot['max_total_risk_amount']:.2f})"
         )
+        return None
+
+    # Tier 2 §13 — portfolio-vol cap (correlation-aware).
+    nav_for_cap = float(acct.get("NAV", balance) or balance or 0.0)
+    vol_block = _tier2_portfolio_vol_breach(instrument, direction, risk_amount, nav_for_cap)
+    if vol_block is not None:
+        log.info(f"[{label}] Skip {instrument} {direction} — {vol_block}")
         return None
 
     units = calculate_units_for_risk_amount(instrument, risk_amount, opp["sl_pips"], account_currency)
@@ -3493,6 +3947,10 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         "calibration_risk_mult": calibration.get("risk_mult", 1.0),
         "partial_tp_hit": False,
         "unrealized_pnl": 0,
+        "percentile_mult": percentile_mult,
+        "percentile_value": percentile_value,
+        "percentile_samples": percentile_samples,
+        "bayesian_weight": bayesian_weight,
     }
 
     if label == "TREND" and opp.get("partial_tp_pips"):
@@ -3502,6 +3960,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
             trade["partial_tp_price"] = actual_entry - opp["partial_tp_pips"] * ps
 
     _pair_cooldowns[instrument] = time.time() + PAIR_COOLDOWN_SECS
+    _tier2_record_score(label, opp.get("score", 0.0))
     save_state()
 
     account_currency = acct.get("currency", account_currency)
@@ -3705,6 +4164,9 @@ def close_trade_exit(trade: dict, reason: str):
         _consecutive_losses = 0
     else:
         _consecutive_losses += 1
+
+    _tier2_update_posteriors(label, win=pnl > 0)
+    _tier2_refresh_drawdown_state()
 
     emoji = "✅" if pnl > 0 else "❌"
     dir_arrow = "⬆️" if direction == "LONG" else "⬇️"
@@ -4058,6 +4520,14 @@ def run():
             df_eurusd_1h = fetch_candles("EUR_USD", "H1", 100)
             if df_eurusd_1h is not None:
                 _market_regime_mult = compute_market_regime(df_eurusd_1h)
+
+            # Tier 2 §18 — refresh OANDA financing cache daily.
+            try:
+                _tier2_refresh_financing(OANDA_ACCOUNT_ID, oanda_get)
+            except NameError:
+                pass
+            # Tier 2 §20 — refresh drawdown-kill state from trade_history.
+            _tier2_refresh_drawdown_state()
 
             refresh_dynamic_watchlist()   # This will also restart stream if needed
             probe_pair_health()
