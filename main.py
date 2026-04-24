@@ -84,6 +84,14 @@ from fxbot.strategy_reconciliation import (
     get_default_reconciliation as get_default_strategy_reconciliation,
 )
 from fxbot.runtime_status import build_runtime_status, publish_runtime_status
+from fxbot.capital_floor import (
+    evaluate_capital_floor,
+    capital_floor_status_fields,
+)
+from fxbot.spread_cap_tuner import (
+    SpreadSampler,
+    get_default_sampler as _get_default_spread_sampler,
+)
 from fxbot.strategies import StrategyScoringContext
 from fxbot.strategies import determine_direction as core_determine_direction
 from fxbot.strategies import score_asian_fade as core_score_asian_fade
@@ -129,6 +137,27 @@ OANDA_STREAM_URL = (
 
 PAPER_TRADE   = os.getenv("PAPER_TRADE", "False").lower() == "true"
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
+
+# ── Tier 2v2 E2 — capital floor (paper-only below £10k) ──────
+# Third-memo §4 + §8 E2: at balance < ~£10k every sizer pins at the OANDA
+# £0.10/pip minimum, making real per-trade risk 5–10× the model. Force paper
+# mode until the account is capitalised. Operator can override with
+# ``CAPITAL_FLOOR_ENABLED=0`` or a lower ``MIN_LIVE_BALANCE`` value.
+CAPITAL_FLOOR_ENABLED = os.getenv("CAPITAL_FLOOR_ENABLED", "1") not in ("0", "", "false", "False")
+MIN_LIVE_BALANCE = float(os.getenv("MIN_LIVE_BALANCE", "10000"))
+_last_known_balance: float = 0.0
+_capital_floor_notified: bool = False
+
+# ── Tier 2v2 E1 — spread cap auto-tune ───────────────────────
+# Third-memo §8 E1: live spreads drift; a fixed per-strategy cap blocks too
+# much on fxPractice and can fall behind regime changes. Feed realised
+# spreads into a (pair × session) sampler and, when enabled, relax the
+# static cap toward the P75 of observed spreads (never below it).
+SPREAD_AUTOTUNE_ENABLED = os.getenv("SPREAD_AUTOTUNE_ENABLED", "0") not in ("0", "", "false", "False")
+SPREAD_AUTOTUNE_PERCENTILE = float(os.getenv("SPREAD_AUTOTUNE_PERCENTILE", "0.75"))
+SPREAD_AUTOTUNE_MIN_SAMPLES = int(os.getenv("SPREAD_AUTOTUNE_MIN_SAMPLES", "60"))
+SPREAD_AUTOTUNE_CEILING_PIPS = float(os.getenv("SPREAD_AUTOTUNE_CEILING_PIPS", "8.0"))
+_spread_sampler: SpreadSampler = _get_default_spread_sampler()
 
 # ── Static fallback pairs (used if dynamic fails) ────────────
 STATIC_CORE_PAIRS = _parse_pair_env("CORE_PAIRS", "EUR_USD,GBP_USD,USD_JPY")
@@ -1250,6 +1279,13 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
                     continue
                 mark_pair_success(inst, "quote")
                 spread = (ask - bid) / ps if ps > 0 else float("inf")
+                # Tier 2v2 E1: feed every measured spread into the auto-tune
+                # sampler. Stored per (instrument, session); read back via
+                # ``_spread_sampler.blended_cap`` when the auto-tune flag flips.
+                try:
+                    _spread_sampler.record(instrument=inst, spread_pips=spread)
+                except Exception:
+                    pass
                 if spread <= max_spread_pips:
                     mark_pair_success(inst, "spread")
                     if is_pair_tradeable(inst):
@@ -2190,13 +2226,74 @@ def calculate_units_for_risk_amount(instrument: str, risk_amount: float, sl_pips
         units = risk_amount / (sl_pips * pip_value_per_unit)
         return max(1, int(round(units)))
 
+
+def _evaluate_capital_floor_decision(balance: float | None = None):
+    """Tier 2v2 E2: decide whether the floor forces paper-mode right now."""
+    bal = float(balance) if balance is not None else float(_last_known_balance or 0.0)
+    return evaluate_capital_floor(
+        account_balance=bal,
+        min_balance=MIN_LIVE_BALANCE,
+        paper_trade=PAPER_TRADE,
+        enabled=CAPITAL_FLOOR_ENABLED,
+    )
+
+
+def _effective_paper_trade(balance: float | None = None) -> bool:
+    """Return True if order submission must be paper-only at this moment.
+
+    Composes the operator's ``PAPER_TRADE`` env flag with the capital-floor
+    safety gate (memo E2). Call sites that previously branched on
+    ``PAPER_TRADE`` directly should migrate to this helper so an
+    under-capitalised account can never accidentally ship live orders.
+    """
+    return bool(_evaluate_capital_floor_decision(balance).force_paper_trade)
+
+
+def _update_known_balance_and_notify_floor(balance: float) -> None:
+    """Cache the latest balance and fire a one-shot Telegram alert on breach.
+
+    Invoked from the main loop after each successful ``get_account_summary``.
+    The one-shot flag resets on any above-floor observation so the operator
+    is re-notified if the account drops again after top-ups.
+    """
+    global _last_known_balance, _capital_floor_notified
+    try:
+        _last_known_balance = float(balance)
+    except (TypeError, ValueError):
+        _last_known_balance = 0.0
+
+    decision = _evaluate_capital_floor_decision(_last_known_balance)
+    if decision.below_floor and not _capital_floor_notified:
+        _capital_floor_notified = True
+        log.warning(
+            f"🛑 Capital floor breached — balance={decision.account_balance:.2f} "
+            f"< min={decision.min_balance:.2f}. Forcing paper-trade mode "
+            f"(memo §8 E2)."
+        )
+        try:
+            telegram(
+                "🛑 <b>Capital Floor Breached</b>\n"
+                f"Balance: {decision.account_balance:,.2f}\n"
+                f"Floor:   {decision.min_balance:,.2f}\n"
+                "No live orders will be submitted until the balance recovers "
+                "(paper-mode forced per third-memo §8 E2)."
+            )
+        except Exception:
+            pass
+    elif not decision.below_floor and _capital_floor_notified:
+        _capital_floor_notified = False
+        log.info("✅ Capital floor cleared — live-order submission re-enabled.")
+
+
 def place_order(instrument: str, units: float, direction: str,
                 tp_price: float = None, sl_price: float = None,
                 trailing_sl_pips: float = None, label: str = "",
                 strategy: str = "",
                 bid: float | None = None, ask: float | None = None,
                 expected_spread_pips: float | None = None) -> dict:
-    if PAPER_TRADE:
+    # Tier 2v2 E2: refuse live submission when the capital floor is breached.
+    # ``_effective_paper_trade()`` composes PAPER_TRADE with the floor gate.
+    if _effective_paper_trade():
         price = get_current_price(instrument)
         entry = price["ask"] if direction == "LONG" else price["bid"]
         if entry > 0:
@@ -4899,6 +4996,7 @@ def _bootstrap_runtime() -> None:
     acct = get_account_summary()
     balance = acct.get("balance", 0)
     log.info(f"✅ OANDA account access verified: {acct.get('currency', 'GBP')} balance {balance:,.2f}")
+    _update_known_balance_and_notify_floor(balance)
     if not telegram_enabled():
         log.warning("Telegram notifications disabled: set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID for /status and heartbeat messages.")
     publish_bot_runtime_status("starting", balance=balance, force=True)
@@ -5003,6 +5101,7 @@ def run():
             acct = get_account_summary()
             balance = acct.get("balance", 0)
             publish_bot_runtime_status("running", balance=balance)
+            _update_known_balance_and_notify_floor(balance)
             if balance <= 0:
                 log_idle_state("zero balance", balance=balance, sleep_seconds=60)
                 log.warning("⚠️ Zero balance — sleeping 60s")
