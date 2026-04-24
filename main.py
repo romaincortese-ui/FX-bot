@@ -2006,6 +2006,18 @@ def sync_open_trades_with_oanda(reason: str = "manual") -> bool:
     global open_trades
     if PAPER_TRADE or not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
         return False
+    # Memo 4 follow-up — when the Tier 2v2 capital-floor gate has forced
+    # paper mode on an otherwise-live account, ``place_order`` returns
+    # synthetic ``PAPER_*`` trade IDs and pushes them onto ``open_trades``
+    # so /status and Telegram entry announcements are consistent. If we
+    # then sync against OANDA (which has zero real trades on a floor-
+    # gated account), the broker-side empty list would overwrite every
+    # paper trade. Short-circuit here so floor-mode state is preserved.
+    try:
+        if _effective_paper_trade():
+            return False
+    except Exception:
+        pass
 
     broker_trades = fetch_open_trades_from_oanda()
     with _open_trades_lock:
