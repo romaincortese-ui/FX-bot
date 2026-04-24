@@ -74,6 +74,9 @@ from fxbot.flow_strategies import (
 from fxbot.kill_switch import evaluate_drawdown_kill
 from fxbot.percentile_sizing import size_by_percentile
 from fxbot.regime import Regime, is_strategy_enabled as regime_is_strategy_enabled
+from fxbot.regime_dwell import RegimeDwellFilter
+from fxbot.carry_basket import build_carry_basket
+from fxbot.carry_feed import derive_currency_rates as derive_currency_rates_from_financing
 from fxbot.seasonality import seasonal_risk_multiplier
 from fxbot.slippage import get_default_logger as get_default_slippage_logger
 from fxbot.strategy_reconciliation import (
@@ -389,6 +392,16 @@ TIER3_SEASONALITY_ENABLED = os.getenv("TIER3_SEASONALITY_ENABLED", "1") not in (
 TIER3_WEEKLY_REPORT_ENABLED = os.getenv("TIER3_WEEKLY_REPORT_ENABLED", "1") not in ("0", "", "false", "False")
 TIER3_WEEKLY_REPORT_WEEKDAY = int(os.getenv("TIER3_WEEKLY_REPORT_WEEKDAY", "0"))  # 0=Monday
 TIER3_WEEKLY_REPORT_HOUR_UTC = int(os.getenv("TIER3_WEEKLY_REPORT_HOUR_UTC", "7"))
+# Tier 4 — verification and post-remediation hardening.
+TIER3_CARRY_BASKET_LIVE = os.getenv("TIER3_CARRY_BASKET_LIVE", "0") not in ("0", "", "false", "False")
+TIER3_CARRY_BASKET_TOP_N = int(os.getenv("TIER3_CARRY_BASKET_TOP_N", "3"))
+TIER3_CARRY_BASKET_BOTTOM_N = int(os.getenv("TIER3_CARRY_BASKET_BOTTOM_N", "3"))
+TIER3_CARRY_BASKET_TARGET_VOL = float(os.getenv("TIER3_CARRY_BASKET_TARGET_VOL", "8.0"))
+TIER4_REGIME_DWELL_BARS = int(os.getenv("TIER4_REGIME_DWELL_BARS", "4"))
+TIER4_CALIBRATION_REDIS_ONLY = os.getenv("TIER4_CALIBRATION_REDIS_ONLY", "0") not in ("0", "", "false", "False")
+TIER4_KILLSWITCH_REDIS_PERSIST = os.getenv("TIER4_KILLSWITCH_REDIS_PERSIST", "1") not in ("0", "", "false", "False")
+REDIS_CARRY_BASKET_KEY = os.getenv("REDIS_CARRY_BASKET_KEY", "fxbot:carry_basket")
+REDIS_KILLSWITCH_STATE_KEY = os.getenv("REDIS_KILLSWITCH_STATE_KEY", "fxbot:drawdown_state")
 PAIR_HEALTH_PROBE_INTERVAL_SECS = int(os.getenv("PAIR_HEALTH_PROBE_INTERVAL_SECS", "900"))
 PAIR_HEALTH_RECOVERY_SUCCESSES = int(os.getenv("PAIR_HEALTH_RECOVERY_SUCCESSES", "3"))
 PAIR_HEALTH_BLOCK_BASE_SECS = int(os.getenv("PAIR_HEALTH_BLOCK_BASE_SECS", "1800"))
@@ -406,7 +419,7 @@ SHARED_BUDGET_KEY = os.getenv("SHARED_BUDGET_KEY", os.getenv("FX_SHARED_BUDGET_K
 BOT_STATUS_INTERVAL = int(os.getenv("BOT_STATUS_INTERVAL", "60"))
 BOT_STATUS_TTL = int(os.getenv("BOT_STATUS_TTL", "180"))
 IDLE_LOG_INTERVAL = int(os.getenv("IDLE_LOG_INTERVAL", "1800"))
-CALIBRATION_MAX_AGE_HOURS = float(os.getenv("CALIBRATION_MAX_AGE_HOURS", "72"))
+CALIBRATION_MAX_AGE_HOURS = float(os.getenv("CALIBRATION_MAX_AGE_HOURS", "48"))
 CALIBRATION_MIN_TOTAL_TRADES = int(os.getenv("CALIBRATION_MIN_TOTAL_TRADES", "50"))
 HTTP_RETRIES        = 3
 HTTP_RETRY_DELAY    = 1.0
@@ -515,6 +528,10 @@ _strategy_bayesian_weights: dict[str, float] = {}
 _drawdown_risk_scale: float = 1.0
 _drawdown_hard_halt: bool = False
 _drawdown_reason: str = ""
+_drawdown_last_persisted_sig: tuple = ()
+_regime_dwell_filter = RegimeDwellFilter(min_dwell_bars=TIER4_REGIME_DWELL_BARS)
+_current_carry_basket: dict | None = None
+_last_carry_basket_refresh_at: float = 0.0
 _financing_cache = FinancingCache(ttl_seconds=TIER2_FINANCING_REFRESH_SECS)
 _last_financing_refresh_at: float = 0.0
 _slippage_logger = get_default_slippage_logger()
@@ -2933,6 +2950,14 @@ def load_trade_calibration() -> None:
             )
             return
 
+        if TIER4_CALIBRATION_REDIS_ONLY:
+            trade_calibration = {}
+            log.info(
+                f"[CALIBRATION] TIER4_CALIBRATION_REDIS_ONLY=1 and Redis key "
+                f"{REDIS_TRADE_CALIBRATION_KEY} empty/missing — calibration disabled"
+            )
+            return
+
         if not os.path.exists(TRADE_CALIBRATION_FILE):
             trade_calibration = {}
             return
@@ -2988,6 +3013,9 @@ def refresh_trade_calibration() -> bool:
                 trade_calibration.update(data)
                 return True
             return False
+
+    if TIER4_CALIBRATION_REDIS_ONLY:
+        return False
 
     try:
         mtime = os.path.getmtime(TRADE_CALIBRATION_FILE)
@@ -3525,12 +3553,16 @@ def _tier2_regime_label() -> "Regime":
     dxy = _dxy_ema_gap
     vix = _vix_level
     if dxy is not None and abs(dxy) >= 0.015:
-        return Regime.USD_TREND
-    if vix is not None and vix >= 25.0:
-        return Regime.RISK_OFF
-    if vix is not None and vix <= 13.5:
-        return Regime.RISK_ON
-    return Regime.CHOP
+        raw = Regime.USD_TREND
+    elif vix is not None and vix >= 25.0:
+        raw = Regime.RISK_OFF
+    elif vix is not None and vix <= 13.5:
+        raw = Regime.RISK_ON
+    else:
+        raw = Regime.CHOP
+    if TIER4_REGIME_DWELL_BARS <= 1:
+        return raw
+    return _regime_dwell_filter.observe(raw)
 
 
 def _tier2_regime_block_reason(strategy: str) -> str | None:
@@ -3581,6 +3613,7 @@ def _tier2_refresh_drawdown_state() -> None:
         _drawdown_risk_scale = 1.0
         _drawdown_hard_halt = False
         _drawdown_reason = ""
+        _tier4_persist_drawdown_state()
         return
     series = _tier2_daily_pnl_series()
     decision = evaluate_drawdown_kill(
@@ -3601,6 +3634,52 @@ def _tier2_refresh_drawdown_state() -> None:
         )
     else:
         _drawdown_risk_scale = 1.0
+    _tier4_persist_drawdown_state()
+
+
+def _tier4_persist_drawdown_state() -> None:
+    """Tier 4 §6: write kill-switch state to Redis immediately on change."""
+    global _drawdown_last_persisted_sig
+    if not TIER4_KILLSWITCH_REDIS_PERSIST or REDIS_CLIENT is None:
+        return
+    sig = (float(_drawdown_risk_scale), bool(_drawdown_hard_halt), str(_drawdown_reason))
+    if sig == _drawdown_last_persisted_sig:
+        return
+    try:
+        payload = {
+            "risk_scale": sig[0],
+            "hard_halt": sig[1],
+            "reason": sig[2],
+            "persisted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        REDIS_CLIENT.set(REDIS_KILLSWITCH_STATE_KEY, json.dumps(payload))
+        _drawdown_last_persisted_sig = sig
+    except Exception as e:
+        log.warning(f"killswitch_redis_persist_failed: {e}")
+
+
+def _tier4_restore_drawdown_state() -> None:
+    """Tier 4 §6: load kill-switch state from Redis on startup."""
+    global _drawdown_risk_scale, _drawdown_hard_halt, _drawdown_reason, _drawdown_last_persisted_sig
+    if not TIER4_KILLSWITCH_REDIS_PERSIST or REDIS_CLIENT is None:
+        return
+    try:
+        raw = REDIS_CLIENT.get(REDIS_KILLSWITCH_STATE_KEY)
+        if not raw:
+            return
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        _drawdown_risk_scale = float(data.get("risk_scale", 1.0))
+        _drawdown_hard_halt = bool(data.get("hard_halt", False))
+        _drawdown_reason = str(data.get("reason", ""))
+        _drawdown_last_persisted_sig = (_drawdown_risk_scale, _drawdown_hard_halt, _drawdown_reason)
+        log.info(
+            f"[KILLSWITCH] Restored drawdown state from Redis: "
+            f"risk_scale={_drawdown_risk_scale:.2f} hard_halt={_drawdown_hard_halt} reason={_drawdown_reason}"
+        )
+    except Exception as e:
+        log.warning(f"killswitch_redis_restore_failed: {e}")
 
 
 def _tier2_drawdown_block_reason() -> str | None:
@@ -3667,7 +3746,63 @@ def _tier2_refresh_financing(account_id: str, fetch) -> int:
     _last_financing_refresh_at = now
     if loaded:
         log.info(f"💱 Financing rates refreshed: {loaded} instruments")
+    _tier3_refresh_carry_basket()
     return loaded
+
+
+def _tier3_refresh_carry_basket() -> dict | None:
+    """Tier 4 §3: build a vol-normalised carry basket from live financing rates
+    and persist to Redis. Returns the basket payload or None.
+    """
+    global _current_carry_basket, _last_carry_basket_refresh_at
+    if not TIER3_CARRY_BASKET_LIVE:
+        return None
+    snapshot = _financing_cache.snapshot()
+    if not snapshot:
+        return None
+    try:
+        rates = derive_currency_rates_from_financing(snapshot)
+        if not rates:
+            return None
+        basket = build_carry_basket(
+            rates=rates,
+            top_n=TIER3_CARRY_BASKET_TOP_N,
+            bottom_n=TIER3_CARRY_BASKET_BOTTOM_N,
+            target_portfolio_vol_pct=TIER3_CARRY_BASKET_TARGET_VOL,
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        log.warning(f"carry_basket_refresh_failed: {exc}")
+        return None
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "expected_annual_carry_pct": basket.expected_annual_carry_pct,
+        "target_portfolio_vol_pct": basket.target_portfolio_vol_pct,
+        "exposure_multiplier": basket.exposure_multiplier,
+        "reason": basket.reason,
+        "legs": [
+            {
+                "currency": leg.currency,
+                "direction": leg.direction,
+                "rank": leg.rank,
+                "weight": leg.weight,
+                "deposit_rate_3m_pct": leg.deposit_rate_3m_pct,
+            }
+            for leg in basket.legs
+        ],
+    }
+    _current_carry_basket = payload
+    _last_carry_basket_refresh_at = time.time()
+    if REDIS_CLIENT is not None:
+        try:
+            REDIS_CLIENT.set(REDIS_CARRY_BASKET_KEY, json.dumps(payload))
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning(f"carry_basket_redis_persist_failed: {exc}")
+    log.info(
+        f"💼 Carry basket rebuilt: legs={len(payload['legs'])} "
+        f"expcarry={payload['expected_annual_carry_pct']:+.2f}% "
+        f"exposure_mult={payload['exposure_multiplier']:.2f}"
+    )
+    return payload
 
 
 def _tier2_carry_block_reason(label: str, instrument: str, direction: str) -> str | None:
@@ -4497,6 +4632,9 @@ def _bootstrap_runtime() -> None:
     log.info("=" * 60)
 
     load_state()
+
+    # Tier 4 §6 — restore drawdown/kill-switch state from Redis (crash-safe).
+    _tier4_restore_drawdown_state()
 
     # Tier 1 §7 item 1 — verify OANDA auth before touching anything else.
     _oanda_preflight_auth_check()
