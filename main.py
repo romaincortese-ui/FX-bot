@@ -8,6 +8,7 @@ import hmac
 import hashlib
 import logging
 import logging.handlers
+import sys
 import requests
 import json
 import os
@@ -104,6 +105,7 @@ STATIC_ALL_PAIRS = STATIC_CORE_PAIRS + STATIC_EXTENDED_PAIRS
 # ── Dynamic watchlist settings ────────────────────────────────
 DYNAMIC_PAIRS = []                 # will be filled at runtime
 LAST_WATCHLIST_UPDATE = 0
+LAST_FORCED_WATCHLIST_REBUILD_AT = 0.0  # last time we force-rebuilt because all pairs were blocked
 WATCHLIST_UPDATE_INTERVAL = int(os.getenv("WATCHLIST_UPDATE_INTERVAL", "3600"))  # 1 hour (was 4h; off-hours spread snapshots stale too long)
 MAX_WATCHLIST_SIZE = int(os.getenv("MAX_WATCHLIST_SIZE", "8"))
 MAX_SPREAD_FILTER_PIPS = float(os.getenv("MAX_SPREAD_FILTER_PIPS", "2.5"))  # raised from 1.5 — practice spreads widen off-hours
@@ -307,8 +309,23 @@ KELLY_MULT_STANDARD   = float(os.getenv("KELLY_MULT_STANDARD",   "1.8"))
 KELLY_MULT_SOLID      = float(os.getenv("KELLY_MULT_SOLID",      "1.2"))
 KELLY_MULT_MARGINAL   = float(os.getenv("KELLY_MULT_MARGINAL",   "0.8"))
 
-SCAN_INTERVAL_BASE   = int(os.getenv("SCAN_INTERVAL_BASE",   "30"))
-SCAN_INTERVAL_ACTIVE = int(os.getenv("SCAN_INTERVAL_ACTIVE", "10"))
+# Scan cadence defaults lifted from 30/10s -> 60/30s (Tier 1 §7 item 10 of
+# consultant assessment): 10s scans burn the OANDA 120 req/s budget, create
+# watchlist-rebuild churn and add no real signal on M5/M15 timeframes.
+SCAN_INTERVAL_BASE   = int(os.getenv("SCAN_INTERVAL_BASE",   "60"))
+SCAN_INTERVAL_ACTIVE = int(os.getenv("SCAN_INTERVAL_ACTIVE", "30"))
+# Forced watchlist rebuilds (the "all pairs blocked" path) must not fire more
+# often than this. Tier 1 §7 item 4: the 18h W2 log shows ~3124 forced
+# rebuilds in 17h40 — one every 20s — which is the primary livelock.
+FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS = int(os.getenv("FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS", "600"))
+
+# Tier 1 §7 item 9 — net-of-cost R:R floor. On spread-cost venues the reward
+# leg of the R:R must be net of round-trip spread, expected slippage, and
+# expected financing. Default floor 1.8 → for every 1.0 of SL risk we require
+# 1.8 of net reward. Set MIN_NET_RR=0 to disable the gate.
+MIN_NET_RR = float(os.getenv("MIN_NET_RR", "1.8"))
+NET_RR_SLIPPAGE_PIPS = float(os.getenv("NET_RR_SLIPPAGE_PIPS", "0.3"))
+NET_RR_FINANCING_PIPS = float(os.getenv("NET_RR_FINANCING_PIPS", "0.0"))
 PAIR_HEALTH_FAILURE_COOLDOWN_SECS = int(os.getenv("PAIR_HEALTH_FAILURE_COOLDOWN_SECS", "60"))
 PAIR_HEALTH_SUCCESS_COOLDOWN_SECS = int(os.getenv("PAIR_HEALTH_SUCCESS_COOLDOWN_SECS", "30"))
 PAIR_HEALTH_PROBE_INTERVAL_SECS = int(os.getenv("PAIR_HEALTH_PROBE_INTERVAL_SECS", "900"))
@@ -342,14 +359,38 @@ validate_main_config(globals())
 #  LOGGING
 # ═══════════════════════════════════════════════════════════════
 
+# Tier 1 §7 item 5 — split stdout/stderr by level so downstream log shippers
+# (Railway, Datadog, etc.) that key severity off the fd can map INFO → info
+# and WARNING+ → error. Previously every line was emitted to a single
+# StreamHandler and every line was re-tagged `severity=error` by the shipper.
+class _MaxLevelFilter(logging.Filter):
+    def __init__(self, max_level: int):
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover
+        return record.levelno < self.max_level
+
+
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s %(levelname)-5s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setFormatter(_log_formatter)
+_stdout_handler.setLevel(logging.INFO)
+_stdout_handler.addFilter(_MaxLevelFilter(logging.WARNING))
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setFormatter(_log_formatter)
+_stderr_handler.setLevel(logging.WARNING)
+_rotating_handler = logging.handlers.RotatingFileHandler(
+    "bot.log", maxBytes=10_000_000, backupCount=5
+)
+_rotating_handler.setFormatter(_log_formatter)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-5s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(),
-        logging.handlers.RotatingFileHandler("bot.log", maxBytes=10_000_000, backupCount=5),
-    ],
+    handlers=[_stdout_handler, _stderr_handler, _rotating_handler],
+    force=True,
 )
 log = logging.getLogger(__name__)
 
@@ -1037,26 +1078,51 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
             else:
                 log.warning("Allowlist filter left 0 pairs; falling back to full OANDA scan.")
 
-        # Filter by spread
+        # Filter by spread — emit structured per-pair telemetry on rejection so
+        # operators can diagnose the "8/8 spread gate rejection" livelock (Tier 1
+        # §7 item 3). Prior implementation wrote only a single free-text warning
+        # ("No pairs passed spread filter.") which was operationally useless.
         chunk_size = 40
         spread_ok = []
+        spread_rejections: list[dict] = []
         for i in range(0, len(fx_pairs), chunk_size):
             chunk = fx_pairs[i:i+chunk_size]
             for price in _fetch_pricing_chunk(chunk):
                 inst = price["instrument"]
                 bid = float(price["closeoutBid"])
                 ask = float(price["closeoutAsk"])
+                ps = pip_size(inst)
                 if bid <= 0 or ask <= 0:
                     mark_pair_failure(inst, "invalid price in watchlist", "quote")
+                    spread_rejections.append({"pair": inst, "bid": bid, "ask": ask, "pip_size": ps, "spread_pips": None, "reason": "invalid_quote"})
                     continue
                 mark_pair_success(inst, "quote")
-                spread = (ask - bid) / pip_size(inst)
+                spread = (ask - bid) / ps if ps > 0 else float("inf")
                 if spread <= max_spread_pips:
                     mark_pair_success(inst, "spread")
                     if is_pair_tradeable(inst):
                         spread_ok.append(inst)
+                        log.info(
+                            f"📊 spread_gate KEEP {inst} bid={bid:.5f} ask={ask:.5f} "
+                            f"pip_size={ps:g} spread_pips={spread:.2f} (<= {max_spread_pips:.2f})"
+                        )
+                    else:
+                        spread_rejections.append({"pair": inst, "bid": bid, "ask": ask, "pip_size": ps, "spread_pips": spread, "reason": "pair_health_blocked"})
                 else:
                     mark_pair_failure(inst, f"spread {spread:.1f} > {max_spread_pips:.1f}", "spread")
+                    spread_rejections.append({"pair": inst, "bid": bid, "ask": ask, "pip_size": ps, "spread_pips": spread, "reason": "spread_too_wide"})
+
+        # Aggregate WARN so the observability pipeline can alert when the gate
+        # rejects everything — the 17h40 W2 log showed this condition for 3124
+        # consecutive cycles with no per-pair detail.
+        if spread_rejections:
+            rejected_sample = spread_rejections[:8]
+            log.warning(
+                "📊 spread_gate rejections=%d (max=%.2fp) sample=%s",
+                len(spread_rejections),
+                max_spread_pips,
+                rejected_sample,
+            )
 
         if not spread_ok:
             log.warning("No pairs passed spread filter. Using static list.")
@@ -1139,12 +1205,26 @@ def get_effective_scan_pairs(session: dict) -> tuple[list[str], list[str], list[
     rebuilt_watchlist = False
 
     if not health_pairs and DYNAMIC_PAIRS:
-        log.warning("🩺 Active dynamic watchlist is fully blocked. Rebuilding watchlist.")
-        if refresh_dynamic_watchlist(force=True):
-            rebuilt_watchlist = True
-            refreshed_session = get_current_session()
-            active_pairs = list(refreshed_session["pairs_allowed"])
-            health_pairs = [pair for pair in active_pairs if is_pair_tradeable(pair)]
+        global LAST_FORCED_WATCHLIST_REBUILD_AT
+        now = time.time()
+        secs_since = now - LAST_FORCED_WATCHLIST_REBUILD_AT
+        if secs_since < FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS:
+            # Tier 1 §7 item 4: W2 log shows ~3123 forced rebuilds in 17h40 (one
+            # every 20s) because this branch fired on every scan pool miss. Cap
+            # it to at most once per FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS.
+            log.info(
+                "🩺 Active dynamic watchlist fully blocked — throttling rebuild "
+                f"(last rebuild {secs_since:.0f}s ago, min interval "
+                f"{FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS}s)."
+            )
+        else:
+            log.warning("🩺 Active dynamic watchlist is fully blocked. Rebuilding watchlist.")
+            LAST_FORCED_WATCHLIST_REBUILD_AT = now
+            if refresh_dynamic_watchlist(force=True):
+                rebuilt_watchlist = True
+                refreshed_session = get_current_session()
+                active_pairs = list(refreshed_session["pairs_allowed"])
+                health_pairs = [pair for pair in active_pairs if is_pair_tradeable(pair)]
 
     if not health_pairs:
         fallback_pool = [pair for pair in STATIC_ALL_PAIRS if is_pair_tradeable(pair)]
@@ -1227,12 +1307,25 @@ def _start_price_stream(pairs=None):
         pairs = DYNAMIC_PAIRS if DYNAMIC_PAIRS else STATIC_ALL_PAIRS
     # Always include pairs with open trades
     open_trade_pairs = list({t["instrument"] for t in open_trades})
-    all_pairs = filter_supported_pairs(list(set(pairs + open_trade_pairs)), "price stream")
+    requested = sorted(set(list(pairs) + open_trade_pairs))
+    all_pairs = filter_supported_pairs(requested, "price stream")
     if not all_pairs:
         log.warning("Skipping price stream start because no supported instruments remain.")
         return
 
-    log.info(f"Starting price stream with {len(all_pairs)} pairs: {all_pairs[:5]}...")
+    # Tier 1 §7 item 2: prior log said "Starting with N pairs" but then sliced
+    # to [:5] for display, making it look like EUR_USD / AUD_USD / EUR_GBP were
+    # silently dropped. Enumerate the full subscribed list and alert on any
+    # allowlisted pair that was filtered out.
+    dropped = sorted(set(requested) - set(all_pairs))
+    log.info(f"🔌 Starting price stream with {len(all_pairs)} pairs: {all_pairs}")
+    if dropped:
+        log.warning(f"🔌 Stream subscription dropped {len(dropped)} pair(s) via supported-filter: {dropped}")
+        try:
+            if any(p in STATIC_ALL_PAIRS for p in dropped):
+                telegram(f"⚠️ <b>Stream dropped allowlisted pairs</b>\nDropped: {', '.join(dropped)}")
+        except Exception:
+            pass
     _stop_stream_event.clear()
     _stream_thread = threading.Thread(target=_price_stream_worker, args=(all_pairs,), daemon=True, name="price-stream")
     _stream_thread.start()
@@ -1874,7 +1967,10 @@ def calculate_units_for_risk_amount(instrument: str, risk_amount: float, sl_pips
 
 def place_order(instrument: str, units: float, direction: str,
                 tp_price: float = None, sl_price: float = None,
-                trailing_sl_pips: float = None, label: str = "") -> dict:
+                trailing_sl_pips: float = None, label: str = "",
+                strategy: str = "",
+                bid: float | None = None, ask: float | None = None,
+                expected_spread_pips: float | None = None) -> dict:
     if PAPER_TRADE:
         price = get_current_price(instrument)
         entry = price["ask"] if direction == "LONG" else price["bid"]
@@ -1893,34 +1989,116 @@ def place_order(instrument: str, units: float, direction: str,
     native_units = max(1, int(round(abs(units))))
     signed_units = native_units if direction == "LONG" else -native_units
 
-    order_body = {
-        "order": {
+    strategy_upper = (strategy or label or "").upper()
+    price_precision = 5 if "JPY" not in instrument else 3
+
+    # Tier 1 §7 item 6 — SCALPER / REVERSAL / PULLBACK are mean-revert strategies
+    # whose realistic alpha is 1–3 pips. Paying the full spread on entry kills
+    # them. Route through a mid-spread LIMIT/GTD order with a 2s expiry; fall
+    # through to MARKET on cancel.
+    use_limit_entry = (
+        strategy_upper in {"SCALPER", "REVERSAL", "PULLBACK"}
+        and bid is not None and ask is not None
+        and bid > 0 and ask > bid
+    )
+
+    # Build common client extensions for idempotency + attribution (Tier 1 §7 item 8).
+    ext_id = f"fxbot-{(strategy_upper or 'bot').lower()}-{instrument}-{int(time.time()*1000)}"
+    client_ext = {
+        "id": ext_id[:128],
+        "tag": strategy_upper[:64] if strategy_upper else "BOT",
+        "comment": (label or strategy_upper)[:128],
+    }
+
+    def _build_bracket(order_dict: dict) -> None:
+        if tp_price:
+            order_dict["takeProfitOnFill"] = {"price": f"{tp_price:.{price_precision}f}"}
+        if sl_price:
+            order_dict["stopLossOnFill"] = {"price": f"{sl_price:.{price_precision}f}"}
+        if trailing_sl_pips:
+            dist = pips_to_price(instrument, trailing_sl_pips)
+            order_dict["trailingStopLossOnFill"] = {"distance": f"{dist:.{price_precision}f}"}
+
+    def _submit(order: dict) -> dict:
+        body = {"order": order}
+        return oanda_post(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", body)
+
+    result: dict | None = None
+    fill: dict = {}
+    used_mode = "MARKET"
+
+    if use_limit_entry:
+        try:
+            from fxbot.execution import plan_limit_entry
+            plan = plan_limit_entry(direction=direction, bid=float(bid), ask=float(ask), mid_offset_frac=0.5, wait_seconds=2)
+            limit_price = round(plan.limit_price, price_precision)
+            gtd_time = (datetime.now(timezone.utc) + timedelta(seconds=max(plan.wait_seconds, 1))).strftime("%Y-%m-%dT%H:%M:%S.000000000Z")
+            limit_order: dict = {
+                "type": "LIMIT",
+                "instrument": instrument,
+                "units": str(signed_units),
+                "price": f"{limit_price:.{price_precision}f}",
+                "timeInForce": "GTD",
+                "gtdTime": gtd_time,
+                "positionFill": "DEFAULT",
+                "clientExtensions": dict(client_ext),
+            }
+            _build_bracket(limit_order)
+            log.info(
+                f"[{label}] Placing LIMIT {direction} {instrument} px={limit_price} "
+                f"units={signed_units} gtd={plan.wait_seconds}s TP={tp_price} SL={sl_price} trail={trailing_sl_pips}"
+            )
+            limit_result = _submit(limit_order)
+            # If the limit was accepted AND filled within the GTD window, we're done.
+            fill_candidate = limit_result.get("orderFillTransaction", {})
+            if fill_candidate:
+                result = limit_result
+                fill = fill_candidate
+                used_mode = "LIMIT"
+            else:
+                log.info(f"[{label}] LIMIT entry not filled within {plan.wait_seconds}s — falling back to MARKET")
+        except Exception as e:
+            log.warning(f"[{label}] LIMIT planning failed ({e}) — using MARKET")
+
+    if result is None:
+        # MARKET fallback / default path (Tier 1 §7 items 7 + 8).
+        market_order: dict = {
             "type": "MARKET",
             "instrument": instrument,
             "units": str(signed_units),
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
+            "clientExtensions": dict(client_ext),
         }
-    }
+        # priceBound caps accepted fill at mid ± 1.5 × expected spread.
+        try:
+            mid: float | None = None
+            if bid is not None and ask is not None and bid > 0 and ask > bid:
+                mid = (float(bid) + float(ask)) / 2.0
+            if mid is None:
+                px = get_current_price(instrument)
+                if px and px.get("bid", 0) > 0 and px.get("ask", 0) > 0:
+                    mid = (float(px["bid"]) + float(px["ask"])) / 2.0
+                    if expected_spread_pips is None:
+                        expected_spread_pips = (float(px["ask"]) - float(px["bid"])) / pip_size(instrument)
+            if expected_spread_pips is None and bid is not None and ask is not None and bid > 0:
+                expected_spread_pips = (float(ask) - float(bid)) / pip_size(instrument)
+            if expected_spread_pips is None or expected_spread_pips <= 0:
+                expected_spread_pips = 2.0
+            if mid is not None:
+                bound_offset = 1.5 * expected_spread_pips * pip_size(instrument)
+                bound_price = mid + bound_offset if direction == "LONG" else mid - bound_offset
+                market_order["priceBound"] = f"{bound_price:.{price_precision}f}"
+        except Exception as e:
+            log.debug(f"[{label}] priceBound calc skipped: {e}")
 
-    if tp_price:
-        order_body["order"]["takeProfitOnFill"] = {
-            "price": f"{tp_price:.5f}" if "JPY" not in instrument else f"{tp_price:.3f}"
-        }
-    if sl_price:
-        order_body["order"]["stopLossOnFill"] = {
-            "price": f"{sl_price:.5f}" if "JPY" not in instrument else f"{sl_price:.3f}"
-        }
-    if trailing_sl_pips:
-        dist = pips_to_price(instrument, trailing_sl_pips)
-        order_body["order"]["trailingStopLossOnFill"] = {
-            "distance": f"{dist:.5f}" if "JPY" not in instrument else f"{dist:.3f}"
-        }
-
-    log.info(f"[{label}] Placing {direction} order: {instrument} | "
-             f"units={signed_units} | TP={tp_price} | SL={sl_price} | trail={trailing_sl_pips}p")
-
-    result = oanda_post(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", order_body)
+        _build_bracket(market_order)
+        log.info(
+            f"[{label}] Placing MARKET {direction} {instrument} units={signed_units} "
+            f"priceBound={market_order.get('priceBound','-')} TP={tp_price} SL={sl_price} trail={trailing_sl_pips}"
+        )
+        result = _submit(market_order)
+        fill = result.get("orderFillTransaction", {})
 
     if "error" in result or result.get("orderRejectTransaction") or result.get("orderCancelTransaction"):
         reject_message = _extract_oanda_error_message(result, str(result.get("error", "order rejected")))
@@ -3161,6 +3339,31 @@ def get_strategy_entry_block_reason(strategy: str, instrument: str, direction: s
         actual_score = float(opp.get("score", 0.0) or 0.0)
         if actual_score < required_score:
             return f"calibration threshold {actual_score:.1f} < {required_score:.1f}"
+        # Tier 1 §7 item 9 — net-of-cost R:R gate. Reject entries whose TP does
+        # not clear min_net_rr after subtracting round-trip spread, slippage
+        # and expected financing from the TP distance. Disabled by setting
+        # MIN_NET_RR=0 in the environment.
+        try:
+            from fxbot.cost_model import compute_net_rr
+            sl_pips = float(opp.get("sl_pips", 0.0) or 0.0)
+            tp_pips = float(opp.get("tp_pips", 0.0) or 0.0)
+            entry_spread = float(opp.get("spread_pips", 0.0) or 0.0)
+            if sl_pips > 0 and tp_pips > 0 and MIN_NET_RR > 0:
+                breakdown = compute_net_rr(
+                    sl_pips=sl_pips,
+                    tp_pips=tp_pips,
+                    entry_spread_pips=entry_spread,
+                    slippage_pips=NET_RR_SLIPPAGE_PIPS,
+                    financing_pips=NET_RR_FINANCING_PIPS,
+                    min_net_rr=MIN_NET_RR,
+                )
+                if not breakdown.passed:
+                    return (
+                        f"net_rr {breakdown.net_rr:.2f} < {MIN_NET_RR:.2f} "
+                        f"(sl={sl_pips:.1f} tp={tp_pips:.1f} spread={entry_spread:.1f})"
+                    )
+        except Exception as e:  # pragma: no cover - defensive
+            log.debug(f"net_rr gate error: {e}")
     if is_pair_paused_by_news(instrument) and strategy != "CARRY":
         return "pre-news risk window"
     return None
@@ -3246,7 +3449,13 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         sl_price = round(entry_price + opp["sl_pips"] * ps, 5 if "JPY" not in instrument else 3)
 
     trail_pips = opp.get("trail_pips")
-    result = place_order(instrument, units, direction, tp_price, sl_price, trail_pips, label)
+    result = place_order(
+        instrument, units, direction, tp_price, sl_price, trail_pips, label,
+        strategy=label,
+        bid=price_data.get("bid"),
+        ask=price_data.get("ask"),
+        expected_spread_pips=opp.get("spread_pips"),
+    )
     if not result or not result.get("id"):
         return None
 
@@ -3643,6 +3852,47 @@ def send_daily_summary(balance: float):
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════════════
 
+def _oanda_preflight_auth_check() -> None:
+    """Tier 1 §7 item 1: verify the OANDA API token against the configured
+    account at startup. If the token has insufficient scope (401) or the
+    account is unreachable (404/403), send a loud Telegram alert and abort.
+
+    This is the single most common cause of the bot running for hours with
+    no trades — the 18h W2 log window fired two HTTP 401s silently because
+    the existing error handling treated them as generic soft pair failures.
+    """
+    if PAPER_TRADE or not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
+        return
+    url = f"{OANDA_API_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/instruments"
+    try:
+        r = _get_session().get(url, timeout=10)
+    except (requests.ConnectionError, requests.Timeout) as e:
+        # Don't hard-fail the bot on a transient network blip — let the
+        # normal retry loop surface it. But log loudly so operators know.
+        log.warning(f"🔐 OANDA preflight network error: {e} — continuing, will retry in main loop")
+        return
+    if r.status_code == 200:
+        log.info(f"🔐 OANDA preflight OK: token authorised for account {OANDA_ACCOUNT_ID}")
+        return
+    body = (r.text or "")[:300]
+    msg = (
+        f"OANDA preflight FAILED — HTTP {r.status_code} on /v3/accounts/{OANDA_ACCOUNT_ID}/instruments. "
+        f"Body: {body}"
+    )
+    log.error(f"🔐 {msg}")
+    try:
+        telegram(
+            "🛑 <b>OANDA auth preflight failed</b>\n"
+            f"HTTP {r.status_code} on account <code>{OANDA_ACCOUNT_ID}</code>.\n"
+            f"<i>{body[:180]}</i>\n"
+            "Fix: re-issue the OANDA API token with View+Trade scope and redeploy."
+        )
+    except Exception:
+        pass
+    publish_bot_runtime_status("auth_error", error=msg[:200], force=True)
+    raise SystemExit(f"OANDA auth preflight failed: HTTP {r.status_code}")
+
+
 def _bootstrap_runtime() -> None:
     global open_trades, _market_regime_mult, _consecutive_losses
     global _session_loss_paused_until, _streak_paused_at, DYNAMIC_PAIRS
@@ -3656,6 +3906,9 @@ def _bootstrap_runtime() -> None:
     log.info("=" * 60)
 
     load_state()
+
+    # Tier 1 §7 item 1 — verify OANDA auth before touching anything else.
+    _oanda_preflight_auth_check()
 
     if not PAPER_TRADE and OANDA_API_KEY and OANDA_ACCOUNT_ID:
         sync_open_trades_with_oanda(reason="startup")
@@ -3843,6 +4096,42 @@ def run():
                     if close_trade_exit(trade, reason):
                         with _open_trades_lock:
                             open_trades.remove(trade)
+
+            # Tier 1 §7 item 11 — Friday 21:00 UTC weekend flatten for non-CARRY
+            # strategies. Avoids Sunday-open gap risk. `should_flatten_for_weekend`
+            # is idempotent so we can call it on every scan; it only returns True
+            # inside the flatten window.
+            try:
+                from fxbot.execution import should_flatten_for_weekend
+                now_utc = datetime.now(timezone.utc)
+                for trade in open_trades[:]:
+                    if not should_flatten_for_weekend(
+                        now_utc=now_utc,
+                        strategy=trade.get("label", ""),
+                        flatten_hour_utc=int(os.getenv("WEEKEND_FLATTEN_HOUR_UTC", "21")),
+                    ):
+                        continue
+                    label = trade.get("label", "")
+                    inst = trade.get("instrument", "")
+                    ok, err = close_trade_result(
+                        trade.get("id", ""),
+                        label=f"weekend_flatten:{label}",
+                        units=trade.get("units"),
+                        instrument=inst,
+                    )
+                    if ok:
+                        log.warning(f"🌙 Weekend flatten closed {label} {inst}")
+                        try:
+                            telegram(f"🌙 <b>Weekend flatten</b>\nClosed {label} on {inst} at Friday cutoff.")
+                        except Exception:
+                            pass
+                        with _open_trades_lock:
+                            if trade in open_trades:
+                                open_trades.remove(trade)
+                    else:
+                        log.error(f"🌙 Weekend flatten failed for {label} {inst}: {err}")
+            except Exception as e:  # pragma: no cover - defensive
+                log.debug(f"weekend flatten check error: {e}")
 
             # Entry scans
             if entries_allowed and len(open_trades) < MAX_OPEN_TRADES:
