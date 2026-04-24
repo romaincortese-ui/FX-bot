@@ -62,10 +62,19 @@ from fxbot.correlation_risk import (
     default_correlation_matrix,
     would_breach_portfolio_cap,
 )
+from fxbot.execution_report import (
+    build_weekly_report as build_weekly_execution_report,
+    format_weekly_telegram as format_weekly_execution_telegram,
+)
 from fxbot.financing import FinancingCache, is_carry_favourable
+from fxbot.flow_strategies import (
+    active_flow_window as active_flow_window_fn,
+    instrument_is_flow_eligible,
+)
 from fxbot.kill_switch import evaluate_drawdown_kill
 from fxbot.percentile_sizing import size_by_percentile
 from fxbot.regime import Regime, is_strategy_enabled as regime_is_strategy_enabled
+from fxbot.seasonality import seasonal_risk_multiplier
 from fxbot.slippage import get_default_logger as get_default_slippage_logger
 from fxbot.strategy_reconciliation import (
     get_default_reconciliation as get_default_strategy_reconciliation,
@@ -182,7 +191,7 @@ SCALPER_BUDGET_PCT    = float(os.getenv("SCALPER_BUDGET_PCT",  "0.35"))
 SCALPER_THRESHOLD     = int(os.getenv("SCALPER_THRESHOLD",     "40"))
 SCALPER_TP_ATR_MULT   = float(os.getenv("SCALPER_TP_ATR_MULT", "2.0"))
 SCALPER_SL_ATR_MULT   = float(os.getenv("SCALPER_SL_ATR_MULT", "1.3"))
-SCALPER_TP_MIN_PIPS   = float(os.getenv("SCALPER_TP_MIN_PIPS", "8"))
+SCALPER_TP_MIN_PIPS   = float(os.getenv("SCALPER_TP_MIN_PIPS", "15"))
 SCALPER_TP_MAX_PIPS   = float(os.getenv("SCALPER_TP_MAX_PIPS", "30"))
 SCALPER_SL_MIN_PIPS   = float(os.getenv("SCALPER_SL_MIN_PIPS", "5"))
 SCALPER_SL_MAX_PIPS   = float(os.getenv("SCALPER_SL_MAX_PIPS", "20"))
@@ -371,6 +380,15 @@ TIER2_BAYESIAN_WEIGHTING_ENABLED = os.getenv("TIER2_BAYESIAN_WEIGHTING_ENABLED",
 TIER2_BAYESIAN_MIN_WEIGHT = float(os.getenv("TIER2_BAYESIAN_MIN_WEIGHT", "0.25"))
 TIER2_BAYESIAN_MAX_WEIGHT = float(os.getenv("TIER2_BAYESIAN_MAX_WEIGHT", "2.0"))
 SHARED_BUDGET_STRICT_REDIS = os.getenv("SHARED_BUDGET_STRICT_REDIS", "0") not in ("0", "", "false", "False")
+# Tier 3 — structural edge-expansion flags.
+TIER3_SCALPER_DISABLE_CROSSES = os.getenv("TIER3_SCALPER_DISABLE_CROSSES", "1") not in ("0", "", "false", "False")
+TIER3_POST_NEWS_ENABLED = os.getenv("TIER3_POST_NEWS_ENABLED", "0") not in ("0", "", "false", "False")
+TIER3_POST_NEWS_CONFIRM_DELAY_SECS = int(os.getenv("TIER3_POST_NEWS_CONFIRM_DELAY_SECS", "90"))
+TIER3_FLOW_WINDOWS_ENABLED = os.getenv("TIER3_FLOW_WINDOWS_ENABLED", "1") not in ("0", "", "false", "False")
+TIER3_SEASONALITY_ENABLED = os.getenv("TIER3_SEASONALITY_ENABLED", "1") not in ("0", "", "false", "False")
+TIER3_WEEKLY_REPORT_ENABLED = os.getenv("TIER3_WEEKLY_REPORT_ENABLED", "1") not in ("0", "", "false", "False")
+TIER3_WEEKLY_REPORT_WEEKDAY = int(os.getenv("TIER3_WEEKLY_REPORT_WEEKDAY", "0"))  # 0=Monday
+TIER3_WEEKLY_REPORT_HOUR_UTC = int(os.getenv("TIER3_WEEKLY_REPORT_HOUR_UTC", "7"))
 PAIR_HEALTH_PROBE_INTERVAL_SECS = int(os.getenv("PAIR_HEALTH_PROBE_INTERVAL_SECS", "900"))
 PAIR_HEALTH_RECOVERY_SUCCESSES = int(os.getenv("PAIR_HEALTH_RECOVERY_SUCCESSES", "3"))
 PAIR_HEALTH_BLOCK_BASE_SECS = int(os.getenv("PAIR_HEALTH_BLOCK_BASE_SECS", "1800"))
@@ -3711,6 +3729,103 @@ def _tier2_log_slippage(
 #  ENTRY & EXIT MANAGEMENT
 # ═══════════════════════════════════════════════════════════════
 
+
+# Tier 3 helpers (§23, §24, §25, §27).
+_USD_MAJORS = {"EUR_USD", "GBP_USD", "AUD_USD", "NZD_USD", "USD_JPY", "USD_CHF", "USD_CAD"}
+
+
+def _tier3_scalper_cross_block(strategy: str, instrument: str) -> str | None:
+    """Tier 3 §23: SCALPER is cost-prohibitive on crosses. Block there."""
+    if not TIER3_SCALPER_DISABLE_CROSSES:
+        return None
+    if str(strategy).upper() != "SCALPER":
+        return None
+    pair = (instrument or "").upper()
+    if pair in _USD_MAJORS:
+        return None
+    return f"scalper_cross_blocked:{pair}"
+
+
+def _tier3_post_news_confirmation_block(
+    strategy: str,
+    instrument: str,
+    now: datetime | None = None,
+) -> str | None:
+    """Tier 3 §24: POST_NEWS requires a 90-second post-release confirmation delay.
+
+    When ``TIER3_POST_NEWS_ENABLED`` is false (default), POST_NEWS is
+    disabled entirely. When true, we require at least
+    ``TIER3_POST_NEWS_CONFIRM_DELAY_SECS`` to elapse after the
+    pause-end timestamp before any POST_NEWS entry is considered.
+    """
+    if str(strategy).upper() != "POST_NEWS":
+        return None
+    if not TIER3_POST_NEWS_ENABLED:
+        return "post_news_disabled_tier3"
+    ts = now or datetime.now(timezone.utc)
+    events = get_post_news_events_for_instrument(instrument, ts)
+    if not events:
+        return None
+    min_delay = max(0, int(TIER3_POST_NEWS_CONFIRM_DELAY_SECS))
+    for event in events:
+        end_str = event.get("pause_end")
+        pause_end = _parse_macro_news_timestamp(end_str) if end_str else None
+        if pause_end is None:
+            continue
+        elapsed = (ts - pause_end).total_seconds()
+        if elapsed < min_delay:
+            return f"post_news_awaiting_confirmation:{int(min_delay - elapsed)}s"
+    return None
+
+
+def _tier3_flow_bias(instrument: str, now: datetime | None = None) -> float:
+    """Tier 3 §25: return a risk multiplier >=1 when inside a flow window."""
+    if not TIER3_FLOW_WINDOWS_ENABLED:
+        return 1.0
+    window = active_flow_window_fn(now)
+    if not window.in_window:
+        return 1.0
+    if not instrument_is_flow_eligible(instrument, window.event):
+        return 1.0
+    return float(window.risk_multiplier)
+
+
+def _tier3_seasonality_bias(strategy: str, instrument: str, now: datetime | None = None) -> float:
+    """Tier 3 §27: empirical EUR/USD & GBP/USD hourly seasonality bias."""
+    if not TIER3_SEASONALITY_ENABLED:
+        return 1.0
+    return seasonal_risk_multiplier(strategy, instrument, now)
+
+
+def _tier3_send_weekly_report(balance: float) -> bool:
+    """Tier 3 §28: weekly execution-quality summary to Telegram."""
+    global last_weekly_summary
+    if not TIER3_WEEKLY_REPORT_ENABLED:
+        return False
+    now = datetime.now(timezone.utc)
+    if now.weekday() != TIER3_WEEKLY_REPORT_WEEKDAY:
+        return False
+    if now.hour != TIER3_WEEKLY_REPORT_HOUR_UTC:
+        return False
+    tag = now.strftime("%Y-%W")
+    if last_weekly_summary == tag:
+        return False
+    try:
+        slip = _slippage_logger.aggregate_by_strategy()
+    except Exception:
+        slip = {}
+    report = build_weekly_execution_report(
+        trade_history=trade_history,
+        slippage_by_strategy=slip,
+        now=now,
+        days=7,
+    )
+    msg = format_weekly_execution_telegram(report, currency=get_account_currency())
+    telegram(msg)
+    last_weekly_summary = tag
+    return True
+
+
 def _would_breach_correlation_limit(instrument: str, direction: str) -> tuple[bool, int, int]:
     return would_breach_correlation_limit(open_trades, instrument, direction, MAX_CORRELATED_TRADES)
 
@@ -3789,6 +3904,12 @@ def get_strategy_entry_block_reason(strategy: str, instrument: str, direction: s
             log.debug(f"net_rr gate error: {e}")
     if is_pair_paused_by_news(instrument) and strategy != "CARRY":
         return "pre-news risk window"
+    scalper_block = _tier3_scalper_cross_block(strategy, instrument)
+    if scalper_block is not None:
+        return scalper_block
+    post_news_block = _tier3_post_news_confirmation_block(strategy, instrument)
+    if post_news_block is not None:
+        return post_news_block
     regime_block = _tier2_regime_block_reason(strategy)
     if regime_block is not None:
         return regime_block
@@ -3813,7 +3934,15 @@ def get_entry_risk_multiplier(strategy: str, instrument: str, session_name: str 
     risk_mult = NEWS_WINDOW_RISK_MULT if is_pair_paused_by_news(instrument) else 1.0
     calibration = get_trade_calibration_adjustment(strategy, instrument, session_name)
     dd_scale = float(_drawdown_risk_scale) if TIER2_DRAWDOWN_KILL_ENABLED else 1.0
-    return round(max(CALIBRATION_RISK_FLOOR, risk_mult * calibration["risk_mult"] * dd_scale), 3)
+    flow_mult = _tier3_flow_bias(instrument)
+    seasonal_mult = _tier3_seasonality_bias(strategy, instrument)
+    return round(
+        max(
+            CALIBRATION_RISK_FLOOR,
+            risk_mult * calibration["risk_mult"] * dd_scale * flow_mult * seasonal_mult,
+        ),
+        3,
+    )
 
 def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     instrument = opp["instrument"]
@@ -4768,7 +4897,10 @@ def run():
 
             send_heartbeat(balance)
             send_daily_summary(balance)
-
+            try:
+                _tier3_send_weekly_report(balance)
+            except Exception as e:
+                logger.warning(f"tier3_weekly_report_failed: {e}")
             # Dynamic scan interval
             if session["aggression"] in ("HIGH",):
                 scan_interval = SCAN_INTERVAL_ACTIVE
