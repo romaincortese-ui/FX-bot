@@ -143,7 +143,13 @@ PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
 # £0.10/pip minimum, making real per-trade risk 5–10× the model. Force paper
 # mode until the account is capitalised. Operator can override with
 # ``CAPITAL_FLOOR_ENABLED=0`` or a lower ``MIN_LIVE_BALANCE`` value.
-CAPITAL_FLOOR_ENABLED = os.getenv("CAPITAL_FLOOR_ENABLED", "1") not in ("0", "", "false", "False")
+#
+# Default is *off* on ``practice`` (demo) accounts — there is no real money
+# to protect, the whole point of the demo is to exercise the full order
+# path. On ``live`` the floor is on by default so an under-capitalised real
+# account cannot accidentally ship 5–10× risk. Env var always wins.
+_DEFAULT_CAPITAL_FLOOR_ENABLED = "0" if OANDA_ENVIRONMENT == "practice" else "1"
+CAPITAL_FLOOR_ENABLED = os.getenv("CAPITAL_FLOOR_ENABLED", _DEFAULT_CAPITAL_FLOOR_ENABLED) not in ("0", "", "false", "False")
 MIN_LIVE_BALANCE = float(os.getenv("MIN_LIVE_BALANCE", "10000"))
 _last_known_balance: float = 0.0
 _capital_floor_notified: bool = False
