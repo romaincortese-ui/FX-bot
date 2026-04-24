@@ -139,9 +139,18 @@ STATIC_ALL_PAIRS = STATIC_CORE_PAIRS + STATIC_EXTENDED_PAIRS
 DYNAMIC_PAIRS = []                 # will be filled at runtime
 LAST_WATCHLIST_UPDATE = 0
 LAST_FORCED_WATCHLIST_REBUILD_AT = 0.0  # last time we force-rebuilt because all pairs were blocked
+# Tracks the last spread-gate rejection "signature" (pair,spread,reason tuple).
+# Used to downgrade identical repeats from WARNING to DEBUG — see third-memo §2.3.
+_last_spread_gate_signature: tuple | None = None
 WATCHLIST_UPDATE_INTERVAL = int(os.getenv("WATCHLIST_UPDATE_INTERVAL", "3600"))  # 1 hour (was 4h; off-hours spread snapshots stale too long)
 MAX_WATCHLIST_SIZE = int(os.getenv("MAX_WATCHLIST_SIZE", "8"))
-MAX_SPREAD_FILTER_PIPS = float(os.getenv("MAX_SPREAD_FILTER_PIPS", "2.5"))  # raised from 1.5 — practice spreads widen off-hours
+# Third-memo §2.3: fxPractice spreads are structurally 3–5× fxTrade live.
+# A 2.5p cap rejects every G10 pair on practice (EUR_USD 2.7p, GBP_USD 5.1p,
+# USD_JPY 3.5p, NZD_USD 13.6p off-hours) and falls through to the static list
+# every rebuild. Use 5.0p on practice and the tighter 2.5p on live; operator
+# can still override with MAX_SPREAD_FILTER_PIPS.
+_DEFAULT_MAX_SPREAD_FILTER_PIPS = "5.0" if OANDA_ENVIRONMENT == "practice" else "2.5"
+MAX_SPREAD_FILTER_PIPS = float(os.getenv("MAX_SPREAD_FILTER_PIPS", _DEFAULT_MAX_SPREAD_FILTER_PIPS))
 ALWAYS_INCLUDE_CORE_PAIRS = os.getenv("ALWAYS_INCLUDE_CORE_PAIRS", "true").strip().lower() in {"1", "true", "yes", "on"}
 # Restrict the dynamic watchlist universe to the operator's configured pair list
 # (STATIC_ALL_PAIRS). Without this, the 68-pair OANDA scan can surface exotics
@@ -430,7 +439,10 @@ BOT_STATUS_INTERVAL = int(os.getenv("BOT_STATUS_INTERVAL", "60"))
 BOT_STATUS_TTL = int(os.getenv("BOT_STATUS_TTL", "180"))
 IDLE_LOG_INTERVAL = int(os.getenv("IDLE_LOG_INTERVAL", "1800"))
 CALIBRATION_MAX_AGE_HOURS = float(os.getenv("CALIBRATION_MAX_AGE_HOURS", "48"))
-CALIBRATION_MIN_TOTAL_TRADES = int(os.getenv("CALIBRATION_MIN_TOTAL_TRADES", "50"))
+# Lowered 50 → 30 (third-memo §2.2). Any single 120-day backtest run on this
+# repo produces ~40 trades under the current gate topology; a 50-trade floor
+# made the calibration payload permanently unreachable on a fresh publish.
+CALIBRATION_MIN_TOTAL_TRADES = int(os.getenv("CALIBRATION_MIN_TOTAL_TRADES", "30"))
 HTTP_RETRIES        = 3
 HTTP_RETRY_DELAY    = 1.0
 HEARTBEAT_INTERVAL  = int(os.getenv("HEARTBEAT_INTERVAL",  "3600"))
@@ -524,6 +536,28 @@ _macro_news_mtime    = 0.0
 macro_news_pause_until = 0.0
 trade_calibration    = {}
 _trade_calibration_mtime = 0.0
+# Tracks the last "ignoring" reason emitted at INFO so repeat cycles can
+# downgrade the log to DEBUG. Third-memo §2.2: the live worker was emitting
+# ~217 identical rejection lines in 52 minutes. Only the first one carries
+# operator-actionable information.
+_calibration_last_reject_reason: str | None = None
+
+
+def _log_calibration_ignored(source_label: str, reason: str) -> None:
+    """Emit the 'ignoring' line at INFO on first hit, DEBUG thereafter."""
+    global _calibration_last_reject_reason
+    msg = f"[CALIBRATION] Ignoring {source_label}: {reason}"
+    if reason == _calibration_last_reject_reason:
+        log.debug(msg)
+    else:
+        log.info(msg)
+        _calibration_last_reject_reason = reason
+
+
+def _log_calibration_loaded_reset() -> None:
+    """Clear the rejection dedup key once a valid payload has loaded."""
+    global _calibration_last_reject_reason
+    _calibration_last_reject_reason = None
 _recent_scan_decisions = []
 _last_scan_cycle_at   = ""
 _last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0, "active_pairs": [], "tradable_pairs": []}
@@ -1232,18 +1266,35 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
 
         # Aggregate WARN so the observability pipeline can alert when the gate
         # rejects everything — the 17h40 W2 log showed this condition for 3124
-        # consecutive cycles with no per-pair detail.
+        # consecutive cycles with no per-pair detail. Dedup repeated-identical
+        # state to DEBUG after the first hit (third-memo §2.3).
+        global _last_spread_gate_signature  # noqa: PLW0603
         if spread_rejections:
             rejected_sample = spread_rejections[:8]
-            log.warning(
-                "📊 spread_gate rejections=%d (max=%.2fp) sample=%s",
-                len(spread_rejections),
-                max_spread_pips,
-                rejected_sample,
-            )
+            signature = tuple(sorted(
+                (r["pair"], round(r.get("spread_pips") or -1.0, 1), r["reason"])
+                for r in spread_rejections
+            ))
+            if signature == _last_spread_gate_signature:
+                log.debug(
+                    "📊 spread_gate rejections=%d (max=%.2fp) [unchanged]",
+                    len(spread_rejections),
+                    max_spread_pips,
+                )
+            else:
+                log.warning(
+                    "📊 spread_gate rejections=%d (max=%.2fp) sample=%s",
+                    len(spread_rejections),
+                    max_spread_pips,
+                    rejected_sample,
+                )
+                _last_spread_gate_signature = signature
 
         if not spread_ok:
-            log.warning("No pairs passed spread filter. Using static list.")
+            if _last_spread_gate_signature is not None:
+                log.debug("No pairs passed spread filter. Using static list.")
+            else:
+                log.warning("No pairs passed spread filter. Using static list.")
             fallback_pairs = [pair for pair in STATIC_ALL_PAIRS if is_pair_tradeable(pair)]
             return filter_supported_pairs(fallback_pairs, "static fallback") or fallback_pairs or STATIC_ALL_PAIRS
 
@@ -1559,6 +1610,28 @@ def _categorize_entry_block_reason(reason: str) -> str:
         return "unknown"
     if _is_market_halted_reason(normalized):
         return "broker_closed"
+    # Third-memo §3 / P0.4 — recognise Tier 1-5 overlay categories so the
+    # [GATE_BLOCK] telemetry can be filtered by cause.
+    if "net_rr" in normalized:
+        return "net_rr_fail"
+    if "calibration threshold" in normalized:
+        return "calibration_score"
+    if "regime" in normalized:
+        return "regime_veto"
+    if "carry" in normalized and ("financing" in normalized or "swap" in normalized):
+        return "carry_financing"
+    if "reconcil" in normalized or "contradict" in normalized:
+        return "reconciliation"
+    if "post_news" in normalized or "post-news" in normalized or "news confirmation" in normalized:
+        return "post_news_confirm"
+    if "scalper" in normalized and "cross" in normalized:
+        return "scalper_cross_block"
+    if "pre-news" in normalized or "news risk window" in normalized:
+        return "news_blackout"
+    if "correlation" in normalized or "portfolio vol" in normalized:
+        return "correlation_cap"
+    if "kill" in normalized or "drawdown" in normalized:
+        return "drawdown_kill"
     if "spread" in normalized:
         return "spread_wide"
     if any(term in normalized for term in ("missing bid/ask", "invalid price", "no candles", "no valid candle rows", "short candle history")):
@@ -1566,6 +1639,40 @@ def _categorize_entry_block_reason(reason: str) -> str:
     if any(term in normalized for term in ("invalid instrument", "pricing request failed", "rejected instrument", "tradeable", "tradable", "close only")):
         return "broker_unavailable"
     return "other"
+
+
+# [GATE_BLOCK] structured telemetry — third-memo §3 / P0.4.
+# The worker fires open_trade_entry() every scan cycle per (strategy,pair).
+# Without dedup, an active session produces 40+ duplicate lines per minute.
+# We dedup on (strategy,instrument,category) within a 60s window.
+_gate_block_last_emit: dict[tuple[str, str, str], float] = {}
+_GATE_BLOCK_DEDUP_SECS = float(os.getenv("GATE_BLOCK_DEDUP_SECS", "60"))
+
+
+def _emit_gate_block_log(
+    strategy: str,
+    instrument: str,
+    direction: str,
+    category: str,
+    reason: str,
+    score: float,
+) -> None:
+    key = (strategy, instrument, category)
+    now = time.time()
+    last = _gate_block_last_emit.get(key, 0.0)
+    if now - last < _GATE_BLOCK_DEDUP_SECS:
+        log.debug(
+            f"[GATE_BLOCK] strategy={strategy} instrument={instrument} "
+            f"direction={direction} category={category} score={score:.1f} "
+            f"reason=\"{reason}\" [dedup]"
+        )
+        return
+    _gate_block_last_emit[key] = now
+    log.info(
+        f"[GATE_BLOCK] strategy={strategy} instrument={instrument} "
+        f"direction={direction} category={category} score={score:.1f} "
+        f"reason=\"{reason}\""
+    )
 
 
 def _sample_entry_blockers(pairs: list[str], limit: int = 3) -> str:
@@ -2269,6 +2376,27 @@ def place_order(instrument: str, units: float, direction: str,
     mark_pair_failure(instrument, "order returned without fill", "order")
     return {}
 
+BROKER_RECONCILED_SENTINEL = "__BROKER_RECONCILED__"
+# OANDA reject codes that indicate the trade is already closed / not present at
+# the broker. Returning (True, BROKER_RECONCILED_SENTINEL) lets the caller drop
+# the trade from local state with pnl=0 instead of entering a retry storm.
+# Ref: third-memo §2.1 — the untreated case was generating 19 close-retry
+# errors / minute against phantom trades restored from startup sync.
+_RECONCILABLE_REJECT_CODES = (
+    "TRADE_DOESNT_EXIST",
+    "POSITION_DOESNT_EXIST",
+    "ORDER_DOESNT_EXIST",
+    "CLOSEOUT_POSITION_DOESNT_EXIST",
+)
+
+
+def _is_broker_reconcile_reject(message: str | None) -> bool:
+    if not message:
+        return False
+    upper = message.upper()
+    return any(code in upper for code in _RECONCILABLE_REJECT_CODES)
+
+
 def close_trade_result(trade_id: str, label: str = "", units: float = None,
                        instrument: str = "") -> tuple[bool, str | None]:
     if PAPER_TRADE:
@@ -2280,6 +2408,18 @@ def close_trade_result(trade_id: str, label: str = "", units: float = None,
     result = oanda_put(path, body)
     if "error" in result or result.get("orderRejectTransaction") or result.get("orderCancelTransaction"):
         reject_message = _extract_oanda_error_message(result, str(result.get("error", "close rejected")))
+        if _is_broker_reconcile_reject(reject_message):
+            # Trade already closed at broker (manual close, broker liquidation,
+            # replica swap, or a previous close that we failed to reconcile
+            # locally). Treat as terminal success so the caller drops the
+            # trade from `open_trades` instead of retrying forever.
+            log.warning(
+                f"[{label}] Trade {trade_id} already closed at broker "
+                f"({reject_message}) — reconciling locally"
+            )
+            if instrument:
+                mark_pair_success(instrument, "close")
+            return True, BROKER_RECONCILED_SENTINEL
         log.error(f"[{label}] Close trade {trade_id} failed: {reject_message}")
         if instrument:
             hard_failure = _is_hard_broker_rejection(reject_message, result.get("status_code"))
@@ -2950,9 +3090,10 @@ def load_trade_calibration() -> None:
             ok, reason = _validate_trade_calibration_payload(data)
             if not ok:
                 trade_calibration = {}
-                log.info(f"[CALIBRATION] Ignoring Redis calibration from key {REDIS_TRADE_CALIBRATION_KEY}: {reason}")
+                _log_calibration_ignored(f"Redis calibration from key {REDIS_TRADE_CALIBRATION_KEY}", reason)
                 return
             trade_calibration = data
+            _log_calibration_loaded_reset()
             log.info(
                 f"[CALIBRATION] Loaded trade calibration from Redis key {REDIS_TRADE_CALIBRATION_KEY}: "
                 f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
@@ -2981,10 +3122,11 @@ def load_trade_calibration() -> None:
         ok, reason = _validate_trade_calibration_payload(data)
         if not ok:
             trade_calibration = {}
-            log.info(f"[CALIBRATION] Ignoring file calibration from {TRADE_CALIBRATION_FILE}: {reason}")
+            _log_calibration_ignored(f"file calibration from {TRADE_CALIBRATION_FILE}", reason)
             return
 
         trade_calibration = data
+        _log_calibration_loaded_reset()
         log.info(
             f"[CALIBRATION] Loaded trade calibration from {TRADE_CALIBRATION_FILE}: "
             f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
@@ -3004,13 +3146,14 @@ def refresh_trade_calibration() -> bool:
             if not ok:
                 if trade_calibration:
                     trade_calibration.clear()
-                log.info(f"[CALIBRATION] Ignoring Redis calibration from key {REDIS_TRADE_CALIBRATION_KEY}: {reason}")
+                _log_calibration_ignored(f"Redis calibration from key {REDIS_TRADE_CALIBRATION_KEY}", reason)
                 return False
             generated_at = data.get("generated_at")
             if generated_at and generated_at != _trade_calibration_mtime:
                 _trade_calibration_mtime = generated_at
                 trade_calibration.clear()
                 trade_calibration.update(data)
+                _log_calibration_loaded_reset()
                 log.info(
                     f"[CALIBRATION] Loaded trade calibration from Redis key {REDIS_TRADE_CALIBRATION_KEY}: "
                     f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
@@ -4157,6 +4300,14 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
 
     block_reason = get_strategy_entry_block_reason(label, instrument, direction, opp=opp, session_name=session_name)
     if block_reason is not None:
+        # P0.4 (third-memo §3) — emit a structured [GATE_BLOCK] line in
+        # addition to the human "[{label}] Skip ..." so operators can grep
+        # for block categories without regex-parsing free text. Dedup identical
+        # (strategy,instrument,category) pairs within the same scan cycle so
+        # we do not re-emit 8 identical lines per rebuild.
+        category = _categorize_entry_block_reason(block_reason)
+        score = float(opp.get("score", 0.0) or 0.0) if opp else 0.0
+        _emit_gate_block_log(label, instrument, direction, category, block_reason, score)
         log.info(f"[{label}] Skip {instrument} {direction} — {block_reason}")
         return None
 
@@ -4471,6 +4622,15 @@ def close_trade_exit(trade: dict, reason: str):
             log.error(f"[{label}] Failed to close {instrument} — will retry{suffix}")
         return False
 
+    reconciled = (close_error == BROKER_RECONCILED_SENTINEL)
+    if reconciled:
+        # Trade was already closed at broker; we cannot compute a real pnl
+        # without a fill record, so record pnl=0 and mark the exit reason.
+        # This also suppresses streak / drawdown updates for a non-event.
+        pnl_pips = 0.0
+        exit_price = trade.get("entry_price", exit_price)
+        reason = "BROKER_RECONCILED"
+
     pnl = pnl_pips * pip_value(instrument, trade.get("units", 1), get_account_currency())
     held_min = (time.time() - trade.get("opened_ts", time.time())) / 60
 
@@ -4492,6 +4652,18 @@ def close_trade_exit(trade: dict, reason: str):
         "closed_at":    datetime.now(timezone.utc).isoformat(),
     }
     trade_history.append(history_entry)
+
+    if reconciled:
+        # Don't pollute streak / posterior / telegram with phantom closes.
+        _tier2_refresh_drawdown_state()
+        clear_close_retry(trade["id"])
+        save_state()
+        telegram(
+            f"🔄 <b>{label} Reconciled</b> | {instrument}\n"
+            f"Trade {trade.get('id','?')} already closed at broker; "
+            f"dropped from local state (pnl=0)."
+        )
+        return True
 
     if pnl > 0:
         _consecutive_losses = 0
