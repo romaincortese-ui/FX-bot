@@ -77,6 +77,7 @@ from fxbot.regime import Regime, is_strategy_enabled as regime_is_strategy_enabl
 from fxbot.regime_dwell import RegimeDwellFilter
 from fxbot.carry_basket import build_carry_basket
 from fxbot.carry_feed import derive_currency_rates as derive_currency_rates_from_financing
+from fxbot.decision_day import decision_day_follow_through
 from fxbot.seasonality import seasonal_risk_multiplier
 from fxbot.slippage import get_default_logger as get_default_slippage_logger
 from fxbot.strategy_reconciliation import (
@@ -93,6 +94,7 @@ from fxbot.strategies import score_pullback as core_score_pullback
 from fxbot.strategies import score_reversal as core_score_reversal
 from fxbot.strategies import score_scalper as core_score_scalper
 from fxbot.strategies import score_trend as core_score_trend
+from fxbot.usdjpy_iv_feed import fetch_usdjpy_1w_iv
 
 
 def _parse_pair_env(var_name: str, default: str) -> list[str]:
@@ -400,6 +402,14 @@ TIER3_CARRY_BASKET_TARGET_VOL = float(os.getenv("TIER3_CARRY_BASKET_TARGET_VOL",
 TIER4_REGIME_DWELL_BARS = int(os.getenv("TIER4_REGIME_DWELL_BARS", "4"))
 TIER4_CALIBRATION_REDIS_ONLY = os.getenv("TIER4_CALIBRATION_REDIS_ONLY", "0") not in ("0", "", "false", "False")
 TIER4_KILLSWITCH_REDIS_PERSIST = os.getenv("TIER4_KILLSWITCH_REDIS_PERSIST", "1") not in ("0", "", "false", "False")
+# Tier 5 — edge expansion: quarter-end flow, decision-day follow-through, carry IV feed.
+TIER5_END_OF_QUARTER_ENABLED = os.getenv("TIER5_END_OF_QUARTER_ENABLED", "1") not in ("0", "", "false", "False")
+TIER5_DECISION_DAY_ENABLED = os.getenv("TIER5_DECISION_DAY_ENABLED", "0") not in ("0", "", "false", "False")
+TIER5_DECISION_DAY_START_DELAY_SECS = int(os.getenv("TIER5_DECISION_DAY_START_DELAY_SECS", "90"))
+TIER5_DECISION_DAY_WINDOW_MINUTES = int(os.getenv("TIER5_DECISION_DAY_WINDOW_MINUTES", "15"))
+TIER5_DECISION_DAY_RISK_MULTIPLIER = float(os.getenv("TIER5_DECISION_DAY_RISK_MULTIPLIER", "1.20"))
+TIER5_USDJPY_IV_ENABLED = os.getenv("TIER5_USDJPY_IV_ENABLED", "0") not in ("0", "", "false", "False")
+REDIS_USDJPY_IV_KEY = os.getenv("REDIS_USDJPY_IV_KEY", "fxbot:usdjpy_1w_iv")
 REDIS_CARRY_BASKET_KEY = os.getenv("REDIS_CARRY_BASKET_KEY", "fxbot:carry_basket")
 REDIS_KILLSWITCH_STATE_KEY = os.getenv("REDIS_KILLSWITCH_STATE_KEY", "fxbot:drawdown_state")
 PAIR_HEALTH_PROBE_INTERVAL_SECS = int(os.getenv("PAIR_HEALTH_PROBE_INTERVAL_SECS", "900"))
@@ -3764,11 +3774,13 @@ def _tier3_refresh_carry_basket() -> dict | None:
         rates = derive_currency_rates_from_financing(snapshot)
         if not rates:
             return None
+        iv_pct = _tier5_fetch_usdjpy_iv_pct()
         basket = build_carry_basket(
             rates=rates,
             top_n=TIER3_CARRY_BASKET_TOP_N,
             bottom_n=TIER3_CARRY_BASKET_BOTTOM_N,
             target_portfolio_vol_pct=TIER3_CARRY_BASKET_TARGET_VOL,
+            usdjpy_1w_iv_pct=iv_pct,
         )
     except Exception as exc:  # pragma: no cover — defensive
         log.warning(f"carry_basket_refresh_failed: {exc}")
@@ -3778,6 +3790,7 @@ def _tier3_refresh_carry_basket() -> dict | None:
         "expected_annual_carry_pct": basket.expected_annual_carry_pct,
         "target_portfolio_vol_pct": basket.target_portfolio_vol_pct,
         "exposure_multiplier": basket.exposure_multiplier,
+        "usdjpy_1w_iv_pct": iv_pct,
         "reason": basket.reason,
         "legs": [
             {
@@ -3920,6 +3933,8 @@ def _tier3_flow_bias(instrument: str, now: datetime | None = None) -> float:
     window = active_flow_window_fn(now)
     if not window.in_window:
         return 1.0
+    if window.event == "END_OF_QUARTER" and not TIER5_END_OF_QUARTER_ENABLED:
+        return 1.0
     if not instrument_is_flow_eligible(instrument, window.event):
         return 1.0
     return float(window.risk_multiplier)
@@ -3930,6 +3945,59 @@ def _tier3_seasonality_bias(strategy: str, instrument: str, now: datetime | None
     if not TIER3_SEASONALITY_ENABLED:
         return 1.0
     return seasonal_risk_multiplier(strategy, instrument, now)
+
+
+def _tier5_decision_day_bias(
+    strategy: str,
+    instrument: str,
+    now: datetime | None = None,
+) -> float:
+    """Tier 5 §8: central-bank decision-day follow-through sizing bias.
+
+    Only trend-continuation strategies benefit — POST_NEWS has its own
+    90-second confirmation gate in Tier 3 §24 and REVERSAL/ASIAN_FADE
+    are explicitly fading the release, so this helper returns 1.0 for
+    them regardless of the window.
+    """
+    if not TIER5_DECISION_DAY_ENABLED:
+        return 1.0
+    s = str(strategy).upper()
+    if s in {"POST_NEWS", "REVERSAL", "ASIAN_FADE", "CARRY"}:
+        return 1.0
+    try:
+        signal = decision_day_follow_through(
+            instrument=instrument,
+            events=macro_news,
+            now=now,
+            start_delay_secs=TIER5_DECISION_DAY_START_DELAY_SECS,
+            window_minutes=TIER5_DECISION_DAY_WINDOW_MINUTES,
+            risk_multiplier=TIER5_DECISION_DAY_RISK_MULTIPLIER,
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug(f"decision_day_bias_error: {exc}")
+        return 1.0
+    return float(signal.risk_multiplier) if signal.in_window else 1.0
+
+
+def _tier5_fetch_usdjpy_iv_pct() -> float | None:
+    """Tier 5 §9: pull the latest USD/JPY 1-week ATM IV from Redis/HTTP.
+
+    Returns ``None`` when disabled or when no trusted reading is available.
+    The caller must treat ``None`` as "run without the IV kill-switch".
+    """
+    if not TIER5_USDJPY_IV_ENABLED:
+        return None
+    try:
+        quote = fetch_usdjpy_1w_iv(
+            redis_client=REDIS_CLIENT,
+            redis_key=REDIS_USDJPY_IV_KEY,
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug(f"usdjpy_iv_fetch_error: {exc}")
+        return None
+    if quote is None:
+        return None
+    return float(quote.atm_iv_pct)
 
 
 def _tier3_send_weekly_report(balance: float) -> bool:
@@ -4071,10 +4139,11 @@ def get_entry_risk_multiplier(strategy: str, instrument: str, session_name: str 
     dd_scale = float(_drawdown_risk_scale) if TIER2_DRAWDOWN_KILL_ENABLED else 1.0
     flow_mult = _tier3_flow_bias(instrument)
     seasonal_mult = _tier3_seasonality_bias(strategy, instrument)
+    decision_mult = _tier5_decision_day_bias(strategy, instrument)
     return round(
         max(
             CALIBRATION_RISK_FLOOR,
-            risk_mult * calibration["risk_mult"] * dd_scale * flow_mult * seasonal_mult,
+            risk_mult * calibration["risk_mult"] * dd_scale * flow_mult * seasonal_mult * decision_mult,
         ),
         3,
     )

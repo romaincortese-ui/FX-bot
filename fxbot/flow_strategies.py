@@ -122,9 +122,52 @@ def is_month_end_window(
     return FlowWindow(False, "", start, end, 0.0, 1.0)
 
 
+_QUARTER_END_MONTHS = {3, 6, 9, 12}
+
+
+def is_end_of_quarter_window(
+    now: datetime | None = None,
+    *,
+    last_business_days: int = 10,
+    utc_hour_start: int = 13,
+    utc_hour_end: int = 16,
+) -> FlowWindow:
+    """End-of-quarter rebalancing flow (FX-bot Tier 5 §7).
+
+    Distinct from month-end: the last ~10 business days of March, June,
+    September and December carry significantly larger pension-fund,
+    sovereign-wealth and index-tracker rebalancing flow than a regular
+    month-end. The effect concentrates 13:00–16:00 UTC (London afternoon
+    through the WMR fix).
+
+    Returns a window with 1.40× risk multiplier — slightly above the
+    regular month-end bias — while preserving the unused-window
+    invariants of the other helpers.
+    """
+    ts = _to_utc(now)
+    if ts.month not in _QUARTER_END_MONTHS:
+        return FlowWindow(False, "", None, None, 0.0, 1.0)
+    candidates = {
+        _last_business_day_offset(ts.date(), n)
+        for n in range(max(1, int(last_business_days)))
+    }
+    if ts.date() not in candidates:
+        return FlowWindow(False, "", None, None, 0.0, 1.0)
+    start = datetime.combine(ts.date(), time(utc_hour_start, 0), tzinfo=timezone.utc)
+    end = datetime.combine(ts.date(), time(utc_hour_end, 0), tzinfo=timezone.utc)
+    if start <= ts <= end:
+        remaining = (end - ts).total_seconds() / 60.0
+        return FlowWindow(True, "END_OF_QUARTER", start, end, remaining, 1.40)
+    return FlowWindow(False, "", start, end, 0.0, 1.0)
+
+
 def active_flow_window(now: datetime | None = None) -> FlowWindow:
     """Return the single highest-priority active flow window, if any."""
-    # Month-end overlaps London fix; pick month-end since its bias is larger.
+    # End-of-quarter beats month-end (strictly stronger flow). Month-end
+    # overlaps London fix; pick month-end since its bias is larger.
+    eoq = is_end_of_quarter_window(now)
+    if eoq.in_window:
+        return eoq
     me = is_month_end_window(now)
     if me.in_window:
         return me
@@ -149,4 +192,7 @@ def instrument_is_flow_eligible(instrument: str, event: str) -> bool:
     if event == "MONTH_END":
         # Month-end flows concentrate in G3; skip emerging crosses.
         return pair in {"EUR_USD", "GBP_USD", "USD_JPY", "EUR_GBP", "USD_CHF"}
+    if event == "END_OF_QUARTER":
+        # Quarter-end rebalance is G3-heavy plus EUR_CHF (hedging leg).
+        return pair in {"EUR_USD", "GBP_USD", "USD_JPY", "EUR_GBP", "USD_CHF", "EUR_CHF", "EUR_JPY"}
     return False
