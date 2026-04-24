@@ -17,6 +17,9 @@ class SimulatorConfig:
     news_slippage_pips: float
     round_trip_cost_pips: float
     max_risk_per_trade: float
+    # Memo 4 §8 F4 — per-pair empirical spread floor overrides. None /
+    # empty dict = fall back to ``spread_floor_pips`` for every pair.
+    per_pair_spread_floor_pips: dict[str, float] | None = None
 
 
 class TradeSimulator:
@@ -68,7 +71,10 @@ class TradeSimulator:
         if units <= 0 or not self.can_open_trade():
             return None
         direction = opp["direction"]
-        effective_spread = max(spread_pips + self.config.spread_buffer_pips, self.config.spread_floor_pips)
+        pair_floor = self.config.spread_floor_pips
+        if self.config.per_pair_spread_floor_pips:
+            pair_floor = float(self.config.per_pair_spread_floor_pips.get(opp["instrument"], pair_floor))
+        effective_spread = max(spread_pips + self.config.spread_buffer_pips, pair_floor)
         slippage = self.config.news_slippage_pips if news_active else self.config.slippage_pips
         if execution_bar and float(execution_bar.get("bid_close", 0) or 0) > 0 and float(execution_bar.get("ask_close", 0) or 0) > 0:
             raw_entry = float(execution_bar["ask_close"]) if direction == "LONG" else float(execution_bar["bid_close"])

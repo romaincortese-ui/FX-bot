@@ -34,6 +34,19 @@ class BacktestConfig:
     generate_macro_states: bool = True
     spread_buffer_pips: float = 0.2
     spread_floor_pips: float = 0.8
+    # Memo 4 §8 F4 — per-pair empirical spread floor. Aligns the BT cost
+    # model with live OANDA fxTrade percentile spreads so the overlay
+    # stack is not starved of candidates by a uniform 0.8 p floor that
+    # overstates costs on the liquid majors. Fallback to
+    # ``spread_floor_pips`` for any pair not in this map.
+    per_pair_spread_floor_pips: dict[str, float] = field(default_factory=lambda: {
+        "EUR_USD": 0.3,
+        "USD_JPY": 0.5,
+        "GBP_USD": 0.5,
+        "AUD_USD": 0.5,
+        "USD_CHF": 0.7,
+        "USD_CAD": 0.7,
+    })
     slippage_pips: float = 0.4
     news_slippage_pips: float = 2.0
     round_trip_cost_pips: float = 0.5

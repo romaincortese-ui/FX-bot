@@ -58,6 +58,7 @@ class BacktestEngine:
                 news_slippage_pips=config.news_slippage_pips,
                 round_trip_cost_pips=config.round_trip_cost_pips,
                 max_risk_per_trade=config.max_risk_per_trade,
+                per_pair_spread_floor_pips=dict(getattr(config, "per_pair_spread_floor_pips", {}) or {}),
             )
         )
         self.strategy_order: list[tuple[str, Callable[..., dict[str, Any] | None]]] = [
@@ -259,25 +260,29 @@ class BacktestEngine:
         return round(regime_atr_mult * vix_regime * dxy_regime, 3)
 
     def _estimate_spread_pips(self, instrument: str, now: datetime) -> float:
+        # Memo 4 §8 F4 — use per-pair empirical floor when configured so
+        # the cost model is no longer uniformly biased by a 0.8 p floor.
+        pair_map = getattr(self.config, "per_pair_spread_floor_pips", None) or {}
+        floor = float(pair_map.get(instrument, self.config.spread_floor_pips))
         bar = self._bar_at(instrument, self.config.granularity, now)
         if bar and float(bar.get("bid_close", 0) or 0) > 0 and float(bar.get("ask_close", 0) or 0) > 0:
             pip_divisor = 0.01 if "JPY" in instrument else 0.0001
-            return round(max(self.config.spread_floor_pips, (float(bar["ask_close"]) - float(bar["bid_close"])) / pip_divisor), 3)
+            return round(max(floor, (float(bar["ask_close"]) - float(bar["bid_close"])) / pip_divisor), 3)
         if instrument not in self._spread_profiles:
             self._spread_profiles[instrument] = self.data_provider.get_pair_spread_profile(instrument, self.config.granularity, self.config.start - timedelta(days=10), self.config.end + timedelta(days=2))
         profile = self._spread_profiles[instrument]
         by_hour = profile.get(f"hour_{now.hour:02d}")
         if by_hour is not None:
-            return round(max(self.config.spread_floor_pips, float(by_hour)), 3)
+            return round(max(floor, float(by_hour)), 3)
         default = profile.get("default")
         if default is not None:
-            return round(max(self.config.spread_floor_pips, float(default)), 3)
+            return round(max(floor, float(default)), 3)
         df = self._fetch_candles_until(instrument, self.config.granularity, 40, now)
         if df is None or len(df) < 20:
-            return self.config.spread_floor_pips
+            return floor
         atr = calc_atr(df, 14)
         atr_pips = atr / 0.01 if "JPY" in instrument else atr / 0.0001
-        estimate = max(self.config.spread_floor_pips, min(3.0, atr_pips * 0.03 + self.config.spread_buffer_pips))
+        estimate = max(floor, min(3.0, atr_pips * 0.03 + self.config.spread_buffer_pips))
         return round(estimate, 3)
 
     def _strategy_threshold(self, label: str) -> int:
@@ -337,6 +342,19 @@ class BacktestEngine:
             self._spy_closes.append(float(spy["close"]))
 
         # Classify regime every step; RegimeDwellFilter smooths out flicker.
+        #
+        # Memo 4 §8 F4 — when the macro feed genuinely lacks DXY/VIX/SPY
+        # history (e.g. the cached BT data only carries the traded pairs)
+        # the classifier correctly returns CHOP as a safe fallback, but
+        # CHOP then vetoes TREND/CARRY/PULLBACK for the entire run. Treat
+        # that specific "no-data" case as a permissive UNKNOWN by setting
+        # ``_regime_has_signal`` False, which bypasses the regime veto
+        # rather than silently blocking 100% of candidates.
+        self._regime_has_signal = bool(
+            len(self._vix_history) >= 30
+            or len(self._spy_closes) >= 25
+            or len(self._dxy_closes) >= 25
+        )
         try:
             raw = classify_regime(
                 dxy_closes=list(self._dxy_closes) or None,
@@ -349,6 +367,10 @@ class BacktestEngine:
 
     def _regime_blocks(self, strategy: str) -> bool:
         if not self._tier2_regime_veto_enabled:
+            return False
+        # Do not veto on a CHOP that is purely a no-data fallback — wait
+        # until at least one macro observable has warmed up.
+        if not getattr(self, "_regime_has_signal", True):
             return False
         return not is_strategy_enabled(strategy, self._current_regime)
 

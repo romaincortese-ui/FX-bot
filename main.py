@@ -2291,6 +2291,64 @@ def place_order(instrument: str, units: float, direction: str,
                 strategy: str = "",
                 bid: float | None = None, ask: float | None = None,
                 expected_spread_pips: float | None = None) -> dict:
+    # Memo 4 §8 F5 — entry-spread audit. Emit a single structured log
+    # line per attempted entry so operators can prove the spread seen at
+    # decision time matched the per-strategy cap, closing the "spread
+    # sample ≠ entry spread" gap flagged in memo §3.3. In strict mode
+    # (default ON) the order is refused if the measured spread exceeds
+    # the per-strategy cap; set ENTRY_SPREAD_AUDIT_STRICT=0 to bypass.
+    _strategy_for_cap = (strategy or label or "").upper()
+    _spread_caps = {
+        "SCALPER": SCALPER_MAX_SPREAD_PIPS,
+        "TREND": TREND_MAX_SPREAD_PIPS,
+        "REVERSAL": REVERSAL_MAX_SPREAD_PIPS,
+        "BREAKOUT": BREAKOUT_MAX_SPREAD_PIPS,
+        "CARRY": CARRY_MAX_SPREAD_PIPS,
+        "ASIAN_FADE": ASIAN_FADE_MAX_SPREAD_PIPS,
+        "POST_NEWS": POST_NEWS_MAX_SPREAD_PIPS,
+        "PULLBACK": PULLBACK_MAX_SPREAD_PIPS,
+    }
+    _cap_pips = _spread_caps.get(_strategy_for_cap, MAX_SPREAD_FILTER_PIPS)
+    _observed_spread: float | None = None
+    try:
+        if bid is not None and ask is not None and float(ask) > float(bid) > 0:
+            _observed_spread = (float(ask) - float(bid)) / pip_size(instrument)
+        elif expected_spread_pips is not None:
+            _observed_spread = float(expected_spread_pips)
+        else:
+            _px = get_current_price(instrument)
+            if _px and _px.get("bid", 0) > 0 and _px.get("ask", 0) > 0:
+                _observed_spread = (float(_px["ask"]) - float(_px["bid"])) / pip_size(instrument)
+    except Exception:
+        _observed_spread = None
+    _spread_txt = f"{_observed_spread:.2f}" if _observed_spread is not None else "UNKNOWN"
+    log.info(
+        f"[ENTRY_SPREAD] strategy={_strategy_for_cap or 'UNKNOWN'} "
+        f"instrument={instrument} spread_pips={_spread_txt} "
+        f"cap_pips={_cap_pips:.2f} direction={direction} "
+        f"units={units} label={label}"
+    )
+    _strict_audit = os.getenv("ENTRY_SPREAD_AUDIT_STRICT", "true").strip().lower() not in {"0", "false", "no", "off"}
+    if (
+        _strict_audit
+        and _observed_spread is not None
+        and _cap_pips > 0
+        and _observed_spread > _cap_pips
+    ):
+        log.warning(
+            f"[ENTRY_SPREAD_BLOCKED] strategy={_strategy_for_cap} instrument={instrument} "
+            f"spread_pips={_observed_spread:.2f} > cap_pips={_cap_pips:.2f} — refusing entry (memo 4 §8 F5)"
+        )
+        return {
+            "id": f"SPREAD_BLOCKED_{int(time.time()*1000)}",
+            "instrument": instrument,
+            "units": 0,
+            "blocked": True,
+            "reason": "entry_spread_above_cap",
+            "spread_pips": _observed_spread,
+            "cap_pips": _cap_pips,
+        }
+
     # Tier 2v2 E2: refuse live submission when the capital floor is breached.
     # ``_effective_paper_trade()`` composes PAPER_TRADE with the floor gate.
     if _effective_paper_trade():
