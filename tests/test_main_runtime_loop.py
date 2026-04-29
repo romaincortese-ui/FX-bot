@@ -204,7 +204,9 @@ def test_build_fx_budget_snapshot_uses_shared_sleeve_state(monkeypatch, tmp_path
     assert snapshot["max_trade_risk_amount"] == 5.0
     assert snapshot["max_total_risk_amount"] == 75.0
     assert snapshot["reserved_fx_risk"] == 30.0
-    assert snapshot["sibling_gold_reserved_risk"] == 12.5
+    # Accounts are separated per-bot; the FX-bot no longer reads the gold-bot's
+    # reserved-risk slot. Sibling reserved-risk is always 0 by definition.
+    assert snapshot["sibling_gold_reserved_risk"] == 0.0
     assert snapshot["available_fx_risk"] == 45.0
 
 

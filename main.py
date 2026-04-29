@@ -200,9 +200,14 @@ DXY_REGIME_THRESHOLD = float(os.getenv("DXY_REGIME_THRESHOLD", "0.008"))
 # ── Spread betting min stake ──────────────────────────────────
 SPREAD_BET_MIN_STAKE = float(os.getenv("SPREAD_BET_MIN_STAKE", "0.10"))
 
-# ── Shared account sleeve split ───────────────────────────────
-FX_BUDGET_ALLOCATION = float(os.getenv("FX_BUDGET_ALLOCATION", "0.50"))
-GOLD_BUDGET_ALLOCATION = float(os.getenv("GOLD_BUDGET_ALLOCATION", "0.50"))
+# ── Account allocation ────────────────────────────────────────
+# Each bot now runs against its own dedicated OANDA sub-account (FX-bot and
+# Gold-bot are no longer co-sharing one account), so the FX-bot uses 100% of
+# the account it sees. The legacy *_BUDGET_ALLOCATION env vars are kept for
+# backward compatibility; lower them only if you want to reserve a portion of
+# this account for something other than FX trading.
+FX_BUDGET_ALLOCATION = float(os.getenv("FX_BUDGET_ALLOCATION", "1.00"))
+GOLD_BUDGET_ALLOCATION = float(os.getenv("GOLD_BUDGET_ALLOCATION", "1.00"))
 
 # ── Capital allocation ───────────────────────────────────────
 SCALPER_ALLOCATION_PCT  = float(os.getenv("SCALPER_ALLOCATION_PCT",  "0.30"))
@@ -217,6 +222,14 @@ MAX_TOTAL_EXPOSURE     = float(os.getenv("MAX_TOTAL_EXPOSURE",      "0.15"))
 MAX_CORRELATED_TRADES  = int(os.getenv("MAX_CORRELATED_TRADES",     "3"))
 MAX_OPEN_TRADES        = int(os.getenv("MAX_OPEN_TRADES",           "8"))
 LEVERAGE               = float(os.getenv("LEVERAGE",                "30"))
+# Absolute hard cap on per-trade risk in account currency. Set > 0 to enable.
+# Use case: small accounts on spread-bet products where SPREAD_BET_MIN_STAKE
+# can clamp the per-pip stake UP, inflating realised risk above
+# MAX_RISK_PER_TRADE %. With this cap set, any trade whose minimum-stake-
+# quantised risk would exceed the cap is REJECTED (not paper-mode forced).
+# 0 = disabled (default).
+MAX_RISK_AMOUNT_PER_TRADE = float(os.getenv("MAX_RISK_AMOUNT_PER_TRADE", "0"))
+
 
 # ── Session windows (UTC) ───────────────────────────────────
 TOKYO_OPEN_UTC   = int(os.getenv("TOKYO_OPEN_UTC",   "0"))
@@ -809,7 +822,10 @@ def build_fx_budget_snapshot(account_balance: float) -> dict[str, float]:
     payload = _load_shared_budget_payload()
     bots = payload.get("bots", {}) if isinstance(payload, dict) else {}
     fx_reserved = float(bots.get("fx", {}).get("reserved_risk", 0.0) or 0.0)
-    gold_reserved = float(bots.get("gold", {}).get("reserved_risk", 0.0) or 0.0)
+    # Accounts are separated per-bot (FX-bot and Gold-bot run on dedicated
+    # OANDA sub-accounts). Sibling reserved-risk is therefore 0 by definition
+    # — the gold bot's positions cannot consume FX-bot account margin.
+    gold_reserved = 0.0
     fx_sleeve_balance = float(account_balance) * FX_BUDGET_ALLOCATION
     max_trade_risk_amount = fx_sleeve_balance * MAX_RISK_PER_TRADE
     max_total_risk_amount = fx_sleeve_balance * MAX_TOTAL_EXPOSURE
@@ -4517,7 +4533,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     )
     if risk_amount <= 0:
         log.info(
-            f"[{label}] Skip {instrument} {direction} — FX sleeve risk exhausted "
+            f"[{label}] Skip {instrument} {direction} — FX risk budget exhausted "
             f"({budget_snapshot['reserved_fx_risk']:.2f}/{budget_snapshot['max_total_risk_amount']:.2f})"
         )
         return None
@@ -4530,6 +4546,24 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         return None
 
     units = calculate_units_for_risk_amount(instrument, risk_amount, opp["sl_pips"], account_currency)
+
+    # Hard absolute-£ cap on per-trade realised risk. Protects small spread-bet
+    # accounts where SPREAD_BET_MIN_STAKE clamps the per-pip stake UP, so that
+    # the realised risk on wide-stop trades silently exceeds MAX_RISK_PER_TRADE %.
+    # Disabled when MAX_RISK_AMOUNT_PER_TRADE <= 0.
+    if MAX_RISK_AMOUNT_PER_TRADE > 0:
+        realised_risk = _estimate_fx_trade_reserved_risk({
+            "instrument": instrument,
+            "units": units,
+            "sl_pips": opp["sl_pips"],
+        })
+        if realised_risk > MAX_RISK_AMOUNT_PER_TRADE:
+            log.info(
+                f"[{label}] Skip {instrument} {direction} — realised risk "
+                f"{realised_risk:.2f} > MAX_RISK_AMOUNT_PER_TRADE {MAX_RISK_AMOUNT_PER_TRADE:.2f} "
+                f"(min-stake clamp on {opp['sl_pips']:.1f}-pip stop)"
+            )
+            return None
 
     price_data = get_current_price(instrument)
     entry_price = price_data["ask"] if direction == "LONG" else price_data["bid"]
@@ -4546,7 +4580,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         effective_margin_available = min(margin_available, sleeve_margin_cap) if margin_available > 0 else sleeve_margin_cap
         if margin_required is not None and effective_margin_available > 0 and margin_required > effective_margin_available:
             log.info(
-                f"[{label}] Skip {instrument} {direction} — insufficient FX sleeve margin "
+                f"[{label}] Skip {instrument} {direction} — insufficient margin "
                 f"({margin_required:.2f} > {effective_margin_available:.2f} {account_currency})"
             )
             return None
@@ -4648,7 +4682,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         f"SL: {sl_price:.5f} (-{opp['sl_pips']:.1f} pips)\n"
         f"Trail: {trail_text}\n"
         f"Units: {unit_text} | Risk model: {account_currency} {risk_amount:.2f}\n"
-        f"FX sleeve: {account_currency} {budget_snapshot['fx_sleeve_balance']:.2f} | Reserved: {budget_snapshot['reserved_fx_risk']:.2f}\n"
+        f"Account: {account_currency} {budget_snapshot['fx_sleeve_balance']:.2f} | Reserved: {budget_snapshot['reserved_fx_risk']:.2f}\n"
         f"Notional: {notional_text}\n"
         f"Budget est. (margin @{LEVERAGE:.0f}x): {margin_text}\n"
         f"Effective leverage: {effective_leverage_text}\n"
