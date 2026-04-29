@@ -87,9 +87,14 @@ class MainRuntimeConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_allocations(self) -> "MainRuntimeConfig":
-        sleeve_total = self.fx_budget_allocation + self.gold_budget_allocation
-        if abs(sleeve_total - 1.0) > 0.01:
-            raise ValueError(f"FX_BUDGET_ALLOCATION and GOLD_BUDGET_ALLOCATION must sum to 1.0, got {sleeve_total:.4f}")
+        # Account-separation refactor (commit 5bfe896): each bot now operates
+        # against its own OANDA sub-account, so FX_BUDGET_ALLOCATION and
+        # GOLD_BUDGET_ALLOCATION are independent per-service knobs (each in
+        # [0, 1]) rather than two halves of a shared sleeve. The previous
+        # cross-bot "must sum to 1.0" rule is incompatible with that model
+        # — when both bots are correctly configured at 1.0 the validator
+        # would crash-loop the container (observed 29-Apr-2026 crash log).
+        # Field-level `le=1.0` already enforces the per-bot ceiling.
         total = (
             self.scalper_allocation_pct
             + self.trend_allocation_pct
