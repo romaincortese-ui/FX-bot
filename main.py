@@ -21,6 +21,10 @@ import math
 import asyncio
 import socket
 from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:  # pragma: no cover — fallback for Python 3.8 sandboxes.
+    ZoneInfo = None  # type: ignore
 from decimal import Decimal, ROUND_DOWN
 import pandas as pd
 import numpy as np
@@ -244,6 +248,21 @@ NY_OPEN_UTC      = int(os.getenv("NY_OPEN_UTC",      "12"))
 NY_CLOSE_UTC     = int(os.getenv("NY_CLOSE_UTC",     "21"))
 ROLLOVER_START_UTC = int(os.getenv("ROLLOVER_START_UTC", "20"))
 ROLLOVER_END_UTC   = int(os.getenv("ROLLOVER_END_UTC",   "21"))
+
+# P2 #14 — DST-aware session boundaries (opt-in).
+#
+# When `SESSION_DST_AWARE=1`, `get_current_session()` interprets the *_OPEN /
+# *_CLOSE constants as **local-time** hours in the corresponding exchange
+# timezone (Asia/Tokyo, Europe/London, America/New_York) and converts the
+# current UTC clock into each zone before checking the band. This keeps the
+# London/NY overlap window aligned across DST transitions instead of slipping
+# by an hour for two weeks twice a year.
+#
+# Defaulted off — the current production hard-coded UTC bands match standard
+# winter-time and changing this without operator review would silently shift
+# the regime classifier. Flip the flag to `1` after confirming the env-var
+# values represent the intended *local* hours.
+SESSION_DST_AWARE = os.getenv("SESSION_DST_AWARE", "0").lower() in ("1", "true", "yes", "on")
 
 SESSION_OVERLAP_MULT   = float(os.getenv("SESSION_OVERLAP_MULT",   "0.85"))
 SESSION_LONDON_MULT    = float(os.getenv("SESSION_LONDON_MULT",    "0.90"))
@@ -670,6 +689,9 @@ CORRELATION_GROUPS = {
 # ── Streaming thread control ───────────────────────────────────
 _stream_thread = None
 _stop_stream_event = threading.Event()
+# P2 #12 — track the instrument tuple currently streaming so a no-op
+# `_start_price_stream(...)` (same pair set) can short-circuit the reconnect.
+_streamed_pairs: tuple[str, ...] = ()
 
 
 def telegram_enabled() -> bool:
@@ -1595,16 +1617,7 @@ def _price_stream_worker(stream_pairs):
 
 def _start_price_stream(pairs=None):
     """Start (or restart) the price stream with the given pair list."""
-    global _stream_thread, _stop_stream_event
-
-    # If a stream is already running, stop it
-    if _stream_thread and _stream_thread.is_alive():
-        log.info("Stopping existing price stream...")
-        _stop_stream_event.set()
-        _stream_thread.join(timeout=5)
-        if _stream_thread.is_alive():
-            log.warning("Stream thread did not stop in time, proceeding anyway.")
-        _stream_thread = None
+    global _stream_thread, _stop_stream_event, _streamed_pairs
 
     # Determine which pairs to stream
     if pairs is None:
@@ -1616,6 +1629,29 @@ def _start_price_stream(pairs=None):
     if not all_pairs:
         log.warning("Skipping price stream start because no supported instruments remain.")
         return
+
+    # P2 #12 — skip the teardown/reconnect cycle when the resolved instrument
+    # set matches what is already streaming. The 24h log dump showed 91 stop /
+    # 92 start / 93 connect events, almost all of them no-op churn from the
+    # watchlist-rebuild loop re-entering with the same pair set. OANDA's
+    # streaming endpoint requires reopening the GET to change instruments, so
+    # we cannot do an in-place subscription update; the next-best move is to
+    # not reopen when nothing changed.
+    if (
+        _stream_thread is not None
+        and _stream_thread.is_alive()
+        and _streamed_pairs == tuple(all_pairs)
+    ):
+        return
+
+    # If a stream is already running, stop it
+    if _stream_thread and _stream_thread.is_alive():
+        log.info("Stopping existing price stream...")
+        _stop_stream_event.set()
+        _stream_thread.join(timeout=5)
+        if _stream_thread.is_alive():
+            log.warning("Stream thread did not stop in time, proceeding anyway.")
+        _stream_thread = None
 
     # Tier 1 §7 item 2: prior log said "Starting with N pairs" but then sliced
     # to [:5] for display, making it look like EUR_USD / AUD_USD / EUR_GBP were
@@ -1631,6 +1667,7 @@ def _start_price_stream(pairs=None):
         except Exception:
             pass
     _stop_stream_event.clear()
+    _streamed_pairs = tuple(all_pairs)
     _stream_thread = threading.Thread(target=_price_stream_worker, args=(all_pairs,), daemon=True, name="price-stream")
     _stream_thread.start()
 
@@ -1644,13 +1681,38 @@ def _restart_price_stream():
 #  SESSION DETECTION (uses dynamic list)
 # ═══════════════════════════════════════════════════════════════
 
+def _hour_in_local_band(now_utc: datetime, tz_name: str, open_h: int, close_h: int) -> bool:
+    """P2 #14 — return True if `now_utc` lies in [open_h, close_h) local time.
+
+    Wrap-around bands (e.g. 22..6) are supported by inverting the comparison.
+    Falls back to the UTC-hour comparison if `zoneinfo` is unavailable.
+    """
+    if ZoneInfo is None:
+        h = now_utc.hour
+        if open_h <= close_h:
+            return open_h <= h < close_h
+        return h >= open_h or h < close_h
+    try:
+        local_hour = now_utc.astimezone(ZoneInfo(tz_name)).hour
+    except Exception:
+        local_hour = now_utc.hour
+    if open_h <= close_h:
+        return open_h <= local_hour < close_h
+    return local_hour >= open_h or local_hour < close_h
+
+
 def get_current_session() -> dict:
     now = datetime.now(timezone.utc)
     hour = now.hour
 
-    tokyo_active  = TOKYO_OPEN_UTC <= hour < TOKYO_CLOSE_UTC
-    london_active = LONDON_OPEN_UTC <= hour < LONDON_CLOSE_UTC
-    ny_active     = NY_OPEN_UTC <= hour < NY_CLOSE_UTC
+    if SESSION_DST_AWARE:
+        tokyo_active  = _hour_in_local_band(now, "Asia/Tokyo",        TOKYO_OPEN_UTC,  TOKYO_CLOSE_UTC)
+        london_active = _hour_in_local_band(now, "Europe/London",     LONDON_OPEN_UTC, LONDON_CLOSE_UTC)
+        ny_active     = _hour_in_local_band(now, "America/New_York", NY_OPEN_UTC,     NY_CLOSE_UTC)
+    else:
+        tokyo_active  = TOKYO_OPEN_UTC <= hour < TOKYO_CLOSE_UTC
+        london_active = LONDON_OPEN_UTC <= hour < LONDON_CLOSE_UTC
+        ny_active     = NY_OPEN_UTC <= hour < NY_CLOSE_UTC
 
     all_pairs = DYNAMIC_PAIRS if DYNAMIC_PAIRS else STATIC_ALL_PAIRS
     core_pairs = [p for p in all_pairs if p in ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "NZD_USD"]]
