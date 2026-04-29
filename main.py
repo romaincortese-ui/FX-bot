@@ -174,6 +174,10 @@ STATIC_ALL_PAIRS = STATIC_CORE_PAIRS + STATIC_EXTENDED_PAIRS
 DYNAMIC_PAIRS = []                 # will be filled at runtime
 LAST_WATCHLIST_UPDATE = 0
 LAST_FORCED_WATCHLIST_REBUILD_AT = 0.0  # last time we force-rebuilt because all pairs were blocked
+# P1 #10: dedupe the "watchlist fully blocked / throttling" log emission. The
+# 24h dump showed 3,812 identical info lines (81% of all info volume). Track
+# the last emitted state so we only log on transitions.
+_LAST_THROTTLE_LOG_STATE: str | None = None  # one of {None, "throttled", "rebuilding", "healthy"}
 # Tracks the last spread-gate rejection "signature" (pair,spread,reason tuple).
 # Used to downgrade identical repeats from WARNING to DEBUG — see third-memo §2.3.
 _last_spread_gate_signature: tuple | None = None
@@ -373,6 +377,12 @@ ADAPTIVE_RELAX_STEP   = float(os.getenv("ADAPTIVE_RELAX_STEP", "2"))
 ADAPTIVE_MAX_OFFSET   = float(os.getenv("ADAPTIVE_MAX_OFFSET", "10"))
 ADAPTIVE_MIN_OFFSET   = float(os.getenv("ADAPTIVE_MIN_OFFSET", "-5"))
 TRADE_CALIBRATION_FILE = os.getenv("TRADE_CALIBRATION_FILE", "backtest_output/calibration.json")
+# P1 #7 — backtest-seed fallback (mirror of futures-bot c51cd8a). When the
+# live calibration blob (Redis or `TRADE_CALIBRATION_FILE`) is missing/stale
+# /below sample threshold, fall back to this seed file (typically generated
+# by a 90-day backtest run). The seed must contain a valid calibration
+# payload but its `generated_at` is exempted from the staleness check.
+CALIBRATION_SEED_FILE = os.getenv("CALIBRATION_SEED_FILE", "backtest_output/calibration_seed.json")
 CALIBRATION_PAIR_MIN_TRADES = int(os.getenv("CALIBRATION_PAIR_MIN_TRADES", "20"))
 CALIBRATION_SESSION_MIN_TRADES = int(os.getenv("CALIBRATION_SESSION_MIN_TRADES", "8"))
 CALIBRATION_BLOCK_MAX_WIN_RATE = float(os.getenv("CALIBRATION_BLOCK_MAX_WIN_RATE", "0.20"))
@@ -469,12 +479,20 @@ TIER5_USDJPY_IV_ENABLED = os.getenv("TIER5_USDJPY_IV_ENABLED", "0") not in ("0",
 REDIS_USDJPY_IV_KEY = os.getenv("REDIS_USDJPY_IV_KEY", "fxbot:usdjpy_1w_iv")
 REDIS_CARRY_BASKET_KEY = os.getenv("REDIS_CARRY_BASKET_KEY", "fxbot:carry_basket")
 REDIS_KILLSWITCH_STATE_KEY = os.getenv("REDIS_KILLSWITCH_STATE_KEY", "fxbot:drawdown_state")
+REDIS_PAIR_COOLDOWNS_KEY = os.getenv("REDIS_PAIR_COOLDOWNS_KEY", "fxbot:pair_cooldowns")
 PAIR_HEALTH_PROBE_INTERVAL_SECS = int(os.getenv("PAIR_HEALTH_PROBE_INTERVAL_SECS", "900"))
 PAIR_HEALTH_RECOVERY_SUCCESSES = int(os.getenv("PAIR_HEALTH_RECOVERY_SUCCESSES", "3"))
 PAIR_HEALTH_BLOCK_BASE_SECS = int(os.getenv("PAIR_HEALTH_BLOCK_BASE_SECS", "1800"))
 PAIR_HEALTH_BLOCK_MAX_SECS = int(os.getenv("PAIR_HEALTH_BLOCK_MAX_SECS", "86400"))
 CLOSE_RETRY_BASE_SECS = int(os.getenv("CLOSE_RETRY_BASE_SECS", "300"))
 CLOSE_RETRY_MAX_SECS = int(os.getenv("CLOSE_RETRY_MAX_SECS", "7200"))
+# P1 #11 — exit-failure escalation thresholds. After this many consecutive
+# failed close attempts on the same trade, send a single Telegram alert.
+EXIT_RETRY_ALERT_AFTER = int(os.getenv("EXIT_RETRY_ALERT_AFTER", "3"))
+# After this many consecutive failures, mark the trade as broker_unreachable
+# so `process_pending_close_retries` stops firing close requests until the
+# operator manually reconciles.
+EXIT_RETRY_GIVE_UP_AFTER = int(os.getenv("EXIT_RETRY_GIVE_UP_AFTER", "10"))
 STATE_FILE          = "state.json"
 MACRO_NEWS_FILE     = os.getenv("MACRO_NEWS_FILE", "macro_news.json")
 REDIS_URL           = os.getenv("REDIS_URL", "")
@@ -1141,6 +1159,15 @@ def schedule_close_retry(trade: dict, error_reason: str) -> None:
     blocked_until = float(rec.get("blocked_until", 0.0))
     next_probe_at = float(rec.get("next_probe_at", 0.0))
     next_retry_at = max(next_retry_at, blocked_until, next_probe_at)
+    previous = _pending_close_retries.get(str(trade["id"]), {})
+    already_alerted = bool(previous.get("escalated", False))
+    already_unreachable = bool(previous.get("broker_unreachable", False))
+    # P1 #11 — exit-failure escalation. Match the gold-bot 11.8h-lockout
+    # pattern: alert the operator after 3 consecutive close failures on the
+    # same trade; mark `broker_unreachable` after 10 to stop the retry storm
+    # until manually resolved (`/clearclose <id>` or restart).
+    escalate_now = attempts >= EXIT_RETRY_ALERT_AFTER and not already_alerted
+    mark_unreachable = attempts >= EXIT_RETRY_GIVE_UP_AFTER and not already_unreachable
     _pending_close_retries[str(trade["id"])] = {
         "trade_id": str(trade["id"]),
         "instrument": trade["instrument"],
@@ -1149,9 +1176,43 @@ def schedule_close_retry(trade: dict, error_reason: str) -> None:
         "reason": error_reason[:200],
         "next_retry_at": next_retry_at,
         "scheduled_at": now,
+        "escalated": already_alerted or escalate_now,
+        "broker_unreachable": already_unreachable or mark_unreachable,
     }
     retry_text = datetime.fromtimestamp(next_retry_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     log.warning(f"🕒 Scheduled forced-close retry for {trade['instrument']} at {retry_text} | reason: {error_reason[:120]}")
+    if escalate_now:
+        log.error(
+            f"🚨 [{trade.get('label', 'RESTORED')}] Close failing for {trade['instrument']} "
+            f"trade {trade['id']} — {attempts} attempts, last reason: {error_reason[:120]}"
+        )
+        try:
+            telegram(
+                "🚨 <b>FX-bot: Exit retry escalation</b>\n"
+                f"{trade['instrument']} · trade <code>{trade['id']}</code>\n"
+                f"Attempts: <b>{attempts}</b> (alert at {EXIT_RETRY_ALERT_AFTER}, "
+                f"give-up at {EXIT_RETRY_GIVE_UP_AFTER})\n"
+                f"Last reason: <i>{error_reason[:200]}</i>\n"
+                f"Next retry: {retry_text}"
+            )
+        except Exception:
+            pass
+    if mark_unreachable:
+        log.error(
+            f"⛔ [{trade.get('label', 'RESTORED')}] Marking trade {trade['id']} on "
+            f"{trade['instrument']} as broker_unreachable after {attempts} failed close attempts — "
+            "halting retries until manual reconcile."
+        )
+        try:
+            telegram(
+                "⛔ <b>FX-bot: Trade marked broker_unreachable</b>\n"
+                f"{trade['instrument']} · trade <code>{trade['id']}</code>\n"
+                f"{attempts} consecutive close failures — retries halted.\n"
+                f"Last reason: <i>{error_reason[:200]}</i>\n"
+                "Investigate at the broker; restart or clear local state to resume."
+            )
+        except Exception:
+            pass
 
 
 def clear_close_retry(trade_id: str) -> None:
@@ -1164,6 +1225,11 @@ def process_pending_close_retries() -> None:
     open_by_id = {str(t.get("id")): t for t in open_trades if t.get("id")}
     now = time.time()
     for trade_id, pending in list(_pending_close_retries.items()):
+        # P1 #11 — give-up gate: stop firing close retries against a trade
+        # that has been marked broker_unreachable. The operator must clear
+        # the pending retry (or restart) to resume.
+        if pending.get("broker_unreachable"):
+            continue
         trade = open_by_id.get(trade_id)
         if trade is None:
             clear_close_retry(trade_id)
@@ -1432,20 +1498,26 @@ def get_effective_scan_pairs(session: dict) -> tuple[list[str], list[str], list[
     rebuilt_watchlist = False
 
     if not health_pairs and DYNAMIC_PAIRS:
-        global LAST_FORCED_WATCHLIST_REBUILD_AT
+        global LAST_FORCED_WATCHLIST_REBUILD_AT, _LAST_THROTTLE_LOG_STATE
         now = time.time()
         secs_since = now - LAST_FORCED_WATCHLIST_REBUILD_AT
         if secs_since < FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS:
             # Tier 1 §7 item 4: W2 log shows ~3123 forced rebuilds in 17h40 (one
             # every 20s) because this branch fired on every scan pool miss. Cap
             # it to at most once per FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS.
-            log.info(
-                "🩺 Active dynamic watchlist fully blocked — throttling rebuild "
-                f"(last rebuild {secs_since:.0f}s ago, min interval "
-                f"{FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS}s)."
-            )
+            # P1 #10: also dedupe the log emission — only print on transition
+            # into the throttled state, not every cycle (24h dump showed 3,812
+            # repeated info lines / 81% of total info volume).
+            if _LAST_THROTTLE_LOG_STATE != "throttled":
+                log.info(
+                    "🩺 Active dynamic watchlist fully blocked — throttling rebuild "
+                    f"(last rebuild {secs_since:.0f}s ago, min interval "
+                    f"{FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS}s)."
+                )
+                _LAST_THROTTLE_LOG_STATE = "throttled"
         else:
             log.warning("🩺 Active dynamic watchlist is fully blocked. Rebuilding watchlist.")
+            _LAST_THROTTLE_LOG_STATE = "rebuilding"
             LAST_FORCED_WATCHLIST_REBUILD_AT = now
             if refresh_dynamic_watchlist(force=True):
                 rebuilt_watchlist = True
@@ -1461,6 +1533,11 @@ def get_effective_scan_pairs(session: dict) -> tuple[list[str], list[str], list[
             health_pairs = [pair for pair in active_pairs if is_pair_tradeable(pair)]
 
     tradable_pairs = list(health_pairs)
+
+    # P1 #10: reset the throttle-log dedupe flag once the watchlist recovers
+    # so the next blockage transition is logged again.
+    if health_pairs and _LAST_THROTTLE_LOG_STATE != "healthy":
+        globals()["_LAST_THROTTLE_LOG_STATE"] = "healthy"
 
     if not health_pairs:
         empty_reason = "pairs blocked"
@@ -1878,7 +1955,12 @@ def oanda_post(path: str, data: dict) -> dict:
                 except ValueError:
                     payload = {}
                 error_body = _extract_oanda_error_message(payload, r.text[:500])
-                log.error(f"OANDA POST {path} error {r.status_code}: {error_body}")
+                # P1 #9: demote reconcilable rejects (TRADE_DOESNT_EXIST etc.)
+                # to WARNING — same rationale as `oanda_put`.
+                if _is_broker_reconcile_reject(error_body):
+                    log.warning(f"OANDA POST {path} reconcilable {r.status_code}: {error_body}")
+                else:
+                    log.error(f"OANDA POST {path} error {r.status_code}: {error_body}")
                 if payload:
                     payload["error"] = error_body
                     payload["status_code"] = r.status_code
@@ -1902,7 +1984,15 @@ def oanda_put(path: str, data: dict) -> dict:
             except ValueError:
                 payload = {}
             error_body = _extract_oanda_error_message(payload, r.text[:500])
-            log.error(f"OANDA PUT {path} error {r.status_code}: {error_body}")
+            # P1 #9: bracketed TP/SL exits at broker race ahead of our local
+            # close request; the resulting `TRADE_DOESNT_EXIST` 404 is the
+            # *expected* terminal state and is reconciled by the caller.
+            # Demote to WARNING so the operator's error dashboard isn't
+            # polluted by the routine bracketed-exit path.
+            if _is_broker_reconcile_reject(error_body):
+                log.warning(f"OANDA PUT {path} reconcilable {r.status_code}: {error_body}")
+            else:
+                log.error(f"OANDA PUT {path} error {r.status_code}: {error_body}")
             if payload:
                 payload["error"] = error_body
                 payload["status_code"] = r.status_code
@@ -3111,6 +3201,7 @@ def save_state():
             json.dump(payload, f, default=str)
         os.replace(tmp, STATE_FILE)
         publish_fx_shared_budget_state()
+        _persist_pair_cooldowns_to_redis()
     except Exception as e:
         log.warning(f"State save failed: {e}")
 
@@ -3140,6 +3231,12 @@ def load_state():
         _last_rebalance_count = d.get("last_rebalance_count", 0)
         _pair_cooldowns       = d.get("pair_cooldowns", {})
         _pending_close_retries = d.get("pending_close_retries", {}) if isinstance(d.get("pending_close_retries", {}), dict) else {}
+        # P1 #6 — reconcile per-pair cooldowns with Redis. Railway containers
+        # have ephemeral filesystems, so STATE_FILE may be wiped on restart;
+        # the Redis copy survives container rotations and prevents the
+        # restart-duplicate trade pattern (24h dump showed AUD_USD TREND
+        # re-fired 17 minutes after a restart).
+        _merge_pair_cooldowns_from_redis()
         raw_pair_health       = d.get("pair_health", {})
         _pair_health = {}
         for instrument, rec in raw_pair_health.items():
@@ -3254,6 +3351,35 @@ def _validate_trade_calibration_payload(data: dict) -> tuple[bool, str | None]:
     return True, None
 
 
+def _validate_trade_calibration_seed(data: dict) -> tuple[bool, str | None]:
+    """P1 #7 — relaxed validator for the backtest seed file.
+
+    The seed is intentionally a long-lived snapshot (typically a 90-day
+    backtest run); skip the staleness gate but still enforce the sample-size
+    floor so a bad/empty seed cannot poison sizing.
+    """
+    total_trades = _count_calibration_trades(data)
+    if total_trades < CALIBRATION_MIN_TOTAL_TRADES:
+        return False, f"insufficient seed sample ({total_trades} trades < {CALIBRATION_MIN_TOTAL_TRADES})"
+    return True, None
+
+
+def _load_trade_calibration_seed() -> dict | None:
+    """P1 #7 — load the backtest-seed calibration file, if present."""
+    if not CALIBRATION_SEED_FILE or not os.path.exists(CALIBRATION_SEED_FILE):
+        return None
+    try:
+        with open(CALIBRATION_SEED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            log.warning(f"Calibration seed {CALIBRATION_SEED_FILE} is not a JSON object — ignoring")
+            return None
+        return data
+    except Exception as e:
+        log.warning(f"Calibration seed load failed for {CALIBRATION_SEED_FILE}: {e}")
+        return None
+
+
 def _load_trade_calibration_from_redis() -> dict | None:
     if REDIS_CLIENT is None:
         return None
@@ -3273,22 +3399,23 @@ def _load_trade_calibration_from_redis() -> dict | None:
 
 def load_trade_calibration() -> None:
     global trade_calibration
+    primary_failure_reason: str | None = None
+    primary_source_label: str | None = None
     try:
         data = _load_trade_calibration_from_redis()
         if data is not None:
             ok, reason = _validate_trade_calibration_payload(data)
-            if not ok:
-                trade_calibration = {}
-                _log_calibration_ignored(f"Redis calibration from key {REDIS_TRADE_CALIBRATION_KEY}", reason)
+            if ok:
+                trade_calibration = data
+                _log_calibration_loaded_reset()
+                log.info(
+                    f"[CALIBRATION] Loaded trade calibration from Redis key {REDIS_TRADE_CALIBRATION_KEY}: "
+                    f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
+                    f"{_count_calibration_trades(trade_calibration)} trades"
+                )
                 return
-            trade_calibration = data
-            _log_calibration_loaded_reset()
-            log.info(
-                f"[CALIBRATION] Loaded trade calibration from Redis key {REDIS_TRADE_CALIBRATION_KEY}: "
-                f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
-                f"{_count_calibration_trades(trade_calibration)} trades"
-            )
-            return
+            primary_source_label = f"Redis calibration from key {REDIS_TRADE_CALIBRATION_KEY}"
+            primary_failure_reason = reason
 
         if TIER4_CALIBRATION_REDIS_ONLY:
             trade_calibration = {}
@@ -3298,29 +3425,51 @@ def load_trade_calibration() -> None:
             )
             return
 
-        if not os.path.exists(TRADE_CALIBRATION_FILE):
-            trade_calibration = {}
-            return
+        if os.path.exists(TRADE_CALIBRATION_FILE):
+            with open(TRADE_CALIBRATION_FILE, "r", encoding="utf-8") as f:
+                file_data = json.load(f)
+            if not isinstance(file_data, dict):
+                raise ValueError("trade calibration file content must be an object")
+            ok, reason = _validate_trade_calibration_payload(file_data)
+            if ok:
+                trade_calibration = file_data
+                _log_calibration_loaded_reset()
+                log.info(
+                    f"[CALIBRATION] Loaded trade calibration from {TRADE_CALIBRATION_FILE}: "
+                    f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
+                    f"{_count_calibration_trades(trade_calibration)} trades"
+                )
+                return
+            if primary_failure_reason is None:
+                primary_source_label = f"file calibration from {TRADE_CALIBRATION_FILE}"
+                primary_failure_reason = reason
 
-        with open(TRADE_CALIBRATION_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        # P1 #7 — backtest-seed fallback. The live calibration loop is dormant
+        # until ~30 closed trades accumulate (24h log shows "14 trades < 30").
+        # When the live blob is unusable, prefer a long-lived backtest snapshot
+        # over no calibration at all so sizing is not flat-zero by default.
+        seed_data = _load_trade_calibration_seed()
+        if seed_data is not None:
+            ok, reason = _validate_trade_calibration_seed(seed_data)
+            if ok:
+                trade_calibration = seed_data
+                _log_calibration_loaded_reset()
+                if primary_failure_reason and primary_source_label:
+                    _log_calibration_ignored(primary_source_label, primary_failure_reason)
+                log.info(
+                    f"[CALIBRATION] Loaded backtest seed from {CALIBRATION_SEED_FILE}: "
+                    f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
+                    f"{_count_calibration_trades(trade_calibration)} trades"
+                )
+                return
+            log.warning(
+                f"[CALIBRATION] Backtest seed at {CALIBRATION_SEED_FILE} rejected: {reason}"
+            )
 
-        if not isinstance(data, dict):
-            raise ValueError("trade calibration file content must be an object")
-
-        ok, reason = _validate_trade_calibration_payload(data)
-        if not ok:
-            trade_calibration = {}
-            _log_calibration_ignored(f"file calibration from {TRADE_CALIBRATION_FILE}", reason)
-            return
-
-        trade_calibration = data
-        _log_calibration_loaded_reset()
-        log.info(
-            f"[CALIBRATION] Loaded trade calibration from {TRADE_CALIBRATION_FILE}: "
-            f"{_count_calibration_pairs(trade_calibration)} strategy/pair entries, "
-            f"{_count_calibration_trades(trade_calibration)} trades"
-        )
+        # No usable source — log the upstream failure (if any) and run flat.
+        trade_calibration = {}
+        if primary_failure_reason and primary_source_label:
+            _log_calibration_ignored(primary_source_label, primary_failure_reason)
     except Exception as e:
         trade_calibration = {}
         log.warning(f"Trade calibration load failed for {TRADE_CALIBRATION_FILE}: {e}")
@@ -4024,6 +4173,72 @@ def _tier4_restore_drawdown_state() -> None:
         log.warning(f"killswitch_redis_restore_failed: {e}")
 
 
+def _persist_pair_cooldowns_to_redis() -> None:
+    """P1 #6 — write per-pair entry cooldowns to Redis after each save_state.
+
+    Railway containers have ephemeral filesystems, so the file-based
+    `state.json` may be wiped on restart. Mirroring `_pair_cooldowns` to
+    Redis ensures a restart cannot re-fire the same TREND/CARRY signal
+    minutes after the prior fire (the 18:37/18:54 AUD_USD duplicate seen in
+    the 24h dump).
+    """
+    if REDIS_CLIENT is None:
+        return
+    try:
+        # Drop expired entries to keep the payload small.
+        now = time.time()
+        live = {k: float(v) for k, v in _pair_cooldowns.items() if float(v) > now}
+        payload = {
+            "cooldowns": live,
+            "persisted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        REDIS_CLIENT.set(REDIS_PAIR_COOLDOWNS_KEY, json.dumps(payload))
+    except Exception as e:
+        log.warning(f"pair_cooldowns_redis_persist_failed: {e}")
+
+
+def _merge_pair_cooldowns_from_redis() -> None:
+    """P1 #6 — restore per-pair cooldowns from Redis at startup.
+
+    Merges with the file-based copy: takes the **latest** expiry per
+    instrument, so a fresher Redis copy supersedes a stale file copy and
+    vice versa.
+    """
+    global _pair_cooldowns
+    if REDIS_CLIENT is None:
+        return
+    try:
+        raw = REDIS_CLIENT.get(REDIS_PAIR_COOLDOWNS_KEY)
+        if not raw:
+            return
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        cooldowns = data.get("cooldowns", {}) if isinstance(data, dict) else {}
+        if not isinstance(cooldowns, dict):
+            return
+        now = time.time()
+        merged = dict(_pair_cooldowns)
+        for instrument, expiry in cooldowns.items():
+            try:
+                expiry_f = float(expiry)
+            except (TypeError, ValueError):
+                continue
+            if expiry_f <= now:
+                continue
+            current = float(merged.get(instrument, 0.0))
+            if expiry_f > current:
+                merged[instrument] = expiry_f
+        if merged != _pair_cooldowns:
+            log.info(
+                f"[COOLDOWNS] Merged {len(cooldowns)} pair-cooldown entries from Redis "
+                f"({REDIS_PAIR_COOLDOWNS_KEY})"
+            )
+        _pair_cooldowns = merged
+    except Exception as e:
+        log.warning(f"pair_cooldowns_redis_restore_failed: {e}")
+
+
 def _tier2_drawdown_block_reason() -> str | None:
     if not TIER2_DRAWDOWN_KILL_ENABLED:
         return None
@@ -4674,8 +4889,16 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     else:
         effective_leverage_text = "n/a"
 
+    # P1 #5 — flag paper-mode (or capital-floor-forced paper) trades in the
+    # Telegram message and log line so the operator never confuses a paper
+    # fill with a live one. 24h dump showed a capital-floor-forced trade
+    # announced as `✅ [TREND] Opened LONG AUD_USD …` with no paper marker.
+    paper_active = PAPER_TRADE or _effective_paper_trade(balance)
+    paper_prefix = "[PAPER] " if paper_active else ""
+    paper_header = "📝 <b>PAPER</b> · " if paper_active else ""
+
     telegram(
-        f"{dir_emoji} <b>{label} {direction}</b> | {instrument}\n"
+        f"{paper_header}{dir_emoji} <b>{label} {direction}</b> | {instrument}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Entry: {actual_entry:.5f}\n"
         f"TP: {tp_price:.5f} (+{opp['tp_pips']:.1f} pips)\n"
@@ -4691,7 +4914,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         f"Kelly: {effective_kelly_mult:.2f}x | Session: {session['name']}"
     )
 
-    log.info(f"✅ [{label}] Opened {direction} {instrument} @ {actual_entry} "
+    log.info(f"✅ {paper_prefix}[{label}] Opened {direction} {instrument} @ {actual_entry} "
              f"| TP={tp_price} SL={sl_price} | score={opp['score']}")
     return trade
 
@@ -5077,6 +5300,23 @@ def _bootstrap_runtime() -> None:
     log.info(f"   Account type: {ACCOUNT_TYPE}")
     log.info(f"   Paper trade: {PAPER_TRADE}")
     log.info(f"   Static pairs: {STATIC_ALL_PAIRS}")
+    # P1 #8 — boot banner with effective env. Operators can verify which
+    # values actually reached the container without parsing Railway's
+    # dashboard. Mirrors futures-bot pattern.
+    log.info(
+        f"   Risk: max_per_trade={MAX_RISK_PER_TRADE:.3%} "
+        f"max_amount_per_trade={MAX_RISK_AMOUNT_PER_TRADE:.2f} "
+        f"max_total_exposure={MAX_TOTAL_EXPOSURE:.3%} "
+        f"max_open_trades={MAX_OPEN_TRADES} leverage={LEVERAGE:.0f}x"
+    )
+    log.info(
+        f"   Capital floor: enabled={CAPITAL_FLOOR_ENABLED} "
+        f"min_live_balance={MIN_LIVE_BALANCE:.2f}"
+    )
+    log.info(
+        f"   Persistence: redis={'connected' if REDIS_CLIENT is not None else 'file_fallback'} "
+        f"state_file={STATE_FILE} shared_budget_key={SHARED_BUDGET_KEY}"
+    )
     log.info("=" * 60)
 
     load_state()
