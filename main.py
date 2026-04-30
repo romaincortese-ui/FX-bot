@@ -531,6 +531,7 @@ CALIBRATION_MIN_TOTAL_TRADES = int(os.getenv("CALIBRATION_MIN_TOTAL_TRADES", "30
 HTTP_RETRIES        = 3
 HTTP_RETRY_DELAY    = 1.0
 HEARTBEAT_INTERVAL  = int(os.getenv("HEARTBEAT_INTERVAL",  "3600"))
+OPEN_TRADES_SYNC_INTERVAL = int(os.getenv("OPEN_TRADES_SYNC_INTERVAL", "60"))
 KLINE_CACHE_TTL     = 15
 MAX_KLINE_CACHE     = 200
 
@@ -590,6 +591,8 @@ if REDIS_URL:
 trade_history      = []
 open_trades        = []
 last_heartbeat_at  = 0
+last_open_trades_sync_at = 0.0
+last_open_trades_reconciled_count = 0
 last_runtime_status_at = 0
 last_idle_log_at = 0
 last_daily_summary = ""
@@ -2094,7 +2097,7 @@ def get_account_summary() -> dict:
         return {"balance": 0, "currency": "GBP"}
 
 
-def fetch_open_trades_from_oanda() -> list[dict]:
+def fetch_open_trades_from_oanda() -> list[dict] | None:
     if PAPER_TRADE or not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
         return []
     try:
@@ -2103,7 +2106,156 @@ def fetch_open_trades_from_oanda() -> list[dict]:
         return trades if isinstance(trades, list) else []
     except Exception as e:
         log.error(f"Failed to fetch open trades from OANDA: {e}")
-        return []
+        return None
+
+
+def fetch_trade_details_from_oanda(trade_id: str) -> dict | None:
+    if PAPER_TRADE or not OANDA_API_KEY or not OANDA_ACCOUNT_ID or not trade_id:
+        return None
+    try:
+        data = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}")
+        trade = data.get("trade", {})
+        return trade if isinstance(trade, dict) else None
+    except Exception as e:
+        log.warning(f"Failed to fetch OANDA trade {trade_id} details: {e}")
+        return None
+
+
+def _as_float(value, default: float | None = None) -> float | None:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _infer_broker_close_details(trade: dict, broker_trade: dict | None) -> dict:
+    broker_trade = broker_trade or {}
+    instrument = trade.get("instrument", "")
+    direction = trade.get("direction", "LONG")
+    entry_price = _as_float(trade.get("entry_price"), 0.0) or 0.0
+    close_price = _as_float(broker_trade.get("averageClosePrice"))
+    if close_price is None:
+        close_price = _as_float(broker_trade.get("price"))
+    realized_pl = _as_float(broker_trade.get("realizedPL"))
+
+    reason = "BROKER_CLOSED"
+    if close_price is not None and instrument:
+        tolerance = max(pips_to_price(instrument, 0.5), abs(close_price) * 0.00001)
+        tp_price = _as_float(trade.get("tp_price"))
+        sl_price = _as_float(trade.get("sl_price"))
+        if direction == "LONG":
+            if sl_price is not None and close_price <= sl_price + tolerance:
+                reason = "STOP_LOSS"
+            elif tp_price is not None and close_price >= tp_price - tolerance:
+                reason = "TAKE_PROFIT"
+        else:
+            if sl_price is not None and close_price >= sl_price - tolerance:
+                reason = "STOP_LOSS"
+            elif tp_price is not None and close_price <= tp_price + tolerance:
+                reason = "TAKE_PROFIT"
+        if reason == "BROKER_CLOSED" and trade.get("trail_pips"):
+            reason = "TRAILING_STOP"
+
+    pnl_pips = 0.0
+    pnl_known = False
+    if close_price is not None and entry_price > 0 and instrument:
+        ps = pip_size(instrument)
+        if direction == "LONG":
+            pnl_pips = (close_price - entry_price) / ps
+        else:
+            pnl_pips = (entry_price - close_price) / ps
+        pnl_known = True
+    elif realized_pl is not None and instrument:
+        pip_value_per_pip = pip_value(instrument, trade.get("units", 1), get_account_currency())
+        if pip_value_per_pip:
+            pnl_pips = realized_pl / pip_value_per_pip
+            pnl_known = True
+
+    if realized_pl is not None:
+        pnl = realized_pl
+        pnl_known = True
+    elif pnl_known:
+        pnl = pnl_pips * pip_value(instrument, trade.get("units", 1), get_account_currency())
+    else:
+        pnl = 0.0
+
+    return {
+        "reason": reason,
+        "close_price": close_price,
+        "pnl": pnl,
+        "pnl_pips": pnl_pips,
+        "pnl_known": pnl_known,
+        "closed_at": broker_trade.get("closeTime") or datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _record_broker_closed_trade(trade: dict, broker_trade: dict | None, sync_reason: str) -> bool:
+    global _consecutive_losses
+    trade_id = str(trade.get("id", ""))
+    if trade_id and any(str(t.get("trade_id", "")) == trade_id for t in trade_history):
+        return False
+
+    details = _infer_broker_close_details(trade, broker_trade)
+    instrument = trade.get("instrument", "")
+    label = trade.get("label", "RESTORED")
+    direction = trade.get("direction", "LONG")
+    entry_price = _as_float(trade.get("entry_price"), 0.0) or 0.0
+    close_price = details["close_price"] if details["close_price"] is not None else entry_price
+    held_min = (time.time() - trade.get("opened_ts", time.time())) / 60
+    if broker_trade and broker_trade.get("closeTime") and trade.get("opened_at"):
+        try:
+            opened_at = datetime.fromisoformat(str(trade["opened_at"]).replace("Z", "+00:00"))
+            closed_at = datetime.fromisoformat(str(broker_trade["closeTime"]).replace("Z", "+00:00"))
+            held_min = max(0.0, (closed_at - opened_at).total_seconds() / 60)
+        except Exception:
+            pass
+
+    history_entry = {
+        "trade_id": trade_id,
+        "instrument": instrument,
+        "label": label,
+        "direction": direction,
+        "entry_price": entry_price,
+        "exit_price": close_price,
+        "pnl": round(details["pnl"], 2),
+        "pnl_pips": round(details["pnl_pips"], 1),
+        "pnl_pct": round((close_price / entry_price - 1) * 100 * (1 if direction == "LONG" else -1), 3) if entry_price else 0.0,
+        "reason": details["reason"],
+        "held_minutes": round(held_min, 1),
+        "score": trade.get("score", 0),
+        "entry_signal": trade.get("entry_signal", ""),
+        "session": trade.get("session_at_entry", ""),
+        "closed_at": details["closed_at"],
+        "sync_reason": sync_reason,
+    }
+    trade_history.append(history_entry)
+
+    if details["pnl_known"]:
+        if details["pnl"] > 0:
+            _consecutive_losses = 0
+        else:
+            _consecutive_losses += 1
+        _tier2_update_posteriors(label, win=details["pnl"] > 0)
+    _tier2_refresh_drawdown_state()
+    clear_close_retry(trade_id)
+
+    log.warning(
+        f"[{label}] Broker-side close reconciled for {instrument} trade {trade_id}: "
+        f"{details['reason']} P&L={details['pnl']:+.2f} pips={details['pnl_pips']:+.1f}"
+    )
+    emoji = "✅" if details["pnl"] > 0 else "❌" if details["pnl"] < 0 else "🔄"
+    dir_arrow = "⬆️" if direction == "LONG" else "⬇️"
+    reason_text = details["reason"].replace("_", " ")
+    exit_text = f"{close_price:.5f}" if details["close_price"] is not None else "broker reported closed"
+    telegram(
+        f"{emoji} <b>{label} Closed at broker</b> | {instrument} {dir_arrow}\n"
+        f"Entry: {entry_price:.5f} → Exit: {exit_text}\n"
+        f"P&L: {details['pnl']:+.2f} ({details['pnl_pips']:+.1f} pips)\n"
+        f"Reason: {reason_text} | Held: {held_min:.0f}min"
+    )
+    return True
 
 
 def get_account_currency() -> str:
@@ -2177,7 +2329,8 @@ def _build_trade_from_oanda(raw_trade: dict, existing: dict | None = None) -> di
 
 
 def sync_open_trades_with_oanda(reason: str = "manual") -> bool:
-    global open_trades
+    global open_trades, last_open_trades_reconciled_count
+    last_open_trades_reconciled_count = 0
     if PAPER_TRADE or not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
         return False
     # Memo 4 follow-up — when the Tier 2v2 capital-floor gate has forced
@@ -2194,17 +2347,24 @@ def sync_open_trades_with_oanda(reason: str = "manual") -> bool:
         pass
 
     broker_trades = fetch_open_trades_from_oanda()
+    if broker_trades is None:
+        log.warning(f"Skipping OANDA open-trade sync ({reason}): broker state unavailable")
+        return False
     with _open_trades_lock:
         existing_by_id = {str(t.get("id")): t for t in open_trades if t.get("id")}
+    broker_ids = {str(t.get("id")) for t in broker_trades if isinstance(t, dict) and t.get("id")}
     synced_trades = []
     for raw_trade in broker_trades:
         trade_id = str(raw_trade.get("id", ""))
         normalized = _build_trade_from_oanda(raw_trade, existing_by_id.get(trade_id))
         if normalized is not None:
             synced_trades.append(normalized)
+        elif trade_id in existing_by_id:
+            synced_trades.append(existing_by_id[trade_id])
 
     old_ids = set(existing_by_id.keys())
     new_ids = {str(t.get("id")) for t in synced_trades if t.get("id")}
+    missing_ids = old_ids - broker_ids
     changed = old_ids != new_ids or len(synced_trades) != len(open_trades)
     if not changed:
         for synced in synced_trades:
@@ -2214,11 +2374,31 @@ def sync_open_trades_with_oanda(reason: str = "manual") -> bool:
                 break
 
     if changed:
+        reconciled_count = 0
+        for trade_id in sorted(missing_ids):
+            trade = existing_by_id.get(trade_id)
+            if not trade or str(trade_id).startswith("PAPER_"):
+                continue
+            broker_trade = fetch_trade_details_from_oanda(trade_id)
+            if _record_broker_closed_trade(trade, broker_trade, reason):
+                reconciled_count += 1
+        last_open_trades_reconciled_count = reconciled_count
         with _open_trades_lock:
             open_trades = synced_trades
         save_state()
         log.info(f"🔄 Synced open trades from OANDA ({reason}): {len(open_trades)} open")
     return changed
+
+
+def sync_open_trades_with_oanda_if_due(reason: str = "runtime") -> bool:
+    global last_open_trades_sync_at
+    if PAPER_TRADE or not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
+        return False
+    now = time.time()
+    if now - last_open_trades_sync_at < OPEN_TRADES_SYNC_INTERVAL:
+        return False
+    last_open_trades_sync_at = now
+    return sync_open_trades_with_oanda(reason=reason)
 
 def get_current_price(instrument: str) -> dict:
     with _price_lock:
@@ -5181,12 +5361,14 @@ def close_trade_exit(trade: dict, reason: str):
 
 def close_all_open_positions(reason: str = "MANUAL_CLOSE") -> tuple[int, int]:
     global open_trades
+    reconciled_count = 0
 
     if not PAPER_TRADE and OANDA_API_KEY and OANDA_ACCOUNT_ID:
         sync_open_trades_with_oanda(reason="close-all")
+        reconciled_count = last_open_trades_reconciled_count
 
     if not open_trades:
-        return 0, 0
+        return reconciled_count, 0
 
     closed_count = 0
     failed_count = 0
@@ -5204,7 +5386,7 @@ def close_all_open_positions(reason: str = "MANUAL_CLOSE") -> tuple[int, int]:
     else:
         save_state()
 
-    return closed_count, failed_count
+    return closed_count + reconciled_count, failed_count
 
 # ═══════════════════════════════════════════════════════════════
 #  ADAPTIVE LEARNING & REBALANCING
@@ -5246,6 +5428,7 @@ def send_heartbeat(balance: float, status: str = "running"):
     if time.time() - last_heartbeat_at < HEARTBEAT_INTERVAL:
         return
     last_heartbeat_at = time.time()
+    sync_open_trades_with_oanda(reason="heartbeat")
     publish_bot_runtime_status(status, balance=balance, force=True)
     session = get_current_session()
     paused_pairs = get_paused_pairs_by_news(session["pairs_allowed"])
@@ -5550,6 +5733,7 @@ def run():
 
             refresh_dynamic_watchlist()   # This will also restart stream if needed
             probe_pair_health()
+            sync_open_trades_with_oanda_if_due(reason="runtime")
             process_pending_close_retries()
 
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
