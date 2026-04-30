@@ -27,6 +27,7 @@ class StrategyScoringContext:
     vix_level: float | None
     vix_low_threshold: float
     get_trade_calibration_adjustment: Callable[[str, str, str | None], Mapping[str, Any]] | None = None
+    get_event_spread_cap_pips: Callable[[str, float], float] | None = None
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
 
@@ -44,6 +45,15 @@ def _macro_bias_aligns_direction(direction: str, bias: str) -> bool:
 
 def _strategy_blocked_by_news_pause(strategy: str, is_paused: bool) -> bool:
     return is_paused and strategy != "CARRY"
+
+
+def _spread_cap_for_instrument(ctx: StrategyScoringContext, instrument: str, base_cap: float) -> float:
+    if ctx.get_event_spread_cap_pips is None:
+        return float(base_cap)
+    try:
+        return float(ctx.get_event_spread_cap_pips(instrument, float(base_cap)))
+    except Exception:
+        return float(base_cap)
 
 
 def _apply_directional_macro_gate(strategy: str, instrument: str, direction: str, ctx: StrategyScoringContext, require_alignment: bool = False) -> tuple[bool, str]:
@@ -124,7 +134,7 @@ def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScor
     if _reject_if_news_paused("SCALPER", instrument, ctx):
         return None
     spread_pips = ctx.get_spread_pips(instrument)
-    if spread_pips > settings["SCALPER_MAX_SPREAD_PIPS"]:
+    if spread_pips > _spread_cap_for_instrument(ctx, instrument, settings["SCALPER_MAX_SPREAD_PIPS"]):
         ctx.reject("SCALPER", instrument, "spread too high")
         return None
 
@@ -252,7 +262,7 @@ def score_trend(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
     if _reject_if_news_paused("TREND", instrument, ctx):
         return None
     spread_pips = ctx.get_spread_pips(instrument)
-    if spread_pips > settings["TREND_MAX_SPREAD_PIPS"]:
+    if spread_pips > _spread_cap_for_instrument(ctx, instrument, settings["TREND_MAX_SPREAD_PIPS"]):
         ctx.reject("TREND", instrument, "spread too high")
         return None
     df_5m = ctx.fetch_candles(instrument, "M5", 60)
@@ -371,7 +381,7 @@ def score_reversal(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     if _reject_if_news_paused("REVERSAL", instrument, ctx):
         return None
     spread_pips = ctx.get_spread_pips(instrument)
-    if spread_pips > settings["REVERSAL_MAX_SPREAD_PIPS"]:
+    if spread_pips > _spread_cap_for_instrument(ctx, instrument, settings["REVERSAL_MAX_SPREAD_PIPS"]):
         ctx.reject("REVERSAL", instrument, "spread too high")
         return None
     if session["aggression"] == "MINIMAL":
@@ -434,7 +444,7 @@ def score_breakout(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     if _reject_if_news_paused("BREAKOUT", instrument, ctx):
         return None
     spread_pips = ctx.get_spread_pips(instrument)
-    if spread_pips > settings["BREAKOUT_MAX_SPREAD_PIPS"]:
+    if spread_pips > _spread_cap_for_instrument(ctx, instrument, settings["BREAKOUT_MAX_SPREAD_PIPS"]):
         ctx.reject("BREAKOUT", instrument, "spread too high")
         return None
     if session["aggression"] in ("MINIMAL", "LOW"):
@@ -507,7 +517,7 @@ def score_carry(instrument: str, session: Mapping[str, Any], ctx: StrategyScorin
         ctx.reject("CARRY", instrument, "no long carry bias")
         return None
     spread_pips = ctx.get_spread_pips(instrument)
-    if spread_pips > settings["CARRY_MAX_SPREAD_PIPS"]:
+    if spread_pips > _spread_cap_for_instrument(ctx, instrument, settings["CARRY_MAX_SPREAD_PIPS"]):
         ctx.reject("CARRY", instrument, "spread too high")
         return None
     df_4h = ctx.fetch_candles(instrument, "H4", 60)
@@ -563,7 +573,7 @@ def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyS
         ctx.reject("ASIAN_FADE", instrument, "Tokyo only")
         return None
     spread_pips = ctx.get_spread_pips(instrument)
-    if spread_pips > settings["ASIAN_FADE_MAX_SPREAD_PIPS"]:
+    if spread_pips > _spread_cap_for_instrument(ctx, instrument, settings["ASIAN_FADE_MAX_SPREAD_PIPS"]):
         ctx.reject("ASIAN_FADE", instrument, "spread too high")
         return None
     df_5m = ctx.fetch_candles(instrument, "M5", 60)
@@ -625,16 +635,16 @@ def score_asian_fade(instrument: str, session: Mapping[str, Any], ctx: StrategyS
 
 
 def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
-    if not ctx.macro_news:
-        ctx.reject("POST_NEWS", instrument, "no macro news loaded")
-        return None
     now = ctx.now_provider()
     matching_events = ctx.get_post_news_events(instrument, now)
+    if not ctx.macro_news and not matching_events:
+        ctx.reject("POST_NEWS", instrument, "no macro news loaded")
+        return None
     if not matching_events:
         ctx.reject("POST_NEWS", instrument, "no recent high-impact post-news window")
         return None
     spread_pips = ctx.get_spread_pips(instrument)
-    if spread_pips > settings["POST_NEWS_MAX_SPREAD_PIPS"]:
+    if spread_pips > _spread_cap_for_instrument(ctx, instrument, settings["POST_NEWS_MAX_SPREAD_PIPS"]):
         ctx.reject("POST_NEWS", instrument, "spread too high")
         return None
     df_5m = ctx.fetch_candles(instrument, "M5", 30)
@@ -690,7 +700,7 @@ def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategySco
     if _reject_if_news_paused("PULLBACK", instrument, ctx):
         return None
     spread_pips = ctx.get_spread_pips(instrument)
-    if spread_pips > settings["PULLBACK_MAX_SPREAD_PIPS"]:
+    if spread_pips > _spread_cap_for_instrument(ctx, instrument, settings["PULLBACK_MAX_SPREAD_PIPS"]):
         ctx.reject("PULLBACK", instrument, "spread too high")
         return None
     if session["aggression"] == "MINIMAL":

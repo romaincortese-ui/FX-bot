@@ -82,6 +82,7 @@ from fxbot.regime_dwell import RegimeDwellFilter
 from fxbot.carry_basket import build_carry_basket
 from fxbot.carry_feed import derive_currency_rates as derive_currency_rates_from_financing
 from fxbot.decision_day import decision_day_follow_through
+from fxbot.event_intelligence import event_signal_for_instrument, is_state_fresh, parse_timestamp
 from fxbot.seasonality import seasonal_risk_multiplier
 from fxbot.slippage import get_default_logger as get_default_slippage_logger
 from fxbot.strategy_reconciliation import (
@@ -480,6 +481,23 @@ TIER3_SEASONALITY_ENABLED = os.getenv("TIER3_SEASONALITY_ENABLED", "1") not in (
 TIER3_WEEKLY_REPORT_ENABLED = os.getenv("TIER3_WEEKLY_REPORT_ENABLED", "1") not in ("0", "", "false", "False")
 TIER3_WEEKLY_REPORT_WEEKDAY = int(os.getenv("TIER3_WEEKLY_REPORT_WEEKDAY", "0"))  # 0=Monday
 TIER3_WEEKLY_REPORT_HOUR_UTC = int(os.getenv("TIER3_WEEKLY_REPORT_HOUR_UTC", "7"))
+# Event intelligence — phase 1-3: RSS/official feed spike detection, market
+# confirmation, risk reservation and cap-fit sizing. Social feeds are excluded.
+EVENT_INTEL_ENABLED = os.getenv("EVENT_INTEL_ENABLED", "1") not in ("0", "", "false", "False")
+EVENT_INTEL_STATE_KEY = os.getenv("EVENT_INTEL_STATE_KEY", "fxbot:event_intelligence")
+EVENT_INTEL_MIN_SCORE = float(os.getenv("EVENT_INTEL_MIN_SCORE", "0.65"))
+EVENT_INTEL_STRONG_SCORE = float(os.getenv("EVENT_INTEL_STRONG_SCORE", "0.75"))
+EVENT_INTEL_STALE_GRACE_SECS = int(os.getenv("EVENT_INTEL_STALE_GRACE_SECS", "300"))
+EVENT_INTEL_POST_EVENT_WINDOW_MINS = int(os.getenv("EVENT_INTEL_POST_EVENT_WINDOW_MINS", "360"))
+EVENT_INTEL_CONFIRM_LOOKBACK_M5_BARS = int(os.getenv("EVENT_INTEL_CONFIRM_LOOKBACK_M5_BARS", "96"))
+EVENT_INTEL_CONFIRM_MIN_ATR_MULT = float(os.getenv("EVENT_INTEL_CONFIRM_MIN_ATR_MULT", "1.25"))
+EVENT_INTEL_CONFIRM_MIN_MOVE_PIPS = float(os.getenv("EVENT_INTEL_CONFIRM_MIN_MOVE_PIPS", "25"))
+EVENT_INTEL_MAX_SPREAD_PIPS = float(os.getenv("EVENT_INTEL_MAX_SPREAD_PIPS", "4.0"))
+EVENT_INTEL_RISK_RESERVE_PCT = float(os.getenv("EVENT_INTEL_RISK_RESERVE_PCT", "0.25"))
+EVENT_INTEL_RISK_MULT = float(os.getenv("EVENT_INTEL_RISK_MULT", "0.50"))
+EVENT_INTEL_CAP_FIT_ENABLED = os.getenv("EVENT_INTEL_CAP_FIT_ENABLED", "1") not in ("0", "", "false", "False")
+EVENT_INTEL_CAP_FIT_MIN_RATIO = float(os.getenv("EVENT_INTEL_CAP_FIT_MIN_RATIO", "0.20"))
+EVENT_INTEL_CAP_FIT_MIN_RISK_AMOUNT = float(os.getenv("EVENT_INTEL_CAP_FIT_MIN_RISK_AMOUNT", "0.25"))
 # Tier 4 — verification and post-remediation hardening.
 TIER3_CARRY_BASKET_LIVE = os.getenv("TIER3_CARRY_BASKET_LIVE", "0") not in ("0", "", "false", "False")
 TIER3_CARRY_BASKET_TOP_N = int(os.getenv("TIER3_CARRY_BASKET_TOP_N", "3"))
@@ -622,6 +640,8 @@ _macro_filter_mtime  = 0.0
 macro_news           = []
 _macro_news_mtime    = 0.0
 macro_news_pause_until = 0.0
+event_intelligence_state = {}
+_event_intelligence_mtime = 0.0
 trade_calibration    = {}
 _trade_calibration_mtime = 0.0
 # Tracks the last "ignoring" reason emitted at INFO so repeat cycles can
@@ -1399,18 +1419,19 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
                     _spread_sampler.record(instrument=inst, spread_pips=spread)
                 except Exception:
                     pass
-                if spread <= max_spread_pips:
+                effective_spread_cap = _event_spread_cap_for_pair(inst, max_spread_pips)
+                if spread <= effective_spread_cap:
                     mark_pair_success(inst, "spread")
                     if is_pair_tradeable(inst):
                         spread_ok.append(inst)
                         log.info(
                             f"📊 spread_gate KEEP {inst} bid={bid:.5f} ask={ask:.5f} "
-                            f"pip_size={ps:g} spread_pips={spread:.2f} (<= {max_spread_pips:.2f})"
+                            f"pip_size={ps:g} spread_pips={spread:.2f} (<= {effective_spread_cap:.2f})"
                         )
                     else:
                         spread_rejections.append({"pair": inst, "bid": bid, "ask": ask, "pip_size": ps, "spread_pips": spread, "reason": "pair_health_blocked"})
                 else:
-                    mark_pair_failure(inst, f"spread {spread:.1f} > {max_spread_pips:.1f}", "spread")
+                    mark_pair_failure(inst, f"spread {spread:.1f} > {effective_spread_cap:.1f}", "spread")
                     spread_rejections.append({"pair": inst, "bid": bid, "ask": ask, "pip_size": ps, "spread_pips": spread, "reason": "spread_too_wide"})
 
         # Aggregate WARN so the observability pipeline can alert when the gate
@@ -2674,7 +2695,7 @@ def place_order(instrument: str, units: float, direction: str,
         "POST_NEWS": POST_NEWS_MAX_SPREAD_PIPS,
         "PULLBACK": PULLBACK_MAX_SPREAD_PIPS,
     }
-    _cap_pips = _spread_caps.get(_strategy_for_cap, MAX_SPREAD_FILTER_PIPS)
+    _cap_pips = _event_spread_cap_for_pair(instrument, _spread_caps.get(_strategy_for_cap, MAX_SPREAD_FILTER_PIPS))
     _observed_spread: float | None = None
     try:
         if bid is not None and ask is not None and float(ask) > float(bid) > 0:
@@ -3978,6 +3999,184 @@ def refresh_macro_news() -> bool:
     return False
 
 
+def _load_event_intelligence_from_redis() -> dict | None:
+    if not EVENT_INTEL_ENABLED or REDIS_CLIENT is None:
+        return None
+    try:
+        raw = REDIS_CLIENT.get(EVENT_INTEL_STATE_KEY)
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        state = json.loads(raw)
+        if isinstance(state, dict):
+            return state
+    except Exception as e:
+        log.warning(f"Failed to load event intelligence from Redis: {e}")
+    return None
+
+
+def load_event_intelligence() -> None:
+    global event_intelligence_state
+    state = _load_event_intelligence_from_redis()
+    if state is None:
+        event_intelligence_state = {}
+        return
+    event_intelligence_state = state
+    currencies = state.get("currencies", {}) if isinstance(state, dict) else {}
+    active = ", ".join(sorted(currencies.keys())) if isinstance(currencies, dict) and currencies else "none"
+    log.info(f"Loaded event intelligence from Redis: active={active}")
+
+
+def refresh_event_intelligence() -> bool:
+    global _event_intelligence_mtime
+    if not EVENT_INTEL_ENABLED or REDIS_CLIENT is None:
+        return False
+    state = _load_event_intelligence_from_redis()
+    if state is None:
+        return False
+    generated_at = state.get("generated_at")
+    if generated_at and generated_at != _event_intelligence_mtime:
+        _event_intelligence_mtime = generated_at
+        load_event_intelligence()
+        return True
+    return False
+
+
+def _event_signal_for_pair(instrument: str) -> dict | None:
+    if not EVENT_INTEL_ENABLED:
+        return None
+    return event_signal_for_instrument(
+        event_intelligence_state,
+        instrument,
+        min_score=EVENT_INTEL_MIN_SCORE,
+        grace_seconds=EVENT_INTEL_STALE_GRACE_SECS,
+    )
+
+
+def _event_signal_direction_matches(signal: dict | None, direction: str) -> bool:
+    if not signal:
+        return False
+    hint = str(signal.get("direction_hint") or "UNKNOWN").upper()
+    return hint == "UNKNOWN" or hint == str(direction).upper()
+
+
+def _event_market_confirmation(instrument: str, signal: dict | None = None) -> dict:
+    signal = signal or _event_signal_for_pair(instrument)
+    if not signal:
+        return {"confirmed": False, "reason": "no_event_signal"}
+    try:
+        df = fetch_candles(instrument, "M5", max(30, EVENT_INTEL_CONFIRM_LOOKBACK_M5_BARS))
+        if df is None or len(df) < 20:
+            return {"confirmed": False, "reason": "insufficient_m5_history"}
+        close = df["close"]
+        lookback = min(max(2, EVENT_INTEL_CONFIRM_LOOKBACK_M5_BARS), len(close) - 1)
+        current = float(close.iloc[-1])
+        reference = float(close.iloc[-lookback])
+        ps = pip_size(instrument)
+        move_pips = (current - reference) / ps if ps > 0 else 0.0
+        atr_pips = price_to_pips(instrument, calc_atr(df, 14))
+        min_move = max(EVENT_INTEL_CONFIRM_MIN_MOVE_PIPS, atr_pips * EVENT_INTEL_CONFIRM_MIN_ATR_MULT)
+        spread_pips = get_spread_pips(instrument)
+        hint = str(signal.get("direction_hint") or "UNKNOWN").upper()
+        if hint == "LONG":
+            direction_ok = move_pips > 0
+        elif hint == "SHORT":
+            direction_ok = move_pips < 0
+        else:
+            direction_ok = True
+        confirmed = abs(move_pips) >= min_move and direction_ok and spread_pips <= EVENT_INTEL_MAX_SPREAD_PIPS
+        return {
+            "confirmed": bool(confirmed),
+            "move_pips": round(move_pips, 1),
+            "atr_pips": round(atr_pips, 1),
+            "min_move_pips": round(min_move, 1),
+            "spread_pips": round(spread_pips, 2),
+            "direction_ok": direction_ok,
+            "reason": "confirmed" if confirmed else "market_not_confirmed",
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug(f"event market confirmation error for {instrument}: {exc}")
+        return {"confirmed": False, "reason": "confirmation_error"}
+
+
+def _event_spread_cap_for_pair(instrument: str, base_cap_pips: float) -> float:
+    signal = _event_signal_for_pair(instrument)
+    if not signal:
+        return base_cap_pips
+    try:
+        score = float(signal.get("event_risk_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score < EVENT_INTEL_STRONG_SCORE:
+        return base_cap_pips
+    return max(float(base_cap_pips), EVENT_INTEL_MAX_SPREAD_PIPS)
+
+
+def _event_virtual_post_news_event(instrument: str, now: datetime) -> dict | None:
+    signal = _event_signal_for_pair(instrument)
+    if not signal:
+        return None
+    event_times = [
+        parsed
+        for parsed in (parse_timestamp(event.get("published_at")) for event in signal.get("events", []) if isinstance(event, dict))
+        if parsed is not None
+    ]
+    event_time = max(event_times) if event_times else None
+    if event_time is None:
+        event_time = parse_timestamp(event_intelligence_state.get("generated_at")) if isinstance(event_intelligence_state, dict) else None
+    if event_time is None:
+        event_time = now
+    window_end = event_time + timedelta(minutes=EVENT_INTEL_POST_EVENT_WINDOW_MINS)
+    if now > window_end:
+        return None
+    pause_end = event_time
+    return {
+        "currency": signal.get("event_currency"),
+        "event": f"Event intelligence: {signal.get('source_summary', '')[:120]}",
+        "impact": "High",
+        "time": event_time.isoformat(),
+        "pause_start": event_time.isoformat(),
+        "pause_end": pause_end.isoformat(),
+        "source": "event_intelligence",
+        "direction_hint": signal.get("direction_hint", "UNKNOWN"),
+        "event_risk_score": signal.get("event_risk_score", 0.0),
+    }
+
+
+def _event_intelligence_entry_block(strategy: str, instrument: str, direction: str) -> str | None:
+    signal = _event_signal_for_pair(instrument)
+    if not signal:
+        return None
+    strategy_key = str(strategy).upper()
+    if strategy_key in {"REVERSAL", "ASIAN_FADE", "CARRY", "SCALPER"}:
+        return f"event risk window ({signal.get('event_currency')})"
+    if not _event_signal_direction_matches(signal, direction):
+        return f"event direction conflict ({signal.get('direction_hint')})"
+    confirmation = _event_market_confirmation(instrument, signal)
+    if not confirmation.get("confirmed"):
+        return f"event awaiting market confirmation ({confirmation.get('reason')})"
+    return None
+
+
+def _event_risk_reserve_amount(budget_snapshot: dict, instrument: str, direction: str) -> float:
+    if not EVENT_INTEL_ENABLED or EVENT_INTEL_RISK_RESERVE_PCT <= 0:
+        return 0.0
+    if not is_state_fresh(event_intelligence_state, grace_seconds=EVENT_INTEL_STALE_GRACE_SECS):
+        return 0.0
+    currencies = event_intelligence_state.get("currencies", {}) if isinstance(event_intelligence_state, dict) else {}
+    if not isinstance(currencies, dict) or not currencies:
+        return 0.0
+    signal = _event_signal_for_pair(instrument)
+    if signal and _event_signal_direction_matches(signal, direction):
+        confirmation = _event_market_confirmation(instrument, signal)
+        if confirmation.get("confirmed"):
+            return 0.0
+    available = float(budget_snapshot.get("available_fx_risk", 0.0) or 0.0)
+    max_total = float(budget_snapshot.get("max_total_risk_amount", 0.0) or 0.0)
+    return max(0.0, min(available, max_total * EVENT_INTEL_RISK_RESERVE_PCT))
+
+
 def _parse_macro_news_timestamp(value: str) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -4027,6 +4226,9 @@ def is_pair_paused_by_news(instrument: str, now: datetime | None = None) -> bool
             continue
         if start_ts <= now < end_ts:
             return True
+    signal = _event_signal_for_pair(instrument)
+    if signal and not _event_market_confirmation(instrument, signal).get("confirmed"):
+        return True
     return False
 
 
@@ -4046,6 +4248,9 @@ def get_post_news_events_for_instrument(instrument: str, now: datetime | None = 
         window_end = pause_end + timedelta(minutes=POST_NEWS_WINDOW_MINS)
         if pause_end <= now <= window_end:
             matched.append(event)
+    virtual_event = _event_virtual_post_news_event(instrument, now)
+    if virtual_event is not None:
+        matched.append(virtual_event)
     return matched
 
 
@@ -4142,6 +4347,7 @@ def _build_strategy_scoring_context() -> StrategyScoringContext:
         vix_level=_vix_level,
         vix_low_threshold=VIX_LOW_THRESHOLD,
         get_trade_calibration_adjustment=get_trade_calibration_adjustment,
+        get_event_spread_cap_pips=_event_spread_cap_for_pair,
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -4247,6 +4453,21 @@ def _tier2_portfolio_vol_breach(
     nav: float,
 ) -> str | None:
     """Return a block reason if adding this trade would exceed the portfolio-vol cap."""
+    decision = _tier2_portfolio_vol_decision(instrument, direction, candidate_risk_amount, nav)
+    if decision is None or decision.allowed:
+        return None
+    return (
+        f"portfolio_vol {decision.portfolio_vol_after:.3%}"
+        f" > cap {decision.cap:.3%}"
+    )
+
+
+def _tier2_portfolio_vol_decision(
+    instrument: str,
+    direction: str,
+    candidate_risk_amount: float,
+    nav: float,
+):
     if not TIER2_PORTFOLIO_VOL_ENABLED or nav <= 0 or candidate_risk_amount <= 0:
         return None
     try:
@@ -4270,12 +4491,40 @@ def _tier2_portfolio_vol_breach(
     except Exception as exc:  # pragma: no cover — defensive
         log.debug(f"portfolio-vol check error: {exc}")
         return None
-    if not decision.allowed:
-        return (
-            f"portfolio_vol {decision.portfolio_vol_after:.3%}"
-            f" > cap {decision.cap:.3%}"
+    return decision
+
+
+def _tier2_cap_fit_risk_amount(
+    instrument: str,
+    direction: str,
+    requested_risk_amount: float,
+    nav: float,
+) -> tuple[float, str | None]:
+    if not EVENT_INTEL_CAP_FIT_ENABLED or requested_risk_amount <= 0 or nav <= 0:
+        return requested_risk_amount, None
+    decision = _tier2_portfolio_vol_decision(instrument, direction, requested_risk_amount, nav)
+    if decision is None or decision.allowed:
+        return requested_risk_amount, None
+    low = 0.0
+    high = float(requested_risk_amount)
+    for _ in range(24):
+        mid = (low + high) / 2.0
+        mid_decision = _tier2_portfolio_vol_decision(instrument, direction, mid, nav)
+        if mid_decision is None or mid_decision.allowed:
+            low = mid
+        else:
+            high = mid
+    fitted = low
+    minimum = max(EVENT_INTEL_CAP_FIT_MIN_RISK_AMOUNT, requested_risk_amount * EVENT_INTEL_CAP_FIT_MIN_RATIO)
+    if fitted < minimum:
+        return 0.0, (
+            f"portfolio_vol cap-fit too small {fitted:.2f} < {minimum:.2f} "
+            f"(requested {requested_risk_amount:.2f})"
         )
-    return None
+    return fitted, (
+        f"portfolio_vol cap-fit {requested_risk_amount:.2f}->{fitted:.2f} "
+        f"under cap {TIER2_PORTFOLIO_VOL_CAP_PCT:.3%}"
+    )
 
 
 # Per-pair 4h ATR ratio would be ideal for a live regime classifier; use the
@@ -4896,6 +5145,9 @@ def get_strategy_entry_block_reason(strategy: str, instrument: str, direction: s
             log.debug(f"net_rr gate error: {e}")
     if is_pair_paused_by_news(instrument) and strategy != "CARRY":
         return "pre-news risk window"
+    event_block = _event_intelligence_entry_block(strategy, instrument, direction)
+    if event_block is not None:
+        return event_block
     scalper_block = _tier3_scalper_cross_block(strategy, instrument)
     if scalper_block is not None:
         return scalper_block
@@ -4924,6 +5176,8 @@ def get_entry_risk_multiplier(strategy: str, instrument: str, session_name: str 
     if session_name is None:
         session_name = get_current_session()["name"]
     risk_mult = NEWS_WINDOW_RISK_MULT if is_pair_paused_by_news(instrument) else 1.0
+    event_signal = _event_signal_for_pair(instrument)
+    event_mult = EVENT_INTEL_RISK_MULT if event_signal else 1.0
     calibration = get_trade_calibration_adjustment(strategy, instrument, session_name)
     dd_scale = float(_drawdown_risk_scale) if TIER2_DRAWDOWN_KILL_ENABLED else 1.0
     flow_mult = _tier3_flow_bias(instrument)
@@ -4932,7 +5186,7 @@ def get_entry_risk_multiplier(strategy: str, instrument: str, session_name: str 
     return round(
         max(
             CALIBRATION_RISK_FLOOR,
-            risk_mult * calibration["risk_mult"] * dd_scale * flow_mult * seasonal_mult * decision_mult,
+            risk_mult * event_mult * calibration["risk_mult"] * dd_scale * flow_mult * seasonal_mult * decision_mult,
         ),
         3,
     )
@@ -4984,14 +5238,18 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
 
     account_currency = acct.get("currency", get_account_currency())
     budget_snapshot = build_fx_budget_snapshot(balance)
+    event_signal = _event_signal_for_pair(instrument)
+    risk_reserve = _event_risk_reserve_amount(budget_snapshot, instrument, direction)
+    available_for_entry = max(0.0, float(budget_snapshot["available_fx_risk"] or 0.0) - risk_reserve)
     risk_amount = min(
         budget_snapshot["max_trade_risk_amount"] * effective_kelly_mult,
-        budget_snapshot["available_fx_risk"],
+        available_for_entry,
     )
     if risk_amount <= 0:
+        reserve_suffix = f", reserved {risk_reserve:.2f} for event risk" if risk_reserve > 0 else ""
         log.info(
             f"[{label}] Skip {instrument} {direction} — FX risk budget exhausted "
-            f"({budget_snapshot['reserved_fx_risk']:.2f}/{budget_snapshot['max_total_risk_amount']:.2f})"
+            f"({budget_snapshot['reserved_fx_risk']:.2f}/{budget_snapshot['max_total_risk_amount']:.2f}{reserve_suffix})"
         )
         return None
 
@@ -4999,8 +5257,22 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     nav_for_cap = float(acct.get("NAV", balance) or balance or 0.0)
     vol_block = _tier2_portfolio_vol_breach(instrument, direction, risk_amount, nav_for_cap)
     if vol_block is not None:
-        log.info(f"[{label}] Skip {instrument} {direction} — {vol_block}")
-        return None
+        event_confirmed = bool(
+            event_signal
+            and _event_signal_direction_matches(event_signal, direction)
+            and _event_market_confirmation(instrument, event_signal).get("confirmed")
+        )
+        if event_confirmed:
+            fitted_risk, fit_reason = _tier2_cap_fit_risk_amount(instrument, direction, risk_amount, nav_for_cap)
+            if fitted_risk <= 0:
+                log.info(f"[{label}] Skip {instrument} {direction} — {fit_reason or vol_block}")
+                return None
+            if fit_reason:
+                log.info(f"[{label}] {instrument} {direction} — {fit_reason}")
+            risk_amount = fitted_risk
+        else:
+            log.info(f"[{label}] Skip {instrument} {direction} — {vol_block}")
+            return None
 
     units = calculate_units_for_risk_amount(instrument, risk_amount, opp["sl_pips"], account_currency)
 
@@ -5058,7 +5330,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         ask=price_data.get("ask"),
         expected_spread_pips=opp.get("spread_pips"),
     )
-    if not result or not result.get("id"):
+    if not result or result.get("blocked") or not result.get("id"):
         return None
 
     actual_entry = result.get("price", entry_price)
@@ -5575,6 +5847,8 @@ def _bootstrap_runtime() -> None:
     if not PAPER_TRADE and OANDA_API_KEY and OANDA_ACCOUNT_ID:
         sync_open_trades_with_oanda(reason="startup")
 
+    load_event_intelligence()
+
     log.info("Building initial dynamic watchlist...")
     DYNAMIC_PAIRS = build_dynamic_watchlist()
     if DYNAMIC_PAIRS:
@@ -5609,6 +5883,7 @@ def _bootstrap_runtime() -> None:
     log.info(f"Current working directory: {os.getcwd()}")
     if REDIS_CLIENT is not None:
         log.info(f"Expecting Redis macro state on key: {REDIS_MACRO_STATE_KEY}")
+        log.info(f"Expecting event intelligence state on key: {EVENT_INTEL_STATE_KEY}")
     else:
         log.info(f"Expecting macro files: {MACRO_FILTER_FILE}, {MACRO_NEWS_FILE}")
 
@@ -5640,11 +5915,14 @@ def _bootstrap_runtime() -> None:
     log.info("🔄 Refreshing macro filter and news data on startup...")
     filter_reloaded = refresh_macro_filters()
     news_reloaded = refresh_macro_news()
+    event_reloaded = refresh_event_intelligence()
     calibration_reloaded = refresh_trade_calibration()
     if not filter_reloaded:
         load_macro_filters()
     if not news_reloaded:
         load_macro_news()
+    if not event_reloaded:
+        load_event_intelligence()
     if not calibration_reloaded:
         load_trade_calibration()
 
@@ -5708,11 +5986,13 @@ def run():
                 _weekend_mode_active = False
             filters_updated = refresh_macro_filters()
             news_updated = refresh_macro_news()
+            event_updated = refresh_event_intelligence()
             calibration_updated = refresh_trade_calibration()
-            if filters_updated or news_updated:
+            if filters_updated or news_updated or event_updated:
                 log.info(
                     f"🔄 Macro JSON refresh: filters={'reloaded' if filters_updated else 'unchanged'} "
-                    f"news={'reloaded' if news_updated else 'unchanged'}"
+                    f"news={'reloaded' if news_updated else 'unchanged'} "
+                    f"events={'reloaded' if event_updated else 'unchanged'}"
                 )
             if calibration_updated:
                 log.info("🔄 Trade calibration refresh: reloaded")
