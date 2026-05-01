@@ -88,6 +88,33 @@ def test_event_market_confirmation_allows_event_spread_cap(monkeypatch) -> None:
     assert main._event_spread_cap_for_pair("USD_JPY", 2.5) == 4.0
 
 
+def test_confirmed_event_intelligence_post_news_bypasses_disabled_tier3(monkeypatch) -> None:
+    main = importlib.import_module("main")
+    published = datetime.now(timezone.utc) - timedelta(minutes=20)
+    now = published + timedelta(minutes=20)
+
+    monkeypatch.setattr(main, "event_intelligence_state", _event_state(published))
+    monkeypatch.setattr(main, "EVENT_INTEL_MIN_SCORE", 0.5)
+    monkeypatch.setattr(main, "EVENT_INTEL_STALE_GRACE_SECS", 0)
+    monkeypatch.setattr(main, "TIER3_POST_NEWS_ENABLED", False)
+    monkeypatch.setattr(main, "_event_market_confirmation", lambda *args, **kwargs: {"confirmed": True})
+
+    assert main._tier3_post_news_confirmation_block("POST_NEWS", "USD_JPY", now=now) is None
+
+
+def test_event_intelligence_post_news_catalyst_boosts_selection() -> None:
+    scoring = importlib.import_module("fxbot.strategies.scoring")
+
+    catalyst = scoring._post_news_event_catalyst(
+        [{"source": "event_intelligence", "event_risk_score": 0.75}],
+        {"EVENT_INTEL_POST_NEWS_SCORE_BOOST": 8.0, "EVENT_INTEL_POST_NEWS_THRESHOLD_RELIEF": 4.0},
+    )
+
+    assert catalyst["score_boost"] == 6.0
+    assert catalyst["threshold_relief"] == 3.0
+    assert catalyst["event_risk_score"] == 0.75
+
+
 def test_event_risk_reserve_spares_confirmed_event_pair(monkeypatch) -> None:
     main = importlib.import_module("main")
     published = datetime.now(timezone.utc) - timedelta(minutes=20)

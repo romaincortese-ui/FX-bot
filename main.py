@@ -495,9 +495,12 @@ EVENT_INTEL_CONFIRM_MIN_MOVE_PIPS = float(os.getenv("EVENT_INTEL_CONFIRM_MIN_MOV
 EVENT_INTEL_MAX_SPREAD_PIPS = float(os.getenv("EVENT_INTEL_MAX_SPREAD_PIPS", "4.0"))
 EVENT_INTEL_RISK_RESERVE_PCT = float(os.getenv("EVENT_INTEL_RISK_RESERVE_PCT", "0.25"))
 EVENT_INTEL_RISK_MULT = float(os.getenv("EVENT_INTEL_RISK_MULT", "0.50"))
+EVENT_INTEL_CATALYST_RISK_MULT = float(os.getenv("EVENT_INTEL_CATALYST_RISK_MULT", "1.15"))
 EVENT_INTEL_CAP_FIT_ENABLED = os.getenv("EVENT_INTEL_CAP_FIT_ENABLED", "1") not in ("0", "", "false", "False")
 EVENT_INTEL_CAP_FIT_MIN_RATIO = float(os.getenv("EVENT_INTEL_CAP_FIT_MIN_RATIO", "0.20"))
 EVENT_INTEL_CAP_FIT_MIN_RISK_AMOUNT = float(os.getenv("EVENT_INTEL_CAP_FIT_MIN_RISK_AMOUNT", "0.25"))
+EVENT_INTEL_POST_NEWS_SCORE_BOOST = float(os.getenv("EVENT_INTEL_POST_NEWS_SCORE_BOOST", "8.0"))
+EVENT_INTEL_POST_NEWS_THRESHOLD_RELIEF = float(os.getenv("EVENT_INTEL_POST_NEWS_THRESHOLD_RELIEF", "4.0"))
 # Tier 4 — verification and post-remediation hardening.
 TIER3_CARRY_BASKET_LIVE = os.getenv("TIER3_CARRY_BASKET_LIVE", "0") not in ("0", "", "false", "False")
 TIER3_CARRY_BASKET_TOP_N = int(os.getenv("TIER3_CARRY_BASKET_TOP_N", "3"))
@@ -4946,10 +4949,16 @@ def _tier3_post_news_confirmation_block(
     """
     if str(strategy).upper() != "POST_NEWS":
         return None
-    if not TIER3_POST_NEWS_ENABLED:
-        return "post_news_disabled_tier3"
     ts = now or datetime.now(timezone.utc)
     events = get_post_news_events_for_instrument(instrument, ts)
+    has_confirmed_event_intel = any(
+        isinstance(event, dict)
+        and event.get("source") == "event_intelligence"
+        and _event_market_confirmation(instrument).get("confirmed")
+        for event in events
+    )
+    if not TIER3_POST_NEWS_ENABLED and not has_confirmed_event_intel:
+        return "post_news_disabled_tier3"
     if not events:
         return None
     min_delay = max(0, int(TIER3_POST_NEWS_CONFIRM_DELAY_SECS))
@@ -5177,7 +5186,11 @@ def get_entry_risk_multiplier(strategy: str, instrument: str, session_name: str 
         session_name = get_current_session()["name"]
     risk_mult = NEWS_WINDOW_RISK_MULT if is_pair_paused_by_news(instrument) else 1.0
     event_signal = _event_signal_for_pair(instrument)
-    event_mult = EVENT_INTEL_RISK_MULT if event_signal else 1.0
+    event_mult = 1.0
+    if event_signal:
+        direction = str(event_signal.get("direction_hint") or "UNKNOWN").upper()
+        confirmed = _event_signal_direction_matches(event_signal, direction) and _event_market_confirmation(instrument, event_signal).get("confirmed")
+        event_mult = EVENT_INTEL_CATALYST_RISK_MULT if confirmed else EVENT_INTEL_RISK_MULT
     calibration = get_trade_calibration_adjustment(strategy, instrument, session_name)
     dd_scale = float(_drawdown_risk_scale) if TIER2_DRAWDOWN_KILL_ENABLED else 1.0
     flow_mult = _tier3_flow_bias(instrument)

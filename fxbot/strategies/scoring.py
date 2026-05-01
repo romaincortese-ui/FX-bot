@@ -130,6 +130,25 @@ def _finalize_opportunity(
     return result
 
 
+def _post_news_event_catalyst(matching_events: Sequence[dict], settings: Mapping[str, Any]) -> dict[str, Any]:
+    event_scores = []
+    for event in matching_events:
+        if not isinstance(event, Mapping) or event.get("source") != "event_intelligence":
+            continue
+        try:
+            event_scores.append(float(event.get("event_risk_score", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            continue
+    if not event_scores:
+        return {"score_boost": 0.0, "threshold_relief": 0.0, "event_risk_score": 0.0}
+    event_score = max(0.0, min(1.0, max(event_scores)))
+    return {
+        "score_boost": float(settings.get("EVENT_INTEL_POST_NEWS_SCORE_BOOST", 8.0) or 0.0) * event_score,
+        "threshold_relief": float(settings.get("EVENT_INTEL_POST_NEWS_THRESHOLD_RELIEF", 4.0) or 0.0) * event_score,
+        "event_risk_score": event_score,
+    }
+
+
 def score_scalper(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
     if _reject_if_news_paused("SCALPER", instrument, ctx):
         return None
@@ -679,8 +698,11 @@ def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategySc
     if (direction == "LONG" and 50 < rsi < 80) or (direction == "SHORT" and 20 < rsi < 50):
         score += 5
     atr_pct = atr / float(close.iloc[-1])
+    event_catalyst = _post_news_event_catalyst(matching_events, settings)
+    score += event_catalyst["score_boost"]
     eff_threshold = settings["POST_NEWS_THRESHOLD"] * session["multiplier"] * ctx.market_regime_mult
     eff_threshold += ctx.adaptive_offsets.get("POST_NEWS", 0)
+    eff_threshold = max(0.0, eff_threshold - event_catalyst["threshold_relief"])
     calibrated = _apply_calibration("POST_NEWS", instrument, session, score, eff_threshold, ctx)
     if calibrated is None:
         return None
@@ -693,7 +715,7 @@ def score_post_news(instrument: str, session: Mapping[str, Any], ctx: StrategySc
     tp_pips, sl_pips, macro_confidence = _apply_target_adjustments(tp_pips, sl_pips, direction, bias, ctx.vix_level)
     if tp_pips / sl_pips < 1.5:
         tp_pips = sl_pips * 1.5
-    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["POST_NEWS_TRAIL_PIPS"], "entry_signal": "POST_NEWS_BREAKOUT", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
+    return _finalize_opportunity({"instrument": instrument, "score": round(score, 2), "selection_score": round(selection_score, 2), "direction": direction, "rsi": round(rsi, 2), "vol_ratio": round(vol_ratio, 2), "atr": atr, "atr_pct": round(atr_pct, 6), "spread_pips": round(spread_pips, 2), "tp_pips": round(tp_pips, 1), "sl_pips": round(sl_pips, 1), "trail_pips": settings["POST_NEWS_TRAIL_PIPS"], "entry_signal": "POST_NEWS_BREAKOUT", "macro_confidence": macro_confidence, "regime_multiplier": ctx.market_regime_mult, "event_catalyst_score": round(event_catalyst["event_risk_score"], 3), "event_catalyst_score_boost": round(event_catalyst["score_boost"], 2), "event_catalyst_threshold_relief": round(event_catalyst["threshold_relief"], 2), "calibration_threshold_offset": calibration["threshold_offset"], "calibration_risk_mult": calibration["risk_mult"], "calibration_source": calibration["source"]}, session=session, bias=bias, eff_threshold=eff_threshold, selection_score=selection_score)
 
 
 def score_pullback(instrument: str, session: Mapping[str, Any], ctx: StrategyScoringContext, settings: Mapping[str, Any]) -> dict | None:
