@@ -186,6 +186,43 @@ def test_run_announces_entries_available_again_when_tradable_pairs_return(monkey
     assert main._entry_pause_reason == ""
 
 
+def test_session_loss_pause_does_not_rearm_unchanged_daily_loss(monkeypatch) -> None:
+    main = importlib.import_module("main")
+
+    monkeypatch.setattr(main, "SESSION_LOSS_PAUSE_PCT", 0.02)
+    main._session_loss_pause_day = ""
+    main._session_loss_pause_pnl = 0.0
+
+    assert main._should_arm_session_loss_pause("2026-05-01", -4.50, 200.0, 3)
+    main._mark_session_loss_pause("2026-05-01", -4.50)
+
+    assert not main._should_arm_session_loss_pause("2026-05-01", -4.50, 200.0, 3)
+    assert not main._should_arm_session_loss_pause("2026-05-01", -4.49, 200.0, 4)
+    assert main._should_arm_session_loss_pause("2026-05-01", -4.52, 200.0, 4)
+
+
+def test_session_loss_pause_marker_resets_after_recovery(monkeypatch) -> None:
+    main = importlib.import_module("main")
+
+    monkeypatch.setattr(main, "SESSION_LOSS_PAUSE_PCT", 0.02)
+    main._session_loss_pause_day = "2026-05-01"
+    main._session_loss_pause_pnl = -4.50
+
+    assert not main._should_arm_session_loss_pause("2026-05-01", -3.00, 200.0, 4)
+    assert main._session_loss_pause_day == ""
+    assert main._session_loss_pause_pnl == 0.0
+
+
+def test_session_loss_pause_uses_current_day_trade_count(monkeypatch) -> None:
+    main = importlib.import_module("main")
+
+    monkeypatch.setattr(main, "SESSION_LOSS_PAUSE_PCT", 0.02)
+    main._session_loss_pause_day = ""
+    main._session_loss_pause_pnl = 0.0
+
+    assert not main._should_arm_session_loss_pause("2026-05-01", -4.50, 200.0, 2)
+
+
 def test_build_fx_budget_snapshot_uses_shared_sleeve_state(monkeypatch, tmp_path) -> None:
     main = importlib.import_module("main")
 

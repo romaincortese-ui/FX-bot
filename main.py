@@ -632,6 +632,8 @@ _last_rebalance_count = 0
 _consecutive_losses   = 0
 _streak_paused_at     = 0.0
 _session_loss_paused_until = 0.0
+_session_loss_pause_day = ""
+_session_loss_pause_pnl = 0.0
 _market_regime_mult  = 1.0
 _dxy_ema_gap         = None
 _dxy_last_good       = None
@@ -2290,6 +2292,32 @@ def _record_broker_closed_trade(trade: dict, broker_trade: dict | None, sync_rea
     return True
 
 
+def _should_arm_session_loss_pause(today: str, today_pnl: float, balance: float, today_trade_count: int) -> bool:
+    """Return True when the session-loss pause should be newly armed.
+
+    The pause is time-based. Once it expires, the same realised daily P&L should
+    not immediately re-arm it; otherwise the bot remains stuck for the whole UTC
+    day after a single loss event. Re-arm only on a new day or a materially worse
+    realised daily P&L.
+    """
+    global _session_loss_pause_day, _session_loss_pause_pnl
+    threshold = -(float(balance) * SESSION_LOSS_PAUSE_PCT)
+    if today_trade_count < 3 or today_pnl >= threshold:
+        if today_pnl >= threshold:
+            _session_loss_pause_day = ""
+            _session_loss_pause_pnl = 0.0
+        return False
+    if _session_loss_pause_day != today:
+        return True
+    return today_pnl < (_session_loss_pause_pnl - 0.01)
+
+
+def _mark_session_loss_pause(today: str, today_pnl: float) -> None:
+    global _session_loss_pause_day, _session_loss_pause_pnl
+    _session_loss_pause_day = today
+    _session_loss_pause_pnl = float(today_pnl)
+
+
 def get_account_currency() -> str:
     if PAPER_TRADE:
         return "GBP" if ACCOUNT_TYPE == "spread_bet" else "USD"
@@ -3781,6 +3809,8 @@ def save_state():
             "trade_history":         trade_history[-500:],
             "consecutive_losses":    _consecutive_losses,
             "streak_paused_at":      _streak_paused_at,
+            "session_loss_pause_day": _session_loss_pause_day,
+            "session_loss_pause_pnl": _session_loss_pause_pnl,
             "entry_pause_reason":    _entry_pause_reason,
             "weekend_mode_active":   _weekend_mode_active,
             "paused":                _paused,
@@ -3815,6 +3845,7 @@ def save_state():
 
 def load_state():
     global open_trades, trade_history, _consecutive_losses, _streak_paused_at, _weekend_mode_active, _entry_pause_reason
+    global _session_loss_pause_day, _session_loss_pause_pnl
     global _paused, _adaptive_offsets, _last_rebalance_count, _pair_cooldowns, _pair_health, _pending_close_retries
     global _missed_opportunities, _strategy_score_history, _strategy_posteriors, _strategy_bayesian_weights
     try:
@@ -3830,6 +3861,8 @@ def load_state():
         trade_history       = d.get("trade_history", [])
         _consecutive_losses = d.get("consecutive_losses", 0)
         _streak_paused_at   = d.get("streak_paused_at", 0.0)
+        _session_loss_pause_day = str(d.get("session_loss_pause_day", "") or "")
+        _session_loss_pause_pnl = float(d.get("session_loss_pause_pnl", 0.0) or 0.0)
         _entry_pause_reason = d.get("entry_pause_reason", "weekend" if d.get("weekend_mode_active", False) else "")
         _weekend_mode_active = d.get("weekend_mode_active", _entry_pause_reason == "weekend")
         _paused             = d.get("paused", False)
@@ -6465,8 +6498,8 @@ def run():
             _refresh_missed_opportunity_marks()
 
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            today_pnl = sum(t.get("pnl", 0) for t in trade_history
-                           if t.get("closed_at", "").startswith(today))
+            today_trades = [t for t in trade_history if t.get("closed_at", "").startswith(today)]
+            today_pnl = sum(t.get("pnl", 0) for t in today_trades)
             daily_loss_limit = -(balance * DAILY_LOSS_LIMIT_PCT)
             daily_cb = today_pnl < daily_loss_limit
             streak_cb = _consecutive_losses >= STREAK_LOSS_MAX
@@ -6474,9 +6507,14 @@ def run():
             session_paused = False
             if _session_loss_paused_until > time.time():
                 session_paused = True
-            elif today_pnl < -(balance * SESSION_LOSS_PAUSE_PCT) and len(trade_history) >= 3:
+            elif _should_arm_session_loss_pause(today, today_pnl, balance, len(today_trades)):
                 _session_loss_paused_until = time.time() + SESSION_LOSS_PAUSE_MINS * 60
+                _mark_session_loss_pause(today, today_pnl)
                 session_paused = True
+                log.warning(
+                    f"[SESSION_LOSS] P&L {get_account_currency()}{today_pnl:.2f} breached "
+                    f"{SESSION_LOSS_PAUSE_PCT:.1%}; entries paused {SESSION_LOSS_PAUSE_MINS}min"
+                )
                 telegram(f"🛑 <b>Session loss limit</b> | P&L {get_account_currency()}{today_pnl:.2f}\n"
                          f"Entries paused {SESSION_LOSS_PAUSE_MINS}min.")
 
