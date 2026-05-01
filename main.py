@@ -555,6 +555,10 @@ HEARTBEAT_INTERVAL  = int(os.getenv("HEARTBEAT_INTERVAL",  "3600"))
 OPEN_TRADES_SYNC_INTERVAL = int(os.getenv("OPEN_TRADES_SYNC_INTERVAL", "60"))
 KLINE_CACHE_TTL     = 15
 MAX_KLINE_CACHE     = 200
+MISSED_OPPORTUNITY_REPORT_ENABLED = os.getenv("MISSED_OPPORTUNITY_REPORT_ENABLED", "1") not in ("0", "", "false", "False")
+MISSED_OPPORTUNITY_MAX_AGE_HOURS = float(os.getenv("MISSED_OPPORTUNITY_MAX_AGE_HOURS", "168"))
+MISSED_OPPORTUNITY_MAX_RECORDS = int(os.getenv("MISSED_OPPORTUNITY_MAX_RECORDS", "100"))
+MISSED_OPPORTUNITY_MARK_REFRESH_SECS = int(os.getenv("MISSED_OPPORTUNITY_MARK_REFRESH_SECS", "60"))
 
 validate_main_config(globals())
 
@@ -670,6 +674,9 @@ def _log_calibration_loaded_reset() -> None:
     global _calibration_last_reject_reason
     _calibration_last_reject_reason = None
 _recent_scan_decisions = []
+_missed_opportunities = {}
+_missed_opportunities_dirty = False
+_missed_opportunities_last_refresh_at = 0.0
 _last_scan_cycle_at   = ""
 _last_scan_cycle_summary = {"active": 0, "healthy": 0, "tradable": 0, "active_pairs": [], "tradable_pairs": []}
 _scan_reject_reasons = {}
@@ -756,6 +763,7 @@ def publish_bot_runtime_status(state: str, balance: float | None = None, error: 
         last_scan_cycle_at=_last_scan_cycle_at or None,
         scan_pool_mode=_last_scan_pool_status.get("mode", "primary"),
         market_regime_mult=round(float(_market_regime_mult), 4),
+        missed_opportunities=_missed_opportunity_status_summary(),
         error=error,
     )
     published = publish_runtime_status(REDIS_CLIENT, REDIS_BOT_STATUS_KEY, payload, BOT_STATUS_TTL)
@@ -2466,6 +2474,357 @@ def get_mid_price(instrument: str) -> float | None:
     return (bid + ask) / 2
 
 
+def _strategy_spread_cap_pips(strategy: str, instrument: str) -> float:
+    strategy_key = (strategy or "").upper()
+    spread_caps = {
+        "SCALPER": SCALPER_MAX_SPREAD_PIPS,
+        "TREND": TREND_MAX_SPREAD_PIPS,
+        "REVERSAL": REVERSAL_MAX_SPREAD_PIPS,
+        "BREAKOUT": BREAKOUT_MAX_SPREAD_PIPS,
+        "CARRY": CARRY_MAX_SPREAD_PIPS,
+        "ASIAN_FADE": ASIAN_FADE_MAX_SPREAD_PIPS,
+        "POST_NEWS": POST_NEWS_MAX_SPREAD_PIPS,
+        "PULLBACK": PULLBACK_MAX_SPREAD_PIPS,
+    }
+    return _event_spread_cap_for_pair(instrument, spread_caps.get(strategy_key, MAX_SPREAD_FILTER_PIPS))
+
+
+def _observe_entry_spread_pips(
+    instrument: str,
+    bid: float | None = None,
+    ask: float | None = None,
+    expected_spread_pips: float | None = None,
+    prefer_live_quote: bool = False,
+) -> tuple[float | None, float | None, float | None]:
+    def _from_live_quote() -> tuple[float | None, float | None, float | None]:
+        price = get_current_price(instrument)
+        bid_value = float(price.get("bid", 0) or 0)
+        ask_value = float(price.get("ask", 0) or 0)
+        if ask_value > bid_value > 0:
+            return (ask_value - bid_value) / pip_size(instrument), bid_value, ask_value
+        return None, None, None
+
+    try:
+        if bid is not None and ask is not None and float(ask) > float(bid) > 0:
+            bid_value = float(bid)
+            ask_value = float(ask)
+            return (ask_value - bid_value) / pip_size(instrument), bid_value, ask_value
+        if prefer_live_quote:
+            observed_spread, observed_bid, observed_ask = _from_live_quote()
+            if observed_spread is not None:
+                return observed_spread, observed_bid, observed_ask
+        if expected_spread_pips is not None:
+            return float(expected_spread_pips), None, None
+        return _from_live_quote()
+    except Exception:
+        pass
+    return None, None, None
+
+
+def _entry_spread_audit_snapshot(
+    strategy: str,
+    instrument: str,
+    direction: str,
+    *,
+    units: float = 0.0,
+    label: str = "",
+    bid: float | None = None,
+    ask: float | None = None,
+    expected_spread_pips: float | None = None,
+    prefer_live_quote: bool = False,
+    context: str = "entry",
+    reason: str = "",
+) -> dict:
+    strategy_key = (strategy or label or "").upper()
+    cap_pips = _strategy_spread_cap_pips(strategy_key, instrument)
+    observed_spread, observed_bid, observed_ask = _observe_entry_spread_pips(
+        instrument,
+        bid=bid,
+        ask=ask,
+        expected_spread_pips=expected_spread_pips,
+        prefer_live_quote=prefer_live_quote,
+    )
+    spread_txt = f"{observed_spread:.2f}" if observed_spread is not None else "UNKNOWN"
+    suffix = f" context={context}"
+    if reason:
+        suffix += f" reason={reason}"
+    log.info(
+        f"[ENTRY_SPREAD] strategy={strategy_key or 'UNKNOWN'} "
+        f"instrument={instrument} spread_pips={spread_txt} "
+        f"cap_pips={cap_pips:.2f} direction={direction} "
+        f"units={units} label={label}{suffix}"
+    )
+    return {
+        "strategy": strategy_key,
+        "instrument": instrument,
+        "direction": direction,
+        "spread_pips": observed_spread,
+        "cap_pips": cap_pips,
+        "bid": observed_bid if observed_bid is not None else bid,
+        "ask": observed_ask if observed_ask is not None else ask,
+        "context": context,
+        "reason": reason,
+    }
+
+
+def _missed_opportunity_enabled() -> bool:
+    return bool(MISSED_OPPORTUNITY_REPORT_ENABLED)
+
+
+def _missed_opportunity_key(strategy: str, instrument: str, direction: str) -> str:
+    return f"{strategy.upper()}:{instrument.upper()}:{direction.upper()}"
+
+
+def _missed_entry_price(direction: str, spread_snapshot: dict | None, opp: dict | None) -> float | None:
+    spread_snapshot = spread_snapshot or {}
+    direction_key = (direction or "").upper()
+    bid = spread_snapshot.get("bid")
+    ask = spread_snapshot.get("ask")
+    try:
+        bid_value = float(bid) if bid is not None else None
+        ask_value = float(ask) if ask is not None else None
+    except (TypeError, ValueError):
+        bid_value = None
+        ask_value = None
+    if direction_key == "LONG" and ask_value and ask_value > 0:
+        return ask_value
+    if direction_key == "SHORT" and bid_value and bid_value > 0:
+        return bid_value
+    if bid_value and ask_value and ask_value > bid_value > 0:
+        return (bid_value + ask_value) / 2
+    if opp:
+        for key in ("entry_price", "price", "mid_price"):
+            try:
+                value = float(opp.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+    return None
+
+
+def _missed_mark_price(direction: str, spread_snapshot: dict | None, instrument: str) -> float | None:
+    spread_snapshot = spread_snapshot or {}
+    direction_key = (direction or "").upper()
+    bid = spread_snapshot.get("bid")
+    ask = spread_snapshot.get("ask")
+    try:
+        bid_value = float(bid) if bid is not None else None
+        ask_value = float(ask) if ask is not None else None
+    except (TypeError, ValueError):
+        bid_value = None
+        ask_value = None
+    if direction_key == "LONG" and bid_value and bid_value > 0:
+        return bid_value
+    if direction_key == "SHORT" and ask_value and ask_value > 0:
+        return ask_value
+    if bid_value and ask_value and ask_value > bid_value > 0:
+        return (bid_value + ask_value) / 2
+    try:
+        price = get_current_price(instrument)
+        bid_value = float(price.get("bid", 0) or 0)
+        ask_value = float(price.get("ask", 0) or 0)
+        if direction_key == "LONG" and bid_value > 0:
+            return bid_value
+        if direction_key == "SHORT" and ask_value > 0:
+            return ask_value
+        if ask_value > bid_value > 0:
+            return (bid_value + ask_value) / 2
+    except Exception:
+        return None
+    return None
+
+
+def _missed_move_pips(instrument: str, direction: str, entry_price: float, mark_price: float) -> float:
+    price_diff = mark_price - entry_price
+    if (direction or "").upper() == "SHORT":
+        price_diff = -price_diff
+    return price_to_pips(instrument, price_diff)
+
+
+def _update_missed_opportunity_mark(record: dict, mark_price: float | None, now_ts: float) -> bool:
+    if mark_price is None:
+        return False
+    try:
+        entry_price = float(record.get("theoretical_entry_price", 0) or 0)
+    except (TypeError, ValueError):
+        entry_price = 0.0
+    if entry_price <= 0:
+        return False
+    move_pips = _missed_move_pips(record.get("instrument", ""), record.get("direction", ""), entry_price, mark_price)
+    record["current_price"] = mark_price
+    record["current_pips"] = round(move_pips, 1)
+    record["mfe_pips"] = round(max(float(record.get("mfe_pips", move_pips) or move_pips), move_pips), 1)
+    record["mae_pips"] = round(min(float(record.get("mae_pips", move_pips) or move_pips), move_pips), 1)
+    first_seen_ts = float(record.get("first_seen_ts", now_ts) or now_ts)
+    horizons = record.setdefault("horizon_pips", {})
+    for label, seconds in (("1h", 3600), ("4h", 14400), ("24h", 86400)):
+        if label not in horizons and now_ts - first_seen_ts >= seconds:
+            horizons[label] = round(move_pips, 1)
+    return True
+
+
+def _prune_missed_opportunities(now_ts: float | None = None) -> None:
+    global _missed_opportunities_dirty
+    if now_ts is None:
+        now_ts = time.time()
+    max_age = max(0.0, MISSED_OPPORTUNITY_MAX_AGE_HOURS) * 3600
+    if max_age > 0:
+        for key, record in list(_missed_opportunities.items()):
+            try:
+                last_seen_ts = float(record.get("last_seen_ts", 0) or 0)
+            except (TypeError, ValueError):
+                last_seen_ts = 0.0
+            if last_seen_ts and now_ts - last_seen_ts > max_age:
+                _missed_opportunities.pop(key, None)
+                _missed_opportunities_dirty = True
+    max_records = max(1, MISSED_OPPORTUNITY_MAX_RECORDS)
+    if len(_missed_opportunities) <= max_records:
+        return
+    ordered = sorted(
+        _missed_opportunities.items(),
+        key=lambda item: float(item[1].get("last_seen_ts", 0) or 0),
+    )
+    for key, _ in ordered[: len(_missed_opportunities) - max_records]:
+        _missed_opportunities.pop(key, None)
+        _missed_opportunities_dirty = True
+
+
+def _record_missed_opportunity(
+    strategy: str,
+    instrument: str,
+    direction: str,
+    reason: str,
+    *,
+    opp: dict | None = None,
+    session_name: str | None = None,
+    risk_amount: float | None = None,
+    portfolio_decision=None,
+    spread_snapshot: dict | None = None,
+) -> None:
+    global _missed_opportunities_dirty
+    if not _missed_opportunity_enabled() or not instrument or not direction:
+        return
+    now_ts = time.time()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    _prune_missed_opportunities(now_ts)
+    key = _missed_opportunity_key(strategy, instrument, direction)
+    spread_snapshot = spread_snapshot or {}
+    entry_price = _missed_entry_price(direction, spread_snapshot, opp)
+    mark_price = _missed_mark_price(direction, spread_snapshot, instrument)
+    existing = _missed_opportunities.get(key)
+    if existing is None:
+        existing = {
+            "first_seen_at": now_iso,
+            "first_seen_ts": now_ts,
+            "strategy": strategy.upper(),
+            "instrument": instrument.upper(),
+            "direction": direction.upper(),
+            "theoretical_entry_price": entry_price,
+            "mfe_pips": 0.0,
+            "mae_pips": 0.0,
+            "horizon_pips": {},
+            "seen_count": 0,
+        }
+        _missed_opportunities[key] = existing
+    spread_value = spread_snapshot.get("spread_pips")
+    cap_value = spread_snapshot.get("cap_pips")
+    if isinstance(spread_value, (int, float)):
+        spread_value = round(float(spread_value), 2)
+    if isinstance(cap_value, (int, float)):
+        cap_value = round(float(cap_value), 2)
+    existing.update({
+        "last_seen_at": now_iso,
+        "last_seen_ts": now_ts,
+        "reason": reason,
+        "category": _categorize_entry_block_reason(reason),
+        "score": float((opp or {}).get("score", 0.0) or 0.0),
+        "selection_score": float((opp or {}).get("selection_score", (opp or {}).get("score", 0.0)) or 0.0),
+        "effective_threshold": float((opp or {}).get("effective_threshold", 0.0) or 0.0),
+        "session": session_name,
+        "sl_pips": float((opp or {}).get("sl_pips", 0.0) or 0.0),
+        "tp_pips": float((opp or {}).get("tp_pips", 0.0) or 0.0),
+        "spread_pips": spread_value,
+        "spread_cap_pips": cap_value,
+        "risk_amount": risk_amount,
+    })
+    if entry_price and not existing.get("theoretical_entry_price"):
+        existing["theoretical_entry_price"] = entry_price
+    if portfolio_decision is not None:
+        existing["portfolio_vol_before"] = round(float(getattr(portfolio_decision, "portfolio_vol_before", 0.0) or 0.0), 6)
+        existing["portfolio_vol_after"] = round(float(getattr(portfolio_decision, "portfolio_vol_after", 0.0) or 0.0), 6)
+        existing["portfolio_vol_cap"] = round(float(getattr(portfolio_decision, "cap", 0.0) or 0.0), 6)
+    existing["seen_count"] = int(existing.get("seen_count", 0) or 0) + 1
+    _update_missed_opportunity_mark(existing, mark_price, now_ts)
+    _missed_opportunities_dirty = True
+    seen_count = int(existing.get("seen_count", 0) or 0)
+    if seen_count in {1, 2, 3, 5, 10} or seen_count % 20 == 0:
+        spread = existing.get("spread_pips")
+        spread_txt = f"{float(spread):.2f}" if isinstance(spread, (int, float)) else "UNKNOWN"
+        log.info(
+            f"[MISSED_OPPORTUNITY] strategy={strategy.upper()} instrument={instrument.upper()} "
+            f"direction={direction.upper()} score={existing.get('score', 0.0):.1f} "
+            f"reason=\"{reason}\" spread_pips={spread_txt} "
+            f"entry={existing.get('theoretical_entry_price')} "
+            f"current_pips={existing.get('current_pips', 0.0)} "
+            f"mfe_pips={existing.get('mfe_pips', 0.0)} mae_pips={existing.get('mae_pips', 0.0)} "
+            f"seen={seen_count}"
+        )
+
+
+def _refresh_missed_opportunity_marks(force: bool = False) -> None:
+    global _missed_opportunities_dirty, _missed_opportunities_last_refresh_at
+    if not _missed_opportunity_enabled() or not _missed_opportunities:
+        return
+    now_ts = time.time()
+    if not force and now_ts - _missed_opportunities_last_refresh_at < MISSED_OPPORTUNITY_MARK_REFRESH_SECS:
+        return
+    _missed_opportunities_last_refresh_at = now_ts
+    _prune_missed_opportunities(now_ts)
+    for record in list(_missed_opportunities.values()):
+        mark_price = _missed_mark_price(record.get("direction", ""), None, record.get("instrument", ""))
+        if _update_missed_opportunity_mark(record, mark_price, now_ts):
+            record["last_mark_at"] = datetime.now(timezone.utc).isoformat()
+            _missed_opportunities_dirty = True
+
+
+def _missed_opportunity_status_summary() -> dict:
+    if not _missed_opportunities:
+        return {"active": False, "count": 0}
+    latest = sorted(
+        _missed_opportunities.values(),
+        key=lambda rec: float(rec.get("last_seen_ts", 0) or 0),
+        reverse=True,
+    )[:5]
+    return {
+        "active": True,
+        "count": len(_missed_opportunities),
+        "latest": [
+            {
+                "strategy": rec.get("strategy"),
+                "instrument": rec.get("instrument"),
+                "direction": rec.get("direction"),
+                "score": rec.get("score"),
+                "reason": rec.get("reason"),
+                "spread_pips": rec.get("spread_pips"),
+                "current_pips": rec.get("current_pips"),
+                "mfe_pips": rec.get("mfe_pips"),
+                "mae_pips": rec.get("mae_pips"),
+                "seen_count": rec.get("seen_count"),
+            }
+            for rec in latest
+        ],
+    }
+
+
+def _save_missed_opportunities_if_dirty() -> None:
+    global _missed_opportunities_dirty
+    if not _missed_opportunities_dirty:
+        return
+    save_state()
+    _missed_opportunities_dirty = False
+
+
 def estimate_fx_conversion_rate(from_currency: str, to_currency: str, visited: set[tuple[str, str]] | None = None) -> float | None:
     if from_currency == to_currency:
         return 1.0
@@ -2688,36 +3047,18 @@ def place_order(instrument: str, units: float, direction: str,
     # (default ON) the order is refused if the measured spread exceeds
     # the per-strategy cap; set ENTRY_SPREAD_AUDIT_STRICT=0 to bypass.
     _strategy_for_cap = (strategy or label or "").upper()
-    _spread_caps = {
-        "SCALPER": SCALPER_MAX_SPREAD_PIPS,
-        "TREND": TREND_MAX_SPREAD_PIPS,
-        "REVERSAL": REVERSAL_MAX_SPREAD_PIPS,
-        "BREAKOUT": BREAKOUT_MAX_SPREAD_PIPS,
-        "CARRY": CARRY_MAX_SPREAD_PIPS,
-        "ASIAN_FADE": ASIAN_FADE_MAX_SPREAD_PIPS,
-        "POST_NEWS": POST_NEWS_MAX_SPREAD_PIPS,
-        "PULLBACK": PULLBACK_MAX_SPREAD_PIPS,
-    }
-    _cap_pips = _event_spread_cap_for_pair(instrument, _spread_caps.get(_strategy_for_cap, MAX_SPREAD_FILTER_PIPS))
-    _observed_spread: float | None = None
-    try:
-        if bid is not None and ask is not None and float(ask) > float(bid) > 0:
-            _observed_spread = (float(ask) - float(bid)) / pip_size(instrument)
-        elif expected_spread_pips is not None:
-            _observed_spread = float(expected_spread_pips)
-        else:
-            _px = get_current_price(instrument)
-            if _px and _px.get("bid", 0) > 0 and _px.get("ask", 0) > 0:
-                _observed_spread = (float(_px["ask"]) - float(_px["bid"])) / pip_size(instrument)
-    except Exception:
-        _observed_spread = None
-    _spread_txt = f"{_observed_spread:.2f}" if _observed_spread is not None else "UNKNOWN"
-    log.info(
-        f"[ENTRY_SPREAD] strategy={_strategy_for_cap or 'UNKNOWN'} "
-        f"instrument={instrument} spread_pips={_spread_txt} "
-        f"cap_pips={_cap_pips:.2f} direction={direction} "
-        f"units={units} label={label}"
+    _spread_audit = _entry_spread_audit_snapshot(
+        _strategy_for_cap,
+        instrument,
+        direction,
+        units=units,
+        label=label,
+        bid=bid,
+        ask=ask,
+        expected_spread_pips=expected_spread_pips,
     )
+    _observed_spread = _spread_audit.get("spread_pips")
+    _cap_pips = float(_spread_audit.get("cap_pips", 0.0) or 0.0)
     _strict_audit = os.getenv("ENTRY_SPREAD_AUDIT_STRICT", "true").strip().lower() not in {"0", "false", "no", "off"}
     if (
         _strict_audit
@@ -3448,6 +3789,7 @@ def save_state():
             "pair_cooldowns":        _pair_cooldowns,
             "pair_health":           _pair_health,
             "pending_close_retries": _pending_close_retries,
+            "missed_opportunities": _missed_opportunities,
             "strategy_score_history": _strategy_score_history,
             "strategy_posteriors": {
                 k: {
@@ -3474,7 +3816,7 @@ def save_state():
 def load_state():
     global open_trades, trade_history, _consecutive_losses, _streak_paused_at, _weekend_mode_active, _entry_pause_reason
     global _paused, _adaptive_offsets, _last_rebalance_count, _pair_cooldowns, _pair_health, _pending_close_retries
-    global _strategy_score_history, _strategy_posteriors, _strategy_bayesian_weights
+    global _missed_opportunities, _strategy_score_history, _strategy_posteriors, _strategy_bayesian_weights
     try:
         if not os.path.exists(STATE_FILE):
             return
@@ -3497,6 +3839,8 @@ def load_state():
         _last_rebalance_count = d.get("last_rebalance_count", 0)
         _pair_cooldowns       = d.get("pair_cooldowns", {})
         _pending_close_retries = d.get("pending_close_retries", {}) if isinstance(d.get("pending_close_retries", {}), dict) else {}
+        raw_missed = d.get("missed_opportunities", {})
+        _missed_opportunities = raw_missed if isinstance(raw_missed, dict) else {}
         # P1 #6 — reconcile per-pair cooldowns with Redis. Railway containers
         # have ephemeral filesystems, so STATE_FILE may be wiped on restart;
         # the Redis copy survives container rotations and prevents the
@@ -5221,6 +5565,25 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         category = _categorize_entry_block_reason(block_reason)
         score = float(opp.get("score", 0.0) or 0.0) if opp else 0.0
         _emit_gate_block_log(label, instrument, direction, category, block_reason, score)
+        spread_snapshot = _entry_spread_audit_snapshot(
+            label,
+            instrument,
+            direction,
+            label=label,
+            expected_spread_pips=opp.get("spread_pips") if opp else None,
+            prefer_live_quote=True,
+            context="pre_block",
+            reason=category,
+        )
+        _record_missed_opportunity(
+            label,
+            instrument,
+            direction,
+            block_reason,
+            opp=opp,
+            session_name=session_name,
+            spread_snapshot=spread_snapshot,
+        )
         log.info(f"[{label}] Skip {instrument} {direction} — {block_reason}")
         return None
 
@@ -5260,15 +5623,44 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     )
     if risk_amount <= 0:
         reserve_suffix = f", reserved {risk_reserve:.2f} for event risk" if risk_reserve > 0 else ""
-        log.info(
-            f"[{label}] Skip {instrument} {direction} — FX risk budget exhausted "
+        reason = (
+            f"FX risk budget exhausted "
             f"({budget_snapshot['reserved_fx_risk']:.2f}/{budget_snapshot['max_total_risk_amount']:.2f}{reserve_suffix})"
+        )
+        spread_snapshot = _entry_spread_audit_snapshot(
+            label,
+            instrument,
+            direction,
+            label=label,
+            expected_spread_pips=opp.get("spread_pips"),
+            prefer_live_quote=True,
+            context="pre_block",
+            reason="risk_budget_exhausted",
+        )
+        _record_missed_opportunity(
+            label,
+            instrument,
+            direction,
+            reason,
+            opp=opp,
+            session_name=session_name,
+            risk_amount=risk_amount,
+            spread_snapshot=spread_snapshot,
+        )
+        log.info(
+            f"[{label}] Skip {instrument} {direction} — {reason}"
         )
         return None
 
     # Tier 2 §13 — portfolio-vol cap (correlation-aware).
     nav_for_cap = float(acct.get("NAV", balance) or balance or 0.0)
-    vol_block = _tier2_portfolio_vol_breach(instrument, direction, risk_amount, nav_for_cap)
+    portfolio_decision = _tier2_portfolio_vol_decision(instrument, direction, risk_amount, nav_for_cap)
+    vol_block = None
+    if portfolio_decision is not None and not portfolio_decision.allowed:
+        vol_block = (
+            f"portfolio_vol {portfolio_decision.portfolio_vol_after:.3%}"
+            f" > cap {portfolio_decision.cap:.3%}"
+        )
     if vol_block is not None:
         event_confirmed = bool(
             event_signal
@@ -5278,12 +5670,54 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         if event_confirmed:
             fitted_risk, fit_reason = _tier2_cap_fit_risk_amount(instrument, direction, risk_amount, nav_for_cap)
             if fitted_risk <= 0:
+                spread_snapshot = _entry_spread_audit_snapshot(
+                    label,
+                    instrument,
+                    direction,
+                    label=label,
+                    expected_spread_pips=opp.get("spread_pips"),
+                    prefer_live_quote=True,
+                    context="pre_block",
+                    reason="portfolio_vol",
+                )
+                _record_missed_opportunity(
+                    label,
+                    instrument,
+                    direction,
+                    fit_reason or vol_block,
+                    opp=opp,
+                    session_name=session_name,
+                    risk_amount=risk_amount,
+                    portfolio_decision=portfolio_decision,
+                    spread_snapshot=spread_snapshot,
+                )
                 log.info(f"[{label}] Skip {instrument} {direction} — {fit_reason or vol_block}")
                 return None
             if fit_reason:
                 log.info(f"[{label}] {instrument} {direction} — {fit_reason}")
             risk_amount = fitted_risk
         else:
+            spread_snapshot = _entry_spread_audit_snapshot(
+                label,
+                instrument,
+                direction,
+                label=label,
+                expected_spread_pips=opp.get("spread_pips"),
+                prefer_live_quote=True,
+                context="pre_block",
+                reason="portfolio_vol",
+            )
+            _record_missed_opportunity(
+                label,
+                instrument,
+                direction,
+                vol_block,
+                opp=opp,
+                session_name=session_name,
+                risk_amount=risk_amount,
+                portfolio_decision=portfolio_decision,
+                spread_snapshot=spread_snapshot,
+            )
             log.info(f"[{label}] Skip {instrument} {direction} — {vol_block}")
             return None
 
@@ -6028,6 +6462,7 @@ def run():
             probe_pair_health()
             sync_open_trades_with_oanda_if_due(reason="runtime")
             process_pending_close_retries()
+            _refresh_missed_opportunity_marks()
 
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             today_pnl = sum(t.get("pnl", 0) for t in trade_history
@@ -6258,6 +6693,8 @@ def run():
                             record_scan_decision("PULLBACK", best_pb["instrument"], reason, "🚫")
                     else:
                         record_scan_decision("PULLBACK", reject_pair or "watchlist", reject_reason or empty_reason, "🔍")
+
+                _save_missed_opportunities_if_dirty()
 
             if len(trade_history) % 10 == 0 and len(trade_history) > 0:
                 update_adaptive_thresholds()
