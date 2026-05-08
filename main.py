@@ -1444,7 +1444,6 @@ def build_dynamic_watchlist(top_n: int = MAX_WATCHLIST_SIZE, max_spread_pips: fl
                     else:
                         spread_rejections.append({"pair": inst, "bid": bid, "ask": ask, "pip_size": ps, "spread_pips": spread, "reason": "pair_health_blocked"})
                 else:
-                    mark_pair_failure(inst, f"spread {spread:.1f} > {effective_spread_cap:.1f}", "spread")
                     spread_rejections.append({"pair": inst, "bid": bid, "ask": ask, "pip_size": ps, "spread_pips": spread, "reason": "spread_too_wide"})
 
         # Aggregate WARN so the observability pipeline can alert when the gate
