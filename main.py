@@ -310,6 +310,28 @@ EXIT_FLAT_HOURS        = float(os.getenv("EXIT_FLAT_HOURS",        "48"))
 EXIT_REVIEW_DAYS       = int(os.getenv("EXIT_REVIEW_DAYS",         "7"))
 EXIT_REVIEW_POOR_THRESHOLD = float(os.getenv("EXIT_REVIEW_POOR_THRESHOLD", "-0.10"))
 
+# Pip-based peak trail (FX-tuned). When MFE_pips >= EXIT_PEAK_TRAIL_ARM_PIPS,
+# close once current pnl_pips drops to MFE_pips * (1 - EXIT_PEAK_TRAIL_GIVEBACK_PCT).
+# Default 0 = disabled (legacy %-based trail only).
+EXIT_PEAK_TRAIL_GIVEBACK_PCT = float(os.getenv("EXIT_PEAK_TRAIL_GIVEBACK_PCT", "0.40"))
+EXIT_PEAK_TRAIL_ARM_PIPS     = float(os.getenv("EXIT_PEAK_TRAIL_ARM_PIPS",     "5"))
+
+# Break-even bump: when pnl_pips >= sl_pips * EXIT_BE_TRIGGER_FRAC, move
+# dynamic SL up to entry + (spread * EXIT_BE_BUFFER_SPREAD_MULT) pips.
+# Default 0 = disabled.
+EXIT_BE_TRIGGER_FRAC         = float(os.getenv("EXIT_BE_TRIGGER_FRAC",         "0.50"))
+EXIT_BE_BUFFER_SPREAD_MULT   = float(os.getenv("EXIT_BE_BUFFER_SPREAD_MULT",   "1.5"))
+
+# Stalled-entry bailout: if held > BAILOUT_NO_PROGRESS_MINS and MFE_pips never
+# exceeded BAILOUT_MIN_MFE_PIPS, exit at market (cuts Pattern-A losers early).
+# Default 0 = disabled.
+BAILOUT_NO_PROGRESS_MINS     = float(os.getenv("BAILOUT_NO_PROGRESS_MINS",     "25"))
+BAILOUT_MIN_MFE_PIPS         = float(os.getenv("BAILOUT_MIN_MFE_PIPS",         "2"))
+
+# Post-loss re-entry cooldown per instrument. After a losing close on X,
+# block new entries on X for this many minutes. 0 = disabled.
+REENTRY_COOLDOWN_MINS        = float(os.getenv("REENTRY_COOLDOWN_MINS",        "120"))
+
 # ── Reversal strategy ───────────────────────────────────────
 REVERSAL_MAX_TRADES   = int(os.getenv("REVERSAL_MAX_TRADES",   "2"))
 REVERSAL_BUDGET_PCT   = float(os.getenv("REVERSAL_BUDGET_PCT", "0.25"))
@@ -5493,6 +5515,26 @@ def get_strategy_entry_block_reason(strategy: str, instrument: str, direction: s
     block_reason = get_entry_block_reason(instrument, direction)
     if block_reason is not None:
         return block_reason
+    # Post-loss re-entry cooldown (per-instrument, time-based; auto-expires).
+    if REENTRY_COOLDOWN_MINS > 0 and trade_history:
+        cutoff = time.time() - REENTRY_COOLDOWN_MINS * 60.0
+        for h in reversed(trade_history[-20:]):
+            if h.get("instrument") != instrument:
+                continue
+            if float(h.get("pnl", 0.0) or 0.0) >= 0:
+                continue
+            closed_at = h.get("closed_at")
+            try:
+                if isinstance(closed_at, str):
+                    closed_ts = datetime.fromisoformat(closed_at.replace("Z", "+00:00")).timestamp()
+                else:
+                    closed_ts = float(closed_at or 0)
+            except Exception:
+                closed_ts = 0.0
+            if closed_ts >= cutoff:
+                mins_left = (closed_ts - cutoff) / 60.0
+                return f"reentry cooldown {mins_left:.0f}m after recent loss"
+            break
     if session_name is None:
         session_name = get_current_session()["name"]
     calibration = get_trade_calibration_adjustment(strategy, instrument, session_name)
@@ -5958,6 +6000,16 @@ def check_exit(trade: dict) -> tuple[bool, str]:
 
     trade["unrealized_pnl"] = round(pnl_pips, 1)
 
+    # ── Track MFE/MAE in pips (for FX-tuned trail & bailout) ───
+    mfe_pips = float(trade.get("mfe_pips", 0.0))
+    mae_pips = float(trade.get("mae_pips", 0.0))
+    if pnl_pips > mfe_pips:
+        mfe_pips = pnl_pips
+        trade["mfe_pips"] = round(mfe_pips, 2)
+    if pnl_pips < mae_pips:
+        mae_pips = pnl_pips
+        trade["mae_pips"] = round(mae_pips, 2)
+
     # ── Dynamic breakeven: entry + spread cost ────────────────
     spread_cost_pct = float(trade.get("spread_pips", 0)) * ps / entry
     breakeven_pct = spread_cost_pct
@@ -5971,16 +6023,49 @@ def check_exit(trade: dict) -> tuple[bool, str]:
             trade["dynamic_sl_pct"] = -0.01  # fallback -1%
     dynamic_sl_pct = trade["dynamic_sl_pct"]
 
+    # ── Break-even bump: once trade is up sl_pips * EXIT_BE_TRIGGER_FRAC,
+    #     raise dynamic SL to entry + buffer to neutralise give-back losses.
+    if EXIT_BE_TRIGGER_FRAC > 0 and not trade.get("_be_bumped"):
+        sl_pips_val = float(trade.get("sl_pips") or 0)
+        if sl_pips_val > 0 and pnl_pips >= sl_pips_val * EXIT_BE_TRIGGER_FRAC:
+            spread_pips_val = float(trade.get("spread_pips", 0) or 0)
+            buffer_pips = spread_pips_val * EXIT_BE_BUFFER_SPREAD_MULT
+            # New SL = entry + buffer (in pct of entry), in the favourable direction.
+            new_sl_pct = (buffer_pips * ps) / entry if entry > 0 else 0.0
+            # dynamic_sl_pct is negative; bumping it toward 0 (or positive) tightens.
+            if new_sl_pct > dynamic_sl_pct:
+                trade["dynamic_sl_pct"] = new_sl_pct
+                dynamic_sl_pct = new_sl_pct
+                trade["_be_bumped"] = True
+                log.info(f"🔒 [{label}] BE bump: {instrument} | pnl={pnl_pips:+.1f}p | "
+                         f"SL → entry+{buffer_pips:.1f}p")
+
     # ── Peak P&L % ────────────────────────────────────────────
     if direction == "LONG":
         peak_pnl_pct = (trade.get("highest_price", entry) - entry) / entry
     else:
         peak_pnl_pct = (entry - trade.get("lowest_price", entry)) / entry
 
+    # 0. Stalled-entry bailout (Pattern-A protection): trade has been open
+    #    long enough but never made meaningful progress in our direction.
+    if BAILOUT_NO_PROGRESS_MINS > 0 and (held_seconds / 60.0) >= BAILOUT_NO_PROGRESS_MINS:
+        if mfe_pips < BAILOUT_MIN_MFE_PIPS and pnl_pips < 0:
+            log.info(f"🪂 [{label}] No-progress bailout: {instrument} | "
+                     f"MFE={mfe_pips:+.1f}p after {held_seconds/60:.0f}m | now {pnl_pips:+.1f}p")
+            return True, "NO_PROGRESS_BAILOUT"
+
     # 1. Dynamic SL
     if pnl_pct <= dynamic_sl_pct:
         log.info(f"🛑 [{label}] SL hit: {instrument} | {pnl_pips:+.1f}p | {pnl_pct*100:+.1f}% (SL={dynamic_sl_pct*100:.2f}%)")
         return True, "STOP_LOSS"
+
+    # 2a. Pip-based peak trail (FX-tuned). Locks in a configurable % of MFE.
+    if EXIT_PEAK_TRAIL_GIVEBACK_PCT > 0 and mfe_pips >= EXIT_PEAK_TRAIL_ARM_PIPS:
+        floor_pips = mfe_pips * (1.0 - EXIT_PEAK_TRAIL_GIVEBACK_PCT)
+        if pnl_pips <= floor_pips:
+            log.info(f"📉 [{label}] Pip trail: {instrument} | {pnl_pips:+.1f}p | "
+                     f"MFE={mfe_pips:+.1f}p → floor={floor_pips:+.1f}p")
+            return True, "PEAK_TRAIL_PIPS"
 
     # 2. Above breakeven → trail from peak (1.5% drop from peak)
     if peak_pnl_pct > breakeven_pct and pnl_pct > breakeven_pct:
