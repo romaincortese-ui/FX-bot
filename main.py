@@ -755,6 +755,43 @@ def telegram_enabled() -> bool:
     return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
 
+def _profit_factor_from_pnls(pnls: list[float]) -> float:
+    gross_profit = sum(value for value in pnls if value > 0)
+    gross_loss = -sum(value for value in pnls if value < 0)
+    if gross_loss > 0:
+        return gross_profit / gross_loss
+    return 999.0 if gross_profit > 0 else 0.0
+
+
+def _runtime_account_metrics(balance_hint: float | None = None) -> dict[str, object]:
+    try:
+        account = get_account_summary()
+    except Exception:
+        account = {}
+    with _open_trades_lock:
+        open_snapshot = list(open_trades)
+    realized_pnls = [float(trade.get("pnl", 0.0) or 0.0) for trade in trade_history]
+    reserved_risk = sum(_estimate_fx_trade_reserved_risk(trade) for trade in open_snapshot if isinstance(trade, dict))
+    balance_value = account.get("NAV", account.get("balance", balance_hint))
+    available = account.get("marginAvailable", balance_value)
+    margin_used = account.get("marginUsed", reserved_risk)
+    unrealized = account.get("unrealizedPL")
+    return {
+        "account_balance": balance_value,
+        "account_nav": account.get("NAV", balance_value),
+        "available_balance": available,
+        "allocated_balance": margin_used,
+        "margin_used": margin_used,
+        "unrealized_pl": unrealized,
+        "account_unrealized_pl": unrealized,
+        "pnl_amount": (sum(realized_pnls) + float(unrealized or 0.0)),
+        "total_trades": len(trade_history) + len(open_snapshot),
+        "profit_factor": _profit_factor_from_pnls(realized_pnls),
+        "currency": account.get("currency", "GBP"),
+        "open_positions": open_snapshot,
+    }
+
+
 def publish_bot_runtime_status(state: str, balance: float | None = None, error: str | None = None, force: bool = False) -> bool:
     global last_runtime_status_at
     if REDIS_CLIENT is None:
@@ -789,6 +826,7 @@ def publish_bot_runtime_status(state: str, balance: float | None = None, error: 
         market_regime_mult=round(float(_market_regime_mult), 4),
         missed_opportunities=_missed_opportunity_status_summary(),
         error=error,
+        **_runtime_account_metrics(balance),
     )
     published = publish_runtime_status(REDIS_CLIENT, REDIS_BOT_STATUS_KEY, payload, BOT_STATUS_TTL)
     if published:
