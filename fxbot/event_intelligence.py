@@ -19,9 +19,8 @@ DEFAULT_RSS_FEEDS: tuple[dict[str, str], ...] = (
     {"name": "ECB", "url": "https://www.ecb.europa.eu/rss/press.html", "tier": "official"},
     {"name": "Bank of England", "url": "https://www.bankofengland.co.uk/rss/news", "tier": "official"},
     {"name": "Bank of Canada", "url": "https://www.bankofcanada.ca/content_type/press/feed/", "tier": "official"},
-    {"name": "Reserve Bank of Australia", "url": "https://www.rba.gov.au/rss/rss-cb.xml", "tier": "official"},
-    {"name": "Reserve Bank of New Zealand", "url": "https://www.rbnz.govt.nz/rss", "tier": "official"},
-    {"name": "Swiss National Bank", "url": "https://www.snb.ch/public/publication/en/rss/news", "tier": "official"},
+    {"name": "Reserve Bank of Australia", "url": "https://www.rba.gov.au/rss/rss-cb-media-releases.xml", "tier": "official"},
+    {"name": "Reserve Bank of Australia Speeches", "url": "https://www.rba.gov.au/rss/rss-cb-speeches.xml", "tier": "official"},
     {"name": "InvestingLive", "url": "https://investinglive.com/feed/", "tier": "market"},
 )
 
