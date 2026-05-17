@@ -1276,6 +1276,28 @@ def _next_close_retry_delay(attempts: int) -> int:
     return min(CLOSE_RETRY_BASE_SECS * max(1, 2 ** max(0, attempts - 1)), CLOSE_RETRY_MAX_SECS)
 
 
+def _pending_close_retry_for_trade(trade_id: str | int | None) -> dict | None:
+    if trade_id is None:
+        return None
+    pending = _pending_close_retries.get(str(trade_id))
+    return pending if isinstance(pending, dict) else None
+
+
+def _close_retry_is_due(pending: dict, now: float | None = None) -> bool:
+    return (time.time() if now is None else now) >= float(pending.get("next_retry_at", 0.0) or 0.0)
+
+
+def _should_defer_close_for_pending_retry(trade: dict, reason: str, now: float | None = None) -> bool:
+    if str(reason or "").upper() == "FORCED_CLOSE_RETRY":
+        return False
+    pending = _pending_close_retry_for_trade(trade.get("id"))
+    if not pending:
+        return False
+    if pending.get("broker_unreachable"):
+        return True
+    return not _close_retry_is_due(pending, now)
+
+
 def schedule_close_retry(trade: dict, error_reason: str) -> None:
     rec = _ensure_pair_health(trade["instrument"])
     attempts = int(_pending_close_retries.get(str(trade["id"]), {}).get("attempts", 0)) + 1
@@ -1362,13 +1384,17 @@ def process_pending_close_retries() -> None:
         if now < float(pending.get("next_retry_at", 0.0)):
             continue
         log.info(f"🔁 Retrying forced close for {trade['instrument']} ({trade_id})")
+        attempts_before = int(pending.get("attempts", 0) or 0)
         if close_trade_exit(trade, "FORCED_CLOSE_RETRY"):
             with _open_trades_lock:
                 if trade in open_trades:
                     open_trades.remove(trade)
             clear_close_retry(trade_id)
         else:
-            schedule_close_retry(trade, get_pair_health_reason(trade["instrument"]) or pending.get("reason", "close retry failed"))
+            current_pending = _pending_close_retry_for_trade(trade_id) or {}
+            attempts_after = int(current_pending.get("attempts", 0) or 0)
+            if attempts_after <= attempts_before and not current_pending.get("broker_unreachable"):
+                schedule_close_retry(trade, get_pair_health_reason(trade["instrument"]) or pending.get("reason", "close retry failed"))
 
 
 def probe_pair_health() -> None:
@@ -6168,6 +6194,26 @@ def close_trade_exit(trade: dict, reason: str):
     instrument = trade["instrument"]
     label = trade["label"]
     direction = trade["direction"]
+
+    if _should_defer_close_for_pending_retry(trade, reason):
+        pending = _pending_close_retry_for_trade(trade.get("id")) or {}
+        now = time.time()
+        last_log_at = float(pending.get("last_defer_log_at", 0.0) or 0.0)
+        if now - last_log_at >= 300:
+            next_retry_at = float(pending.get("next_retry_at", 0.0) or 0.0)
+            retry_text = datetime.fromtimestamp(next_retry_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if next_retry_at > 0 else "unscheduled"
+            if pending.get("broker_unreachable"):
+                log.warning(
+                    f"[{label}] Close deferred for {instrument} trade {trade.get('id')} — "
+                    "broker_unreachable pending manual reconcile."
+                )
+            else:
+                log.info(
+                    f"[{label}] Close deferred for {instrument} trade {trade.get('id')} — "
+                    f"pending retry at {retry_text}."
+                )
+            pending["last_defer_log_at"] = now
+        return False
 
     price_data = get_current_price(instrument)
     exit_price = price_data["bid"] if direction == "LONG" else price_data["ask"]

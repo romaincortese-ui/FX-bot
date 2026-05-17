@@ -10,6 +10,7 @@ dropping the trade.
 from __future__ import annotations
 
 import importlib
+import time
 
 import pytest
 
@@ -81,6 +82,97 @@ def test_market_halted_close_schedules_retry(main, monkeypatch):
     assert scheduled, "MARKET_HALTED must schedule a close-retry"
     assert scheduled[0][0] is trade
     assert "MARKET_HALTED" in scheduled[0][1]
+
+
+def test_pending_close_retry_defers_routine_exit_until_due(main, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        main,
+        "close_trade_result",
+        lambda trade_id, label, instrument=None: calls.append(str(trade_id)) or (False, "MARKET_HALTED"),
+    )
+
+    trade = {
+        "id": "42",
+        "instrument": "EUR_USD",
+        "label": "RESTORED",
+        "direction": "LONG",
+        "entry_price": 1.0,
+        "units": 1,
+        "opened_ts": 0,
+    }
+    main._pending_close_retries["42"] = {
+        "trade_id": "42",
+        "attempts": 1,
+        "next_retry_at": time.time() + 3600,
+        "broker_unreachable": False,
+    }
+
+    result = main.close_trade_exit(trade, "NO_PROGRESS_BAILOUT")
+
+    assert result is False
+    assert calls == []
+    assert main._pending_close_retries["42"]["attempts"] == 1
+
+
+def test_broker_unreachable_close_retry_defers_routine_exit(main, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        main,
+        "close_trade_result",
+        lambda trade_id, label, instrument=None: calls.append(str(trade_id)) or (False, "MARKET_HALTED"),
+    )
+
+    trade = {
+        "id": "99",
+        "instrument": "EUR_USD",
+        "label": "RESTORED",
+        "direction": "LONG",
+        "entry_price": 1.0,
+        "units": 1,
+        "opened_ts": 0,
+    }
+    main._pending_close_retries["99"] = {
+        "trade_id": "99",
+        "attempts": 10,
+        "next_retry_at": time.time() - 1,
+        "broker_unreachable": True,
+    }
+
+    result = main.close_trade_exit(trade, "NO_PROGRESS_BAILOUT")
+
+    assert result is False
+    assert calls == []
+
+
+def test_due_pending_retry_failure_schedules_once(main, monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "close_trade_result",
+        lambda trade_id, label, instrument=None: (False, "MARKET_HALTED"),
+    )
+    monkeypatch.setattr(main, "get_current_price", lambda inst: {"bid": 1.0, "ask": 1.0})
+
+    trade = {
+        "id": "123",
+        "instrument": "EUR_USD",
+        "label": "RESTORED",
+        "direction": "LONG",
+        "entry_price": 1.0,
+        "units": 1,
+        "opened_ts": 0,
+    }
+    monkeypatch.setattr(main, "open_trades", [trade], raising=False)
+    main._pending_close_retries["123"] = {
+        "trade_id": "123",
+        "attempts": 1,
+        "next_retry_at": time.time() - 1,
+        "broker_unreachable": False,
+    }
+
+    main.process_pending_close_retries()
+
+    assert main._pending_close_retries["123"]["attempts"] == 2
 
 
 def test_reconciled_close_does_not_schedule_retry(main, monkeypatch):
