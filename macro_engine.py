@@ -397,11 +397,14 @@ def load_forex_factory_news() -> List[dict]:
         return []
 
     events: List[dict] = []
-    # Allow a configurable lookback window (in days) for news events
+    # Allow configurable lookback/lookahead windows. The lookahead matters near
+    # UTC midnight: Tokyo can be approaching while the next UTC date's calendar
+    # events are otherwise still filtered out.
     news_lookback_days = int(os.getenv("NEWS_LOOKBACK_DAYS", "1"))
+    news_lookahead_days = int(os.getenv("NEWS_LOOKAHEAD_DAYS", "1"))
     now_utc = datetime.now(timezone.utc)
     min_date = (now_utc - timedelta(days=news_lookback_days)).date()
-    max_date = now_utc.date()
+    max_date = (now_utc + timedelta(days=max(0, news_lookahead_days))).date()
     if root.tag.lower() == "weeklyevents":
         items = root.findall('.//event')
         item_kind = "event"
