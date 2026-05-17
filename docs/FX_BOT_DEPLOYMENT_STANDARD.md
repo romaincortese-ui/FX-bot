@@ -78,6 +78,8 @@ Variables that **should** match (shared budget coordination):
 | Flag | Default | When to enable |
 |---|---|---|
 | `MAX_RISK_AMOUNT_PER_TRADE` | `0` (disabled) | Set to a £-cap (e.g. `3.0` on a £200 sleeve) to enforce an absolute-£ ceiling regardless of `MAX_RISK_PER_TRADE * balance`. Required for small-account safety. |
+| `MIN_TRADE_MARGIN_ACCOUNT` | `1.00` live / `0` practice | Reject entries whose estimated margin is too small to produce meaningful P&L (for example a £0.08 margin trade). |
+| `TRADE_LANE_ALLOWLIST` / `TRADE_LANE_BLOCKLIST` | empty | Optional `STRATEGY:INSTRUMENT:DIRECTION` controls for deploying only backtest-validated lanes, e.g. `SCALPER:AUD_USD:SHORT,SCALPER:EUR_USD:LONG`. |
 | `MIN_LIVE_BALANCE` | `10000` | **Lower** to match your sleeve size (e.g. `75`) — otherwise the capital-floor circuit-breaker forces paper mode silently. |
 | `EXIT_RETRY_ALERT_AFTER` | `3` | Telegram escalation after N consecutive close failures on a single trade. Lower for tighter monitoring; raise for noisier brokers. |
 | `EXIT_RETRY_GIVE_UP_AFTER` | `10` | Trade marked `broker_unreachable`; retry loop halts. Operator must restart or clear pending-close state to resume. |

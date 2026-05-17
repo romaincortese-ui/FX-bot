@@ -76,6 +76,7 @@ from fxbot.flow_strategies import (
     instrument_is_flow_eligible,
 )
 from fxbot.kill_switch import evaluate_drawdown_kill
+from fxbot.lane_filter import parse_trade_lanes, trade_lane_block_reason
 from fxbot.percentile_sizing import size_by_percentile
 from fxbot.regime import Regime, is_strategy_enabled as regime_is_strategy_enabled
 from fxbot.regime_dwell import RegimeDwellFilter
@@ -209,6 +210,9 @@ DXY_REGIME_THRESHOLD = float(os.getenv("DXY_REGIME_THRESHOLD", "0.008"))
 # ── Spread betting min stake ──────────────────────────────────
 SPREAD_BET_MIN_STAKE = float(os.getenv("SPREAD_BET_MIN_STAKE", "0.10"))
 
+_DEFAULT_MIN_TRADE_MARGIN = "1.00" if OANDA_ENVIRONMENT == "live" else "0"
+MIN_TRADE_MARGIN_ACCOUNT = float(os.getenv("MIN_TRADE_MARGIN_ACCOUNT", _DEFAULT_MIN_TRADE_MARGIN))
+
 # ── Account allocation ────────────────────────────────────────
 # Each bot now runs against its own dedicated OANDA sub-account (FX-bot and
 # Gold-bot are no longer co-sharing one account), so the FX-bot uses 100% of
@@ -327,6 +331,9 @@ EXIT_BE_BUFFER_SPREAD_MULT   = float(os.getenv("EXIT_BE_BUFFER_SPREAD_MULT",   "
 # Default 0 = disabled.
 BAILOUT_NO_PROGRESS_MINS     = float(os.getenv("BAILOUT_NO_PROGRESS_MINS",     "25"))
 BAILOUT_MIN_MFE_PIPS         = float(os.getenv("BAILOUT_MIN_MFE_PIPS",         "2"))
+
+TRADE_LANE_ALLOWLIST = parse_trade_lanes(os.getenv("TRADE_LANE_ALLOWLIST", ""))
+TRADE_LANE_BLOCKLIST = parse_trade_lanes(os.getenv("TRADE_LANE_BLOCKLIST", ""))
 
 # Post-loss re-entry cooldown per instrument. After a losing close on X,
 # block new entries on X for this many minutes. 0 = disabled.
@@ -5550,6 +5557,9 @@ def get_entry_block_reason(instrument: str, direction: str) -> str | None:
 
 
 def get_strategy_entry_block_reason(strategy: str, instrument: str, direction: str, opp: dict | None = None, session_name: str | None = None) -> str | None:
+    lane_reason = trade_lane_block_reason(strategy, instrument, direction, TRADE_LANE_ALLOWLIST, TRADE_LANE_BLOCKLIST)
+    if lane_reason is not None:
+        return lane_reason
     block_reason = get_entry_block_reason(instrument, direction)
     if block_reason is not None:
         return block_reason
@@ -5866,6 +5876,16 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         margin_available = float(acct.get("marginAvailable", 0) or 0)
         sleeve_margin_cap = budget_snapshot["fx_sleeve_balance"]
         effective_margin_available = min(margin_available, sleeve_margin_cap) if margin_available > 0 else sleeve_margin_cap
+        if (
+            margin_required is not None
+            and MIN_TRADE_MARGIN_ACCOUNT > 0
+            and margin_required < MIN_TRADE_MARGIN_ACCOUNT
+        ):
+            log.info(
+                f"[{label}] Skip {instrument} {direction} — estimated margin "
+                f"{margin_required:.2f} < MIN_TRADE_MARGIN_ACCOUNT {MIN_TRADE_MARGIN_ACCOUNT:.2f} {account_currency}"
+            )
+            return None
         if margin_required is not None and effective_margin_available > 0 and margin_required > effective_margin_available:
             log.info(
                 f"[{label}] Skip {instrument} {direction} — insufficient margin "

@@ -10,6 +10,7 @@ import pandas as pd
 import requests
 
 from fxbot.indicators import calc_atr, calc_ema
+from fxbot.lane_filter import parse_trade_lanes, trade_lane_block_reason
 from fxbot.risk import would_breach_correlation_limit
 from fxbot.strategies import StrategyScoringContext
 from fxbot.strategies import determine_direction
@@ -71,6 +72,8 @@ class BacktestEngine:
             ("POST_NEWS", score_post_news),
             ("PULLBACK", score_pullback),
         ]
+        self._lane_allowlist = parse_trade_lanes(str(self.settings.get("TRADE_LANE_ALLOWLIST", "") or ""))
+        self._lane_blocklist = parse_trade_lanes(str(self.settings.get("TRADE_LANE_BLOCKLIST", "") or ""))
         self._spread_profiles: dict[str, dict[str, float]] = {}
         self._last_trade_close: dict[tuple[str, str], datetime] = {}  # (strategy, instrument) -> last close time
 
@@ -542,10 +545,14 @@ class BacktestEngine:
                 {i: self._bar_at(i, self.config.granularity, current) for i in self.config.instruments},
                 sl_pct=float(self.settings.get("EXIT_SL_PCT", -0.40)),
                 peak_trail_pct=float(self.settings.get("EXIT_PEAK_TRAIL_PCT", 0.015)),
+                peak_trail_giveback_pct=float(self.settings.get("EXIT_PEAK_TRAIL_GIVEBACK_PCT", 0.40)),
+                peak_trail_arm_pips=float(self.settings.get("EXIT_PEAK_TRAIL_ARM_PIPS", 5.0)),
                 flat_hours=float(self.settings.get("EXIT_FLAT_HOURS", 48.0)),
                 review_days=int(self.settings.get("EXIT_REVIEW_DAYS", 7)),
                 review_poor_threshold=float(self.settings.get("EXIT_REVIEW_POOR_THRESHOLD", -0.10)),
                 review_trend_bars=int(self.settings.get("EXIT_REVIEW_TREND_BARS", 50)),
+                bailout_no_progress_mins=float(self.settings.get("BAILOUT_NO_PROGRESS_MINS", 25.0)),
+                bailout_min_mfe_pips=float(self.settings.get("BAILOUT_MIN_MFE_PIPS", 2.0)),
                 candle_fetch=lambda i, g, c, now=current: self._fetch_candles_until(i, g, c, now),
             )
             for ct in closed_trades:
@@ -616,6 +623,10 @@ class BacktestEngine:
                     )
                     opp = scorer(instrument, session, ctx, self.settings)
                     if opp is None:
+                        continue
+                    lane_reason = trade_lane_block_reason(label, opp["instrument"], opp["direction"], self._lane_allowlist, self._lane_blocklist)
+                    if lane_reason is not None:
+                        self.overlay_block_counts[lane_reason] += 1
                         continue
                     # Tier 1 §9 — net-of-cost R:R gate.
                     rr_ok, _ = self._net_rr_passes(opp, spread_pips)

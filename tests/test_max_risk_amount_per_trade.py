@@ -77,3 +77,32 @@ def test_max_risk_amount_per_trade_disabled_when_zero(monkeypatch):
         200.0,
     )
     assert trade is not None, "with cap disabled, oversized trade is not blocked by this gate"
+
+
+def test_min_trade_margin_rejects_tiny_native_units_trade(monkeypatch):
+    main = importlib.import_module("main")
+    _patch_common(monkeypatch, main)
+    monkeypatch.setattr(main, "uses_oanda_native_units", lambda: True)
+    monkeypatch.setattr(main, "MIN_TRADE_MARGIN_ACCOUNT", 1.0)
+    monkeypatch.setattr(main, "MAX_RISK_AMOUNT_PER_TRADE", 0.0)
+    monkeypatch.setattr(main, "calculate_units_for_risk_amount", lambda *a, **k: 2)
+    monkeypatch.setattr(
+        main,
+        "estimate_trade_budget",
+        lambda *args, **kwargs: {
+            "base_currency": "EUR",
+            "quote_currency": "USD",
+            "base_units": 2.0,
+            "quote_notional": 2.4,
+            "notional_account": 2.4,
+            "margin_account": 0.08,
+        },
+    )
+
+    trade = main.open_trade_entry(
+        {"instrument": "EUR_USD", "direction": "LONG", "score": 60, "sl_pips": 15.0, "tp_pips": 30.0},
+        "TREND",
+        200.0,
+    )
+
+    assert trade is None, "trade should be rejected because estimated margin is below the configured floor"

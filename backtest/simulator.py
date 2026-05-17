@@ -195,9 +195,13 @@ class TradeSimulator:
 
     def update_open_trades(self, current_time: datetime, bar_lookup: dict[str, dict[str, Any]],
                            sl_pct: float = -0.40, peak_trail_pct: float = 0.015,
+                           peak_trail_giveback_pct: float = 0.40,
+                           peak_trail_arm_pips: float = 5.0,
                            flat_hours: float = 48.0, review_days: int = 7,
                            review_poor_threshold: float = -0.10,
                            review_trend_bars: int = 50,
+                           bailout_no_progress_mins: float = 25.0,
+                           bailout_min_mfe_pips: float = 2.0,
                            candle_fetch: Any = None) -> list[dict[str, Any]]:
         """Unified exit logic for all strategies.
 
@@ -228,8 +232,16 @@ class TradeSimulator:
             # Mark price for this bar
             if trade["direction"] == "LONG":
                 mark = bid_close if has_bid_ask else close
+                high_mark = float(bar.get("bid_high", 0) or 0) if has_bid_ask else high
+                low_mark = float(bar.get("bid_low", 0) or 0) if has_bid_ask else low
             else:
                 mark = ask_close if has_bid_ask else close
+                high_mark = float(bar.get("ask_high", 0) or 0) if has_bid_ask else high
+                low_mark = float(bar.get("ask_low", 0) or 0) if has_bid_ask else low
+            if high_mark <= 0:
+                high_mark = high
+            if low_mark <= 0:
+                low_mark = low
 
             trade["highest_price"] = max(float(trade.get("highest_price", trade["entry_price"])), high)
             trade["lowest_price"] = min(float(trade.get("lowest_price", trade["entry_price"])), low)
@@ -241,8 +253,10 @@ class TradeSimulator:
             # ── P&L % relative to entry ───────────────────────────
             if trade["direction"] == "LONG":
                 pnl_pct = (mark - entry) / entry
+                pnl_pips = price_to_pips(trade["instrument"], mark - entry)
             else:
                 pnl_pct = (entry - mark) / entry
+                pnl_pips = price_to_pips(trade["instrument"], entry - mark)
 
             # ── Dynamic breakeven: entry + spread cost ────────────
             spread_cost_pct = float(trade.get("spread_pips", 0)) * pip_size(trade["instrument"]) / entry
@@ -257,8 +271,39 @@ class TradeSimulator:
             exit_reason = None
             raw_exit_price = mark
 
+            sl_price = float(trade.get("sl_price", 0) or 0)
+            tp_price = float(trade.get("tp_price", 0) or 0)
+            if trade["direction"] == "LONG":
+                if sl_price > 0 and low_mark <= sl_price:
+                    exit_reason = "STOP_LOSS"
+                    raw_exit_price = sl_price
+                elif tp_price > 0 and high_mark >= tp_price:
+                    exit_reason = "TAKE_PROFIT"
+                    raw_exit_price = tp_price
+            else:
+                if sl_price > 0 and high_mark >= sl_price:
+                    exit_reason = "STOP_LOSS"
+                    raw_exit_price = sl_price
+                elif tp_price > 0 and low_mark <= tp_price:
+                    exit_reason = "TAKE_PROFIT"
+                    raw_exit_price = tp_price
+
+            if trade["direction"] == "LONG":
+                mfe_pips = max(0.0, price_to_pips(trade["instrument"], float(trade["highest_price"]) - entry))
+            else:
+                mfe_pips = max(0.0, price_to_pips(trade["instrument"], entry - float(trade["lowest_price"])))
+
+            if exit_reason is None and bailout_no_progress_mins > 0 and held_seconds / 60.0 >= bailout_no_progress_mins:
+                if mfe_pips < bailout_min_mfe_pips and pnl_pips < 0:
+                    exit_reason = "NO_PROGRESS_BAILOUT"
+
+            if exit_reason is None and peak_trail_giveback_pct > 0 and mfe_pips >= peak_trail_arm_pips:
+                floor_pips = mfe_pips * (1.0 - peak_trail_giveback_pct)
+                if pnl_pips <= floor_pips:
+                    exit_reason = "PEAK_TRAIL_PIPS"
+
             # 1. Hard SL at -40%
-            if pnl_pct <= sl_pct:
+            if exit_reason is None and pnl_pct <= sl_pct:
                 exit_reason = "STOP_LOSS"
 
             # 2. Above breakeven → trail from peak

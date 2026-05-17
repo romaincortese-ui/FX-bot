@@ -15,12 +15,14 @@ from typing import Any, Iterable, Mapping, Sequence
 
 DEFAULT_RSS_FEEDS: tuple[dict[str, str], ...] = (
     {"name": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml", "tier": "official"},
-    {"name": "Bank of Japan", "url": "https://www.boj.or.jp/rss/whatsnew.xml", "tier": "official"},
+    {"name": "Bank of Japan", "url": "https://www.boj.or.jp/en/rss/whatsnew.xml", "tier": "official"},
     {"name": "ECB", "url": "https://www.ecb.europa.eu/rss/press.html", "tier": "official"},
     {"name": "Bank of England", "url": "https://www.bankofengland.co.uk/rss/news", "tier": "official"},
-    {"name": "FXStreet", "url": "https://www.fxstreet.com/rss/news", "tier": "market"},
-    {"name": "ForexLive", "url": "https://www.forexlive.com/feed/", "tier": "market"},
-    {"name": "DailyFX", "url": "https://www.dailyfx.com/feeds/all", "tier": "market"},
+    {"name": "Bank of Canada", "url": "https://www.bankofcanada.ca/content_type/press/feed/", "tier": "official"},
+    {"name": "Reserve Bank of Australia", "url": "https://www.rba.gov.au/rss/rss-cb.xml", "tier": "official"},
+    {"name": "Reserve Bank of New Zealand", "url": "https://www.rbnz.govt.nz/rss", "tier": "official"},
+    {"name": "Swiss National Bank", "url": "https://www.snb.ch/public/publication/en/rss/news", "tier": "official"},
+    {"name": "InvestingLive", "url": "https://investinglive.com/feed/", "tier": "market"},
 )
 
 SOURCE_QUALITY = {
@@ -41,15 +43,31 @@ CURRENCY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "NZD": ("nzd", "kiwi", "rbnz", "reserve bank of new zealand", "dairy"),
 }
 
+SOURCE_CURRENCY_HINTS: tuple[tuple[str, str], ...] = (
+    ("federal reserve", "USD"),
+    ("bank of japan", "JPY"),
+    ("ecb", "EUR"),
+    ("european central bank", "EUR"),
+    ("bank of england", "GBP"),
+    ("bank of canada", "CAD"),
+    ("reserve bank of australia", "AUD"),
+    ("reserve bank of new zealand", "NZD"),
+    ("swiss national bank", "CHF"),
+)
+
 SEVERITY_KEYWORDS: tuple[tuple[str, float], ...] = (
     ("intervention", 1.00),
     ("emergency", 1.00),
     ("unscheduled", 0.95),
     ("rate decision", 0.92),
+    ("bank rate", 0.92),
+    ("interest rate", 0.90),
     ("policy decision", 0.90),
     ("monetary policy", 0.88),
     ("press conference", 0.85),
     ("statement", 0.75),
+    ("minutes", 0.70),
+    ("speech", 0.66),
     ("inflation", 0.72),
     ("cpi", 0.72),
     ("pce", 0.72),
@@ -161,6 +179,14 @@ def parse_feed_items(
     return items
 
 
+def _source_currency_hint(item: FeedItem) -> str | None:
+    source_text = normalize_text(f"{item.source} {item.url}")
+    for hint, currency in SOURCE_CURRENCY_HINTS:
+        if hint in source_text:
+            return currency
+    return None
+
+
 def parse_feed_config(raw_value: str | None) -> list[dict[str, str]]:
     if not raw_value or not raw_value.strip():
         return [dict(item) for item in DEFAULT_RSS_FEEDS]
@@ -192,7 +218,6 @@ def parse_feed_config(raw_value: str | None) -> list[dict[str, str]]:
 
 def classify_item(item: FeedItem) -> dict[str, Any]:
     text = normalize_text(item.text)
-    currencies = [ccy for ccy, keywords in CURRENCY_KEYWORDS.items() if any(keyword in text for keyword in keywords)]
     severity = 0.0
     matched_terms = []
     for term, weight in SEVERITY_KEYWORDS:
@@ -201,6 +226,11 @@ def classify_item(item: FeedItem) -> dict[str, Any]:
             matched_terms.append(term)
     if any(keyword in text for keyword in ("boj", "fomc", "ecb", "boe", "snb", "boc", "rba", "rbnz")):
         severity = max(severity, 0.82)
+
+    currencies = [ccy for ccy, keywords in CURRENCY_KEYWORDS.items() if any(keyword in text for keyword in keywords)]
+    hinted_currency = _source_currency_hint(item)
+    if hinted_currency and severity >= 0.60 and hinted_currency not in currencies:
+        currencies.append(hinted_currency)
 
     strength_hits = sum(1 for term in STRENGTH_TERMS if term in text)
     weakness_hits = sum(1 for term in WEAKNESS_TERMS if term in text)

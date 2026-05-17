@@ -201,10 +201,16 @@ class BacktestConfig:
             "KELLY_MULT_MARGINAL": env_float("KELLY_MULT_MARGINAL", 1.0),
             # ── Unified exit settings (all strategies) ──
             "EXIT_PEAK_TRAIL_PCT": env_float("EXIT_PEAK_TRAIL_PCT", 0.015),
+            "EXIT_PEAK_TRAIL_GIVEBACK_PCT": env_float("EXIT_PEAK_TRAIL_GIVEBACK_PCT", 0.40),
+            "EXIT_PEAK_TRAIL_ARM_PIPS": env_float("EXIT_PEAK_TRAIL_ARM_PIPS", 5.0),
             "EXIT_FLAT_HOURS": env_float("EXIT_FLAT_HOURS", 48.0),
             "EXIT_REVIEW_DAYS": env_int("EXIT_REVIEW_DAYS", 7),
             "EXIT_REVIEW_POOR_THRESHOLD": env_float("EXIT_REVIEW_POOR_THRESHOLD", -0.10),
             "EXIT_REVIEW_TREND_BARS": env_int("EXIT_REVIEW_TREND_BARS", 50),
+            "BAILOUT_NO_PROGRESS_MINS": env_float("BAILOUT_NO_PROGRESS_MINS", 25.0),
+            "BAILOUT_MIN_MFE_PIPS": env_float("BAILOUT_MIN_MFE_PIPS", 2.0),
+            "TRADE_LANE_ALLOWLIST": env_str("TRADE_LANE_ALLOWLIST", ""),
+            "TRADE_LANE_BLOCKLIST": env_str("TRADE_LANE_BLOCKLIST", ""),
             # ── Dynamic leverage ──
             "LEVERAGE_MIN": env_float("LEVERAGE_MIN", 10.0),
             "LEVERAGE_MAX": env_float("LEVERAGE_MAX", 30.0),

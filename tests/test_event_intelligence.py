@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from fxbot.event_intelligence import FeedItem, build_event_intelligence_state, event_signal_for_instrument
+from fxbot.event_intelligence import FeedItem, classify_item, build_event_intelligence_state, event_signal_for_instrument
 
 
 def _event_state(now: datetime | None = None) -> dict:
@@ -186,3 +186,19 @@ def test_event_worker_publishes_redis_state(monkeypatch) -> None:
     state = json.loads(client.store[worker.EVENT_INTEL_STATE_KEY])
     assert "JPY" in state["currencies"]
     assert state["item_count"] == 1
+
+
+def test_official_source_currency_hint_classifies_policy_release() -> None:
+    item = FeedItem(
+        title="Bank Rate maintained at 3.75% - Monetary Policy Summary and minutes",
+        summary="The Monetary Policy Committee voted to maintain Bank Rate.",
+        url="https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes/example",
+        published_at=datetime.now(timezone.utc),
+        source="Bank of England",
+        source_tier="official",
+    )
+
+    classified = classify_item(item)
+
+    assert "GBP" in classified["currencies"]
+    assert classified["keyword_severity"] >= 0.9
