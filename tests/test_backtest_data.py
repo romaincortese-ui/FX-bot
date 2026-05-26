@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
 import requests
 
 from backtest.data import HistoricalDataProvider
@@ -84,3 +85,27 @@ def test_get_candles_retries_transient_oanda_errors(tmp_path, monkeypatch):
     provider.get_candles("GBP_USD", "H4", start, end, price="MBA")
 
     assert len(provider.session.calls) == 2
+
+
+def test_get_candles_uses_nearby_cache_for_prefetch_buffer(tmp_path):
+    provider = HistoricalDataProvider(cache_dir=str(tmp_path))
+    start = datetime(2026, 4, 7, tzinfo=timezone.utc)
+    requested_end = datetime(2026, 5, 19, tzinfo=timezone.utc)
+    cached_end = datetime(2026, 5, 17, 12, tzinfo=timezone.utc)
+    frame = pd.DataFrame(
+        {
+            "open": [1.0, 1.1, 1.2],
+            "high": [1.1, 1.2, 1.3],
+            "low": [0.9, 1.0, 1.1],
+            "close": [1.05, 1.15, 1.25],
+            "volume": [10, 11, 12],
+        },
+        index=pd.to_datetime([start, start + timedelta(days=20), cached_end], utc=True),
+    )
+    provider._write_cache(provider._cache_base("EUR_USD", "M5", start, cached_end), frame)
+
+    candles = provider.get_candles("EUR_USD", "M5", start, requested_end)
+
+    assert candles is not None
+    assert len(candles) == 3
+    assert candles.index.max().to_pydatetime() == cached_end

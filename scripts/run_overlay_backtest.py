@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backtest.config import BacktestConfig  # noqa: E402
+from backtest.config import DEFAULT_BACKTEST_INSTRUMENTS, BacktestConfig  # noqa: E402
 from backtest.data import HistoricalDataProvider  # noqa: E402
 from backtest.engine import BacktestEngine  # noqa: E402
 from backtest.macro_sim import MacroReplay, generate_daily_macro_snapshots  # noqa: E402
@@ -90,7 +90,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Overlay-aware 120-day backtest")
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
-    parser.add_argument("--instruments", default="EUR_USD,GBP_USD,USD_JPY")
+    parser.add_argument("--instruments", default=DEFAULT_BACKTEST_INSTRUMENTS)
     parser.add_argument("--output", default="backtest_output_tier2v2_120d")
     parser.add_argument("--granularity", default="M5")
     parser.add_argument("--skip-macro", action="store_true",
@@ -157,11 +157,11 @@ def main() -> int:
         "leverage": config.leverage,
         "overlay_flags": {
             "TIER1_NET_RR": os.getenv("BACKTEST_TIER1_NET_RR_ENABLED", "true"),
-            "TIER1_NET_RR_MIN": os.getenv("BACKTEST_TIER1_NET_RR_MIN", "1.8"),
-            "TIER2_REGIME_VETO": os.getenv("BACKTEST_TIER2_REGIME_VETO_ENABLED", "true"),
+            "TIER1_NET_RR_MIN": os.getenv("BACKTEST_TIER1_NET_RR_MIN", "1.2"),
+            "TIER2_REGIME_VETO": os.getenv("BACKTEST_TIER2_REGIME_VETO_ENABLED", "false"),
             "TIER2_KILL_SWITCH": os.getenv("BACKTEST_TIER2_KILL_SWITCH_ENABLED", "true"),
             "TIER2_PORTFOLIO_CAP": os.getenv("BACKTEST_TIER2_PORTFOLIO_CAP_ENABLED", "true"),
-            "TIER2_PORTFOLIO_CAP_PCT": os.getenv("BACKTEST_TIER2_PORTFOLIO_CAP_PCT", "0.08"),
+            "TIER2_PORTFOLIO_CAP_PCT": os.getenv("BACKTEST_TIER2_PORTFOLIO_CAP_PCT", "0.20"),
             "TIER2_PERCENTILE_SIZING": os.getenv("BACKTEST_TIER2_PERCENTILE_SIZING_ENABLED", "true"),
             "TIER3_NEWS_IMPACT": os.getenv("BACKTEST_TIER3_NEWS_IMPACT_ENABLED", "true"),
             "TIER3_FLOW": os.getenv("BACKTEST_TIER3_FLOW_ENABLED", "true"),

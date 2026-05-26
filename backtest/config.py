@@ -7,6 +7,10 @@ from typing import Any
 from fxbot.config import env_float, env_int, env_str
 
 
+DEFAULT_BACKTEST_INSTRUMENTS = "AUD_USD,EUR_GBP,EUR_USD,GBP_USD,NZD_USD,USD_CAD,USD_CHF,USD_JPY"
+DEFAULT_VALIDATED_SCALPER_LANES = "SCALPER:AUD_USD:SHORT,SCALPER:EUR_USD:LONG,SCALPER:USD_CHF:LONG"
+
+
 def _parse_utc_datetime(value: str) -> datetime:
     text = value.strip()
     if not text:
@@ -62,21 +66,14 @@ class BacktestConfig:
     macro_news_file: str = ""
     dxy_history_file: str = ""
     vix_history_file: str = ""
-    strategies: list[str] = field(default_factory=lambda: [
-        "SCALPER",
-        "TREND",
-        "REVERSAL",
-        "CARRY",
-        "POST_NEWS",
-        "PULLBACK",
-    ])
+    strategies: list[str] = field(default_factory=lambda: ["SCALPER"])
 
     @classmethod
     def from_env(cls) -> "BacktestConfig":
         start = _parse_utc_datetime(env_str("BACKTEST_START", "2023-01-01T00:00:00+00:00"))
         end = _parse_utc_datetime(env_str("BACKTEST_END", "2023-03-01T00:00:00+00:00"))
-        instruments = _parse_csv(env_str("BACKTEST_INSTRUMENTS", "EUR_USD,GBP_USD,USD_JPY"))
-        strategies = _parse_csv(env_str("BACKTEST_STRATEGIES", "SCALPER,TREND,REVERSAL,CARRY,POST_NEWS,PULLBACK"))
+        instruments = _parse_csv(env_str("BACKTEST_INSTRUMENTS", DEFAULT_BACKTEST_INSTRUMENTS))
+        strategies = _parse_csv(env_str("BACKTEST_STRATEGIES", "SCALPER"))
         return cls(
             start=start,
             end=end,
@@ -113,7 +110,7 @@ class BacktestConfig:
             "SCALPER_MAX_RSI": env_int("SCALPER_MAX_RSI", 70),
             "SCALPER_MIN_RSI": env_int("SCALPER_MIN_RSI", 30),
             "SCALPER_CONFLUENCE_BONUS": env_float("SCALPER_CONFLUENCE_BONUS", 15.0),
-            "SCALPER_THRESHOLD": env_int("SCALPER_THRESHOLD", 50),
+            "SCALPER_THRESHOLD": env_int("SCALPER_THRESHOLD", 70),
             "SCALPER_TP_MIN_PIPS": env_float("SCALPER_TP_MIN_PIPS", 8.0),
             "SCALPER_TP_MAX_PIPS": env_float("SCALPER_TP_MAX_PIPS", 25.0),
             "SCALPER_SL_MIN_PIPS": env_float("SCALPER_SL_MIN_PIPS", 6.0),
@@ -209,7 +206,7 @@ class BacktestConfig:
             "EXIT_REVIEW_TREND_BARS": env_int("EXIT_REVIEW_TREND_BARS", 50),
             "BAILOUT_NO_PROGRESS_MINS": env_float("BAILOUT_NO_PROGRESS_MINS", 25.0),
             "BAILOUT_MIN_MFE_PIPS": env_float("BAILOUT_MIN_MFE_PIPS", 2.0),
-            "TRADE_LANE_ALLOWLIST": env_str("TRADE_LANE_ALLOWLIST", ""),
+            "TRADE_LANE_ALLOWLIST": env_str("TRADE_LANE_ALLOWLIST", DEFAULT_VALIDATED_SCALPER_LANES),
             "TRADE_LANE_BLOCKLIST": env_str("TRADE_LANE_BLOCKLIST", ""),
             # ── Dynamic leverage ──
             "LEVERAGE_MIN": env_float("LEVERAGE_MIN", 10.0),

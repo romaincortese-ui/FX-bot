@@ -94,6 +94,7 @@ def test_net_rr_gate_passes_when_disabled():
 
 def test_regime_veto_blocks_reversal_in_usd_trend_regime():
     engine = _make_engine()
+    engine._tier2_regime_veto_enabled = True
     engine._current_regime = Regime.USD_TREND
     # Live-path mapping: REVERSAL disabled in a persistent USD trend.
     assert engine._regime_blocks("REVERSAL") is True

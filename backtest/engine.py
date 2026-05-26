@@ -81,11 +81,11 @@ class BacktestEngine:
         # Feature flags — default ON so the backtest mirrors the live path.
         # Set BACKTEST_TIER*_*_ENABLED=0 to isolate any single overlay.
         self._tier1_net_rr_enabled = _flag("BACKTEST_TIER1_NET_RR_ENABLED", "true")
-        self._tier1_net_rr_min = float(os.getenv("BACKTEST_TIER1_NET_RR_MIN", "1.8"))
-        self._tier2_regime_veto_enabled = _flag("BACKTEST_TIER2_REGIME_VETO_ENABLED", "true")
+        self._tier1_net_rr_min = float(os.getenv("BACKTEST_TIER1_NET_RR_MIN", "1.2"))
+        self._tier2_regime_veto_enabled = _flag("BACKTEST_TIER2_REGIME_VETO_ENABLED", "false")
         self._tier2_kill_switch_enabled = _flag("BACKTEST_TIER2_KILL_SWITCH_ENABLED", "true")
         self._tier2_portfolio_cap_enabled = _flag("BACKTEST_TIER2_PORTFOLIO_CAP_ENABLED", "true")
-        self._tier2_portfolio_cap_pct = float(os.getenv("BACKTEST_TIER2_PORTFOLIO_CAP_PCT", "0.08"))
+        self._tier2_portfolio_cap_pct = float(os.getenv("BACKTEST_TIER2_PORTFOLIO_CAP_PCT", "0.20"))
         self._tier2_percentile_sizing_enabled = _flag("BACKTEST_TIER2_PERCENTILE_SIZING_ENABLED", "true")
         self._tier3_news_impact_enabled = _flag("BACKTEST_TIER3_NEWS_IMPACT_ENABLED", "true")
         self._tier3_flow_enabled = _flag("BACKTEST_TIER3_FLOW_ENABLED", "true")

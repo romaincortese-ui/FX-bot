@@ -175,6 +175,7 @@ _spread_sampler: SpreadSampler = _get_default_spread_sampler()
 STATIC_CORE_PAIRS = _parse_pair_env("CORE_PAIRS", "EUR_USD,GBP_USD,USD_JPY")
 STATIC_EXTENDED_PAIRS = _parse_pair_env("EXTENDED_PAIRS", "AUD_USD,USD_CAD,EUR_GBP,USD_CHF,NZD_USD")
 STATIC_ALL_PAIRS = STATIC_CORE_PAIRS + STATIC_EXTENDED_PAIRS
+DEFAULT_VALIDATED_SCALPER_LANES = "SCALPER:AUD_USD:SHORT,SCALPER:EUR_USD:LONG,SCALPER:USD_CHF:LONG"
 
 # ── Dynamic watchlist settings ────────────────────────────────
 DYNAMIC_PAIRS = []                 # will be filled at runtime
@@ -278,7 +279,7 @@ SESSION_OFF_HOURS_MULT = float(os.getenv("SESSION_OFF_HOURS_MULT", "1.30"))
 # ── Scalper strategy ────────────────────────────────────────
 SCALPER_MAX_TRADES    = int(os.getenv("SCALPER_MAX_TRADES",    "3"))
 SCALPER_BUDGET_PCT    = float(os.getenv("SCALPER_BUDGET_PCT",  "0.35"))
-SCALPER_THRESHOLD     = int(os.getenv("SCALPER_THRESHOLD",     "40"))
+SCALPER_THRESHOLD     = int(os.getenv("SCALPER_THRESHOLD",     "70"))
 SCALPER_TP_ATR_MULT   = float(os.getenv("SCALPER_TP_ATR_MULT", "2.0"))
 SCALPER_SL_ATR_MULT   = float(os.getenv("SCALPER_SL_ATR_MULT", "1.3"))
 SCALPER_TP_MIN_PIPS   = float(os.getenv("SCALPER_TP_MIN_PIPS", "15"))
@@ -332,7 +333,7 @@ EXIT_BE_BUFFER_SPREAD_MULT   = float(os.getenv("EXIT_BE_BUFFER_SPREAD_MULT",   "
 BAILOUT_NO_PROGRESS_MINS     = float(os.getenv("BAILOUT_NO_PROGRESS_MINS",     "25"))
 BAILOUT_MIN_MFE_PIPS         = float(os.getenv("BAILOUT_MIN_MFE_PIPS",         "2"))
 
-TRADE_LANE_ALLOWLIST = parse_trade_lanes(os.getenv("TRADE_LANE_ALLOWLIST", ""))
+TRADE_LANE_ALLOWLIST = parse_trade_lanes(os.getenv("TRADE_LANE_ALLOWLIST", DEFAULT_VALIDATED_SCALPER_LANES))
 TRADE_LANE_BLOCKLIST = parse_trade_lanes(os.getenv("TRADE_LANE_BLOCKLIST", ""))
 
 # Post-loss re-entry cooldown per instrument. After a losing close on X,
@@ -470,9 +471,9 @@ FORCED_WATCHLIST_REBUILD_MIN_INTERVAL_SECS = int(os.getenv("FORCED_WATCHLIST_REB
 
 # Tier 1 §7 item 9 — net-of-cost R:R floor. On spread-cost venues the reward
 # leg of the R:R must be net of round-trip spread, expected slippage, and
-# expected financing. Default floor 1.8 → for every 1.0 of SL risk we require
-# 1.8 of net reward. Set MIN_NET_RR=0 to disable the gate.
-MIN_NET_RR = float(os.getenv("MIN_NET_RR", "1.8"))
+# expected financing. Default floor 1.2 means every 1.0 of SL risk requires
+# 1.2 of net reward. Set MIN_NET_RR=0 to disable the gate.
+MIN_NET_RR = float(os.getenv("MIN_NET_RR", "1.2"))
 NET_RR_SLIPPAGE_PIPS = float(os.getenv("NET_RR_SLIPPAGE_PIPS", "0.3"))
 NET_RR_FINANCING_PIPS = float(os.getenv("NET_RR_FINANCING_PIPS", "0.0"))
 PAIR_HEALTH_FAILURE_COOLDOWN_SECS = int(os.getenv("PAIR_HEALTH_FAILURE_COOLDOWN_SECS", "60"))
@@ -482,7 +483,7 @@ TIER2_PERCENTILE_SIZING_ENABLED = os.getenv("TIER2_PERCENTILE_SIZING_ENABLED", "
 TIER2_PERCENTILE_LOOKBACK = int(os.getenv("TIER2_PERCENTILE_LOOKBACK", "60"))
 TIER2_PERCENTILE_FLOOR = float(os.getenv("TIER2_PERCENTILE_FLOOR", "0.5"))
 TIER2_PERCENTILE_CAP = float(os.getenv("TIER2_PERCENTILE_CAP", "2.0"))
-TIER2_PORTFOLIO_VOL_CAP_PCT = float(os.getenv("TIER2_PORTFOLIO_VOL_CAP_PCT", "0.03"))
+TIER2_PORTFOLIO_VOL_CAP_PCT = float(os.getenv("TIER2_PORTFOLIO_VOL_CAP_PCT", "0.20"))
 TIER2_PORTFOLIO_VOL_ENABLED = os.getenv("TIER2_PORTFOLIO_VOL_ENABLED", "1") not in ("0", "", "false", "False")
 TIER2_REGIME_GATE_ENABLED = os.getenv("TIER2_REGIME_GATE_ENABLED", "1") not in ("0", "", "false", "False")
 TIER2_STRATEGY_DEDUP_ENABLED = os.getenv("TIER2_STRATEGY_DEDUP_ENABLED", "1") not in ("0", "", "false", "False")

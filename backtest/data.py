@@ -84,6 +84,43 @@ class HistoricalDataProvider:
             return pd.read_pickle(pickle_path)
         return None
 
+    def _read_nearby_cache(self, instrument: str, granularity: str, start: datetime, end: datetime) -> pd.DataFrame | None:
+        best: pd.DataFrame | None = None
+        best_end: datetime | None = None
+        requested_span_seconds = max((end - start).total_seconds(), _granularity_step(granularity).total_seconds())
+        pattern = f"{instrument}_{granularity}_*.p*"
+        cache_bases: list[Path] = []
+        seen: set[Path] = set()
+        for path in sorted(self.cache_dir.glob(pattern), key=lambda item: item.name, reverse=True):
+            base = path.with_suffix("")
+            if base in seen:
+                continue
+            seen.add(base)
+            cache_bases.append(base)
+            if len(cache_bases) >= 8:
+                break
+        for base in cache_bases:
+            try:
+                cached = self._read_cache(base)
+            except Exception:
+                continue
+            if cached is None or cached.empty:
+                continue
+            cached_start = _to_utc(cached.index.min().to_pydatetime())
+            cached_end = _to_utc(cached.index.max().to_pydatetime())
+            covered_start = max(cached_start, start)
+            covered_end = min(cached_end, end)
+            coverage = max(0.0, (covered_end - covered_start).total_seconds()) / requested_span_seconds
+            if coverage < 0.75:
+                continue
+            if best_end is None or cached_end > best_end:
+                best = cached
+                best_end = cached_end
+        if best is None:
+            return None
+        sliced = best[(best.index >= start) & (best.index < end)]
+        return sliced if not sliced.empty else None
+
     def _write_cache(self, base: Path, df: pd.DataFrame) -> None:
         parquet_path = base.with_suffix(".parquet")
         try:
@@ -105,6 +142,9 @@ class HistoricalDataProvider:
         cached = self._read_cache(cache_base)
         if cached is not None:
             return cached
+        nearby_cached = self._read_nearby_cache(instrument, granularity, start, end)
+        if nearby_cached is not None:
+            return nearby_cached
         if not self.oanda_api_key:
             return None
 
