@@ -46,15 +46,27 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
     report = build_backtest_report(equity_curve, trades)
     calibration = build_trade_calibration(trades)
     export_backtest_artifacts(config.output_dir, equity_curve, trades, report)
-    publish_trade_calibration(
-        env_str("REDIS_URL", "").strip(),
-        env_str("REDIS_TRADE_CALIBRATION_KEY", "trade_calibration").strip(),
-        calibration,
-    )
+    calibration_passed, _ = validate_positive_pnl(report)
+    if calibration_passed:
+        publish_trade_calibration(
+            env_str("REDIS_URL", "").strip(),
+            env_str("REDIS_TRADE_CALIBRATION_KEY", "trade_calibration").strip(),
+            calibration,
+        )
     return report
 
 
-def main() -> None:
+def validate_positive_pnl(report: dict[str, Any]) -> tuple[bool, str]:
+    total_trades = int(report.get("total_trades", 0) or 0)
+    total_pnl = float(report.get("total_pnl", 0.0) or 0.0)
+    if total_trades <= 0:
+        return False, "no_trades"
+    if total_pnl <= 0:
+        return False, "non_positive_pnl"
+    return True, "positive_pnl"
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Run the integrated FX bot backtester")
     parser.add_argument("--start", help="UTC ISO start datetime")
     parser.add_argument("--end", help="UTC ISO end datetime")
@@ -74,7 +86,13 @@ def main() -> None:
 
     report = run_backtest(config)
     print(json.dumps(report, indent=2))
+    passed, reason = validate_positive_pnl(report)
+    if not passed:
+        print(f"validation=failed reason={reason} pnl={float(report.get('total_pnl', 0.0) or 0.0):.2f}")
+        return 1
+    print("validation=passed reason=positive_pnl")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

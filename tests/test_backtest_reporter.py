@@ -1,4 +1,5 @@
 from backtest.reporter import build_backtest_report, build_trade_calibration
+from backtest.run_backtest import validate_positive_pnl
 
 
 def test_build_backtest_report_calculates_core_metrics():
@@ -34,3 +35,24 @@ def test_build_trade_calibration_groups_by_strategy_pair_and_session():
     assert calibration["by_strategy"]["TREND"]["trades"] == 3
     assert calibration["by_strategy_pair"]["TREND"]["EUR_USD"]["trades"] == 2
     assert calibration["by_strategy_pair_session"]["TREND"]["EUR_USD"]["LONDON"]["expectancy_pips"] == 2.0
+
+
+def test_positive_pnl_validation_rejects_zero_trade_report():
+    passed, reason = validate_positive_pnl({"total_trades": 0, "total_pnl": 0.0})
+
+    assert passed is False
+    assert reason == "no_trades"
+
+
+def test_positive_pnl_validation_rejects_losing_report():
+    passed, reason = validate_positive_pnl({"total_trades": 4, "total_pnl": -10.0})
+
+    assert passed is False
+    assert reason == "non_positive_pnl"
+
+
+def test_positive_pnl_validation_accepts_positive_report():
+    passed, reason = validate_positive_pnl({"total_trades": 4, "total_pnl": 10.0})
+
+    assert passed is True
+    assert reason == "positive_pnl"

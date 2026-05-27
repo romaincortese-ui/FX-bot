@@ -8,6 +8,7 @@ import redis
 
 from backtest.config import BacktestConfig
 from backtest.run_backtest import run_backtest
+from backtest.run_backtest import validate_positive_pnl
 from fxbot.config import env_int
 from fxbot.runtime_status import build_runtime_status, publish_runtime_status
 
@@ -72,13 +73,16 @@ def main() -> None:
     end_offset_days = max(0, env_int("BACKTEST_ROLLING_END_OFFSET_DAYS", 0))
     config.start, config.end = build_rolling_window(datetime.now(timezone.utc), rolling_days, end_offset_days)
     report = run_backtest(config)
+    validation_passed, validation_reason = validate_positive_pnl(report)
+    calibration_state = "completed" if validation_passed else "failed"
     publish_calibration_runtime_state(
-        "completed",
+        calibration_state,
         rolling_days=rolling_days,
         end_offset_days=end_offset_days,
         start=config.start.isoformat(),
         end=config.end.isoformat(),
         total_trades=int(report.get("total_trades", 0) or 0),
+        validation_reason=validation_reason,
     )
     print(
         json.dumps(
@@ -88,10 +92,13 @@ def main() -> None:
                 "start": config.start.isoformat(),
                 "end": config.end.isoformat(),
                 "report": report,
+                "validation": {"passed": validation_passed, "reason": validation_reason},
             },
             indent=2,
         )
     )
+    if not validation_passed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
