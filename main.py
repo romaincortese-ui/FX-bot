@@ -226,10 +226,10 @@ GOLD_BUDGET_ALLOCATION = float(os.getenv("GOLD_BUDGET_ALLOCATION", "1.00"))
 # ── Capital allocation ───────────────────────────────────────
 # SCALPER raised 30% → 50%: backtests show it's the only profitable
 # strategy; it should own the majority of risk budget.
-# TREND reduced 40% → 25%: high-conviction trend trades should be
-# smaller until the strategy proves edge in live conditions.
+# TREND reduced 40% → 20%: 0.20 shifted to SCALPER (sum stays 1.0).
+# High-conviction trend trades remain smaller until strategy proves edge.
 SCALPER_ALLOCATION_PCT  = float(os.getenv("SCALPER_ALLOCATION_PCT",  "0.50"))
-TREND_ALLOCATION_PCT    = float(os.getenv("TREND_ALLOCATION_PCT",    "0.25"))
+TREND_ALLOCATION_PCT    = float(os.getenv("TREND_ALLOCATION_PCT",    "0.20"))
 REVERSAL_ALLOCATION_PCT = float(os.getenv("REVERSAL_ALLOCATION_PCT", "0.15"))
 BREAKOUT_ALLOCATION_PCT = float(os.getenv("BREAKOUT_ALLOCATION_PCT", "0.15"))
 
