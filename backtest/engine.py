@@ -685,6 +685,14 @@ class BacktestEngine:
                 best_opp["kelly_mult"] = effective_kelly
                 best_opp["overlay_scale"] = round(overlay_scale, 4)
                 best_opp["regime_at_entry"] = str(getattr(self._current_regime, "value", self._current_regime))
+                # Per-strategy flat-exit horizon: SCALPER uses a tight 4h
+                # ceiling; other strategies fall back to EXIT_FLAT_HOURS.
+                # Stored on the opportunity dict so the simulator can honour
+                # it per-trade without a global parameter change.
+                strategy_flat_key = f"{label}_FLAT_HOURS"
+                best_opp["max_flat_hours"] = float(
+                    self.settings.get(strategy_flat_key, self.settings.get("EXIT_FLAT_HOURS", 48.0))
+                )
                 news_active = self._is_pair_paused_by_news(macro_state, best_opp["instrument"], current)
                 self.simulator.open_trade(best_opp, label, current, float(bar["close"]), units, self._estimate_spread_pips(best_opp["instrument"], current), news_active, execution_bar=bar)
 

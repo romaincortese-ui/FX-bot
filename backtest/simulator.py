@@ -62,6 +62,8 @@ class TradeSimulator:
             "momentum_5d",
             "pullback_depth",
             "crossed_now",
+            # Per-strategy flat-exit horizon (set by the engine at entry time).
+            "max_flat_hours",
         )
         for key in diagnostic_keys:
             if key in opp:
@@ -313,8 +315,12 @@ class TradeSimulator:
                 if drawdown_from_peak >= peak_trail_pct:
                     exit_reason = "PEAK_TRAIL"
 
-            # 3. Flat exit: above breakeven AND held > flat_hours
-            if exit_reason is None and held_hours >= flat_hours:
+            # 3. Flat exit: above breakeven AND held > flat_hours.
+            # Per-trade max_flat_hours (set at entry time, e.g. 4h for
+            # SCALPER) takes precedence over the global flat_hours so
+            # short-duration strategies don't hold winners for 48h.
+            trade_flat_hours = float(trade.get("max_flat_hours", flat_hours))
+            if exit_reason is None and held_hours >= trade_flat_hours:
                 if pnl_pct >= breakeven_pct and pnl_pct < breakeven_pct + peak_trail_pct:
                     exit_reason = "FLAT_EXIT"
 

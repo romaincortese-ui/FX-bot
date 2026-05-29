@@ -224,8 +224,12 @@ FX_BUDGET_ALLOCATION = float(os.getenv("FX_BUDGET_ALLOCATION", "1.00"))
 GOLD_BUDGET_ALLOCATION = float(os.getenv("GOLD_BUDGET_ALLOCATION", "1.00"))
 
 # ── Capital allocation ───────────────────────────────────────
-SCALPER_ALLOCATION_PCT  = float(os.getenv("SCALPER_ALLOCATION_PCT",  "0.30"))
-TREND_ALLOCATION_PCT    = float(os.getenv("TREND_ALLOCATION_PCT",    "0.40"))
+# SCALPER raised 30% → 50%: backtests show it's the only profitable
+# strategy; it should own the majority of risk budget.
+# TREND reduced 40% → 25%: high-conviction trend trades should be
+# smaller until the strategy proves edge in live conditions.
+SCALPER_ALLOCATION_PCT  = float(os.getenv("SCALPER_ALLOCATION_PCT",  "0.50"))
+TREND_ALLOCATION_PCT    = float(os.getenv("TREND_ALLOCATION_PCT",    "0.25"))
 REVERSAL_ALLOCATION_PCT = float(os.getenv("REVERSAL_ALLOCATION_PCT", "0.15"))
 BREAKOUT_ALLOCATION_PCT = float(os.getenv("BREAKOUT_ALLOCATION_PCT", "0.15"))
 
@@ -268,7 +272,10 @@ ROLLOVER_END_UTC   = int(os.getenv("ROLLOVER_END_UTC",   "21"))
 # winter-time and changing this without operator review would silently shift
 # the regime classifier. Flip the flag to `1` after confirming the env-var
 # values represent the intended *local* hours.
-SESSION_DST_AWARE = os.getenv("SESSION_DST_AWARE", "0").lower() in ("1", "true", "yes", "on")
+# DST-aware session windows are now ON by default. This keeps the
+# London/NY overlap band aligned after clock-change weekends instead
+# of slipping by an hour for two weeks twice a year.
+SESSION_DST_AWARE = os.getenv("SESSION_DST_AWARE", "1").lower() in ("1", "true", "yes", "on")
 
 SESSION_OVERLAP_MULT   = float(os.getenv("SESSION_OVERLAP_MULT",   "0.85"))
 SESSION_LONDON_MULT    = float(os.getenv("SESSION_LONDON_MULT",    "0.90"))
@@ -317,9 +324,14 @@ EXIT_REVIEW_POOR_THRESHOLD = float(os.getenv("EXIT_REVIEW_POOR_THRESHOLD", "-0.1
 
 # Pip-based peak trail (FX-tuned). When MFE_pips >= EXIT_PEAK_TRAIL_ARM_PIPS,
 # close once current pnl_pips drops to MFE_pips * (1 - EXIT_PEAK_TRAIL_GIVEBACK_PCT).
-# Default 0 = disabled (legacy %-based trail only).
-EXIT_PEAK_TRAIL_GIVEBACK_PCT = float(os.getenv("EXIT_PEAK_TRAIL_GIVEBACK_PCT", "0.40"))
+# Reduced from 0.40 → 0.25: the 40% giveback let trades retrace too far
+# within a single 5-min bar, surrendering most of the MFE.
+EXIT_PEAK_TRAIL_GIVEBACK_PCT = float(os.getenv("EXIT_PEAK_TRAIL_GIVEBACK_PCT", "0.25"))
 EXIT_PEAK_TRAIL_ARM_PIPS     = float(os.getenv("EXIT_PEAK_TRAIL_ARM_PIPS",     "5"))
+# Per-strategy flat-exit horizon. SCALPER must not hold a winner for
+# 48h — 4h is the correct ceiling for an intraday scalper.
+SCALPER_FLAT_HOURS = float(os.getenv("SCALPER_FLAT_HOURS", "4"))
+TREND_FLAT_HOURS   = float(os.getenv("TREND_FLAT_HOURS",   "72"))
 
 # Break-even bump: when pnl_pips >= sl_pips * EXIT_BE_TRIGGER_FRAC, move
 # dynamic SL up to entry + (spread * EXIT_BE_BUFFER_SPREAD_MULT) pips.
@@ -366,7 +378,10 @@ BREAKOUT_TRAIL_PIPS   = float(os.getenv("BREAKOUT_TRAIL_PIPS", "10"))
 
 # ── Carry strategy ──────────────────────────────────────────
 CARRY_MAX_TRADES      = int(os.getenv("CARRY_MAX_TRADES",      "1"))
-CARRY_THRESHOLD       = int(os.getenv("CARRY_THRESHOLD",       "35"))
+# Raised from 35 → 55: carry is often blocked by VIX > 18 in current
+# conditions; when it does fire, only high-conviction setups are
+# worth holding for 120h.
+CARRY_THRESHOLD       = int(os.getenv("CARRY_THRESHOLD",       "55"))
 CARRY_TP_ATR_MULT     = float(os.getenv("CARRY_TP_ATR_MULT",   "2.5"))
 CARRY_SL_ATR_MULT     = float(os.getenv("CARRY_SL_ATR_MULT",   "1.5"))
 CARRY_MAX_HOURS       = int(os.getenv("CARRY_MAX_HOURS",       "120"))
@@ -396,7 +411,9 @@ POST_NEWS_WINDOW_MINS     = int(os.getenv("POST_NEWS_WINDOW_MINS",     "15"))
 
 # ── Pullback strategy ───────────────────────────────────────
 PULLBACK_MAX_TRADES      = int(os.getenv("PULLBACK_MAX_TRADES",      "2"))
-PULLBACK_THRESHOLD       = int(os.getenv("PULLBACK_THRESHOLD",       "37"))
+# Raised from 37 → 60: low-conviction pullback entries had poor
+# profit factor in backtest; higher bar retains only strong setups.
+PULLBACK_THRESHOLD       = int(os.getenv("PULLBACK_THRESHOLD",       "60"))
 PULLBACK_TP_ATR_MULT     = float(os.getenv("PULLBACK_TP_ATR_MULT",   "2.5"))
 PULLBACK_SL_ATR_MULT     = float(os.getenv("PULLBACK_SL_ATR_MULT",   "1.2"))
 PULLBACK_MAX_SPREAD_PIPS = float(os.getenv("PULLBACK_MAX_SPREAD_PIPS","2.5"))
@@ -6160,8 +6177,12 @@ def check_exit(trade: dict) -> tuple[bool, str]:
                      f"peak +{peak_pnl_pct*100:.1f}% → now +{pnl_pct*100:.1f}%")
             return True, "PEAK_TRAIL"
 
-    # 3. Flat exit: above breakeven AND held > 48h
-    if held_hours >= EXIT_FLAT_HOURS:
+    # 3. Flat exit: above breakeven AND held > per-strategy flat hours.
+    # SCALPER uses SCALPER_FLAT_HOURS (4h); TREND uses TREND_FLAT_HOURS
+    # (72h); all others fall back to EXIT_FLAT_HOURS (48h).
+    _flat_hours_map = {"SCALPER": SCALPER_FLAT_HOURS, "TREND": TREND_FLAT_HOURS}
+    _effective_flat_hours = _flat_hours_map.get(label, EXIT_FLAT_HOURS)
+    if held_hours >= _effective_flat_hours:
         if pnl_pct >= breakeven_pct and pnl_pct < breakeven_pct + EXIT_PEAK_TRAIL_PCT:
             log.info(f"😴 [{label}] Flat exit: {instrument} | {pnl_pips:+.1f}p after {held_hours:.0f}h")
             return True, "FLAT_EXIT"

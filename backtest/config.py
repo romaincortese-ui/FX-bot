@@ -150,7 +150,10 @@ class BacktestConfig:
             "BREAKOUT_MIN_SQUEEZE_BARS": env_int("BREAKOUT_MIN_SQUEEZE_BARS", 8),
             "CARRY_VIX_MAX": env_float("CARRY_VIX_MAX", 18.0),
             "CARRY_MAX_SPREAD_PIPS": env_float("CARRY_MAX_SPREAD_PIPS", 2.5),
-            "CARRY_THRESHOLD": env_int("CARRY_THRESHOLD", 35),
+            # Raised from 35 → 55: carry is structurally blocked by
+            # VIX > 18 in most 2025-26 conditions; when it does fire,
+            # only high-conviction setups are worth holding 120h.
+            "CARRY_THRESHOLD": env_int("CARRY_THRESHOLD", 55),
             "CARRY_TP_ATR_MULT": env_float("CARRY_TP_ATR_MULT", 2.5),
             "CARRY_SL_ATR_MULT": env_float("CARRY_SL_ATR_MULT", 1.5),
             "CARRY_TRAIL_PIPS": env_float("CARRY_TRAIL_PIPS", 15.0),
@@ -169,7 +172,10 @@ class BacktestConfig:
             "POST_NEWS_TRAIL_PIPS": env_float("POST_NEWS_TRAIL_PIPS", 8.0),
             "POST_NEWS_WINDOW_MINS": env_int("POST_NEWS_WINDOW_MINS", 15),
             "PULLBACK_MAX_SPREAD_PIPS": env_float("PULLBACK_MAX_SPREAD_PIPS", 2.5),
-            "PULLBACK_THRESHOLD": env_int("PULLBACK_THRESHOLD", 37),
+            # Raised from 37 → 60: low-conviction PULLBACK entries in
+            # backtests had a poor profit factor. Higher bar filters
+            # marginal signals while retaining the strongest setups.
+            "PULLBACK_THRESHOLD": env_int("PULLBACK_THRESHOLD", 60),
             "PULLBACK_MIN_4H_TREND_GAP": env_float("PULLBACK_MIN_4H_TREND_GAP", 0.0012),
             "PULLBACK_TP_ATR_MULT": env_float("PULLBACK_TP_ATR_MULT", 2.5),
             "PULLBACK_SL_ATR_MULT": env_float("PULLBACK_SL_ATR_MULT", 1.2),
@@ -198,9 +204,18 @@ class BacktestConfig:
             "KELLY_MULT_MARGINAL": env_float("KELLY_MULT_MARGINAL", 1.0),
             # ── Unified exit settings (all strategies) ──
             "EXIT_PEAK_TRAIL_PCT": env_float("EXIT_PEAK_TRAIL_PCT", 0.015),
-            "EXIT_PEAK_TRAIL_GIVEBACK_PCT": env_float("EXIT_PEAK_TRAIL_GIVEBACK_PCT", 0.40),
+            # Reduced from 0.40 → 0.25: capture more of peak P&L before
+            # trailing out. 40% giveback let trades retrace too far within
+            # a single 5-min bar losing most of the MFE.
+            "EXIT_PEAK_TRAIL_GIVEBACK_PCT": env_float("EXIT_PEAK_TRAIL_GIVEBACK_PCT", 0.25),
             "EXIT_PEAK_TRAIL_ARM_PIPS": env_float("EXIT_PEAK_TRAIL_ARM_PIPS", 5.0),
             "EXIT_FLAT_HOURS": env_float("EXIT_FLAT_HOURS", 48.0),
+            # Per-strategy flat-exit horizon. SCALPER should not hold a
+            # winner for 48h — 4h is the correct ceiling for an intraday
+            # scalper. Strategies absent from this map fall back to
+            # EXIT_FLAT_HOURS.
+            "SCALPER_FLAT_HOURS": env_float("SCALPER_FLAT_HOURS", 4.0),
+            "TREND_FLAT_HOURS": env_float("TREND_FLAT_HOURS", 72.0),
             "EXIT_REVIEW_DAYS": env_int("EXIT_REVIEW_DAYS", 7),
             "EXIT_REVIEW_POOR_THRESHOLD": env_float("EXIT_REVIEW_POOR_THRESHOLD", -0.10),
             "EXIT_REVIEW_TREND_BARS": env_int("EXIT_REVIEW_TREND_BARS", 50),

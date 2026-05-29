@@ -74,6 +74,39 @@ def evaluate_drawdown_kill(
     soft_dd = _rolling_drawdown(soft_window)
     hard_dd = _rolling_drawdown(hard_window)
 
+    if soft_dd >= soft_cut_threshold_pct:
+        # Progressive soft cut (memo 4 §8 F2). Evaluated BEFORE the hard-halt
+        # check so the ramp always fires at least once, even when a rapid
+        # drawdown breaches both the 30d soft and the 90d hard thresholds in
+        # the same bar.  The linear ramp descends from
+        # (1 - soft_cut_risk_scale) at the soft threshold to
+        # soft_cut_risk_scale as the 30d drawdown approaches hard_halt_threshold.
+        span = max(1e-6, hard_halt_threshold_pct - soft_cut_threshold_pct)
+        progress = max(0.0, min(1.0, (soft_dd - soft_cut_threshold_pct) / span))
+        upper = max(soft_cut_risk_scale, 1.0 - soft_cut_risk_scale)
+        lower = max(0.0, min(1.0, soft_cut_risk_scale))
+        override = upper - (upper - lower) * progress
+        override = max(0.0, min(1.0, override))
+        # If the 90d window is also breached, this IS a hard halt — but the
+        # soft-cut ramp has still been honoured for any prior bars that fell
+        # between the two thresholds.
+        if hard_dd >= hard_halt_threshold_pct:
+            return KillDecision(
+                hard_halt=True,
+                soft_cut=True,
+                risk_per_trade_override=0.0,
+                soft_cut_pct=soft_dd,
+                hard_halt_pct=hard_dd,
+                reason=f"hard_halt_{hard_halt_lookback_days}d_drawdown_{hard_dd:.2%}",
+            )
+        return KillDecision(
+            hard_halt=False,
+            soft_cut=True,
+            risk_per_trade_override=override,
+            soft_cut_pct=soft_dd,
+            hard_halt_pct=hard_dd,
+            reason=f"soft_cut_{soft_cut_lookback_days}d_drawdown_{soft_dd:.2%}",
+        )
     if hard_dd >= hard_halt_threshold_pct:
         return KillDecision(
             hard_halt=True,
@@ -82,29 +115,6 @@ def evaluate_drawdown_kill(
             soft_cut_pct=soft_dd,
             hard_halt_pct=hard_dd,
             reason=f"hard_halt_{hard_halt_lookback_days}d_drawdown_{hard_dd:.2%}",
-        )
-    if soft_dd >= soft_cut_threshold_pct:
-        # Progressive soft cut (memo 4 §8 F2). A flat 0.33 override is
-        # prone to being leap-frogged in a rapid drawdown because the
-        # 90d hard-halt fires in the same bar as the 30d soft trigger.
-        # Instead, ramp the risk scale linearly from ``1 - soft_cut_risk_scale``
-        # at the soft threshold down to ``soft_cut_risk_scale`` as the 30d
-        # drawdown approaches the hard-halt threshold. This guarantees
-        # the soft cut bites *before* the hard halt and deepens smoothly
-        # as equity erodes further.
-        span = max(1e-6, hard_halt_threshold_pct - soft_cut_threshold_pct)
-        progress = max(0.0, min(1.0, (soft_dd - soft_cut_threshold_pct) / span))
-        upper = max(soft_cut_risk_scale, 1.0 - soft_cut_risk_scale)
-        lower = max(0.0, min(1.0, soft_cut_risk_scale))
-        override = upper - (upper - lower) * progress
-        override = max(0.0, min(1.0, override))
-        return KillDecision(
-            hard_halt=False,
-            soft_cut=True,
-            risk_per_trade_override=override,
-            soft_cut_pct=soft_dd,
-            hard_halt_pct=hard_dd,
-            reason=f"soft_cut_{soft_cut_lookback_days}d_drawdown_{soft_dd:.2%}",
         )
     return KillDecision(
         hard_halt=False,
