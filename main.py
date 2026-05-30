@@ -108,6 +108,7 @@ from fxbot.strategies import score_pullback as core_score_pullback
 from fxbot.strategies import score_reversal as core_score_reversal
 from fxbot.strategies import score_scalper as core_score_scalper
 from fxbot.strategies import score_trend as core_score_trend
+from fxbot.prediction_overlay import apply_prediction_overlay, evaluate_prediction_overlay, load_prediction_state_payload, prediction_size_multiplier, select_point_in_time_prediction_state
 from fxbot.usdjpy_iv_feed import fetch_usdjpy_1w_iv
 
 
@@ -648,6 +649,46 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+FX_PREDICTION_OVERLAY_ENABLED = _env_bool("FX_PREDICTION_OVERLAY_ENABLED", False)
+FX_PREDICTION_STATE_FILE = os.getenv("FX_PREDICTION_STATE_FILE", "").strip()
+FX_PREDICTION_REFRESH_SECONDS = max(5, _env_int("FX_PREDICTION_REFRESH_SECONDS", 60))
+FX_PREDICTION_STALE_SECONDS = max(1, _env_int("FX_PREDICTION_STALE_SECONDS", 60))
+FX_PREDICTION_FALLBACK_MODE = os.getenv("FX_PREDICTION_FALLBACK_MODE", "neutral").strip().lower()
+FX_PREDICTION_MIN_FAVOURABLE_PROBABILITY = max(0.0, min(1.0, _env_float("FX_PREDICTION_MIN_FAVOURABLE_PROBABILITY", 0.50)))
+FX_PREDICTION_MIN_POSTERIOR = max(0.0, min(1.0, _env_float("FX_PREDICTION_MIN_POSTERIOR", 0.50)))
+FX_PREDICTION_EVENT_GIVEN_SUCCESS = max(0.0, min(1.0, _env_float("FX_PREDICTION_EVENT_GIVEN_SUCCESS", 0.60)))
+FX_PREDICTION_KELLY_BASE_FRACTION = max(0.001, _env_float("FX_PREDICTION_KELLY_BASE_FRACTION", 0.04))
+FX_PREDICTION_MAX_SIZE_MULTIPLIER = max(0.0, _env_float("FX_PREDICTION_MAX_SIZE_MULTIPLIER", 1.0))
+FX_PREDICTION_SCORE_SCALE = max(0.0, _env_float("FX_PREDICTION_SCORE_SCALE", 20.0))
+
 REDIS_CLIENT = None
 if REDIS_URL:
     try:
@@ -732,6 +773,9 @@ _scan_reject_reasons = {}
 _pair_health         = {}
 _last_scan_pool_status = {"mode": "primary", "active": 0, "healthy": 0, "tradable": 0}
 _pending_close_retries = {}
+_prediction_overlay_payload = None
+_prediction_overlay_loaded_at = 0.0
+_prediction_overlay_last_error_at = 0.0
 # Tier 2 runtime state.
 _strategy_score_history: dict[str, list[float]] = {}
 _strategy_posteriors: dict[str, "StrategyPosterior"] = {}
@@ -3617,6 +3661,72 @@ def _pop_scan_reject_reason(strategy: str, instrument: str) -> str | None:
     return _scan_reject_reasons.pop((strategy, instrument), None)
 
 
+def _prediction_overlay_state(now: datetime) -> dict | None:
+    global _prediction_overlay_payload, _prediction_overlay_loaded_at, _prediction_overlay_last_error_at
+    if not FX_PREDICTION_OVERLAY_ENABLED:
+        return None
+    now_ts = time.time()
+    if now_ts - _prediction_overlay_loaded_at >= FX_PREDICTION_REFRESH_SECONDS:
+        _prediction_overlay_loaded_at = now_ts
+        try:
+            _prediction_overlay_payload = load_prediction_state_payload(FX_PREDICTION_STATE_FILE)
+        except Exception as exc:
+            if now_ts - _prediction_overlay_last_error_at >= 900:
+                log.warning(f"Prediction overlay state load failed; using cached/neutral state: {exc}")
+                _prediction_overlay_last_error_at = now_ts
+    return select_point_in_time_prediction_state(_prediction_overlay_payload, now)
+
+
+def _apply_prediction_overlay_to_opportunity(strategy: str, opp: dict, now: datetime) -> tuple[dict | None, str | None]:
+    if not FX_PREDICTION_OVERLAY_ENABLED:
+        return opp, None
+    state = _prediction_overlay_state(now)
+    decision = evaluate_prediction_overlay(
+        opp,
+        state,
+        now,
+        enabled=True,
+        symbol=str(opp.get("instrument") or ""),
+        side=str(opp.get("direction") or ""),
+        stale_seconds=FX_PREDICTION_STALE_SECONDS,
+        fallback_mode=FX_PREDICTION_FALLBACK_MODE,
+        min_favourable_probability=FX_PREDICTION_MIN_FAVOURABLE_PROBABILITY,
+        min_posterior=FX_PREDICTION_MIN_POSTERIOR,
+        event_given_success=FX_PREDICTION_EVENT_GIVEN_SUCCESS,
+        kelly_base_fraction=FX_PREDICTION_KELLY_BASE_FRACTION,
+        max_size_multiplier=FX_PREDICTION_MAX_SIZE_MULTIPLIER,
+        score_scale=FX_PREDICTION_SCORE_SCALE,
+    )
+    if not decision.allowed:
+        log.info(
+            "[%s] Skip %s %s — prediction overlay %s p=%.2f posterior=%.2f",
+            strategy,
+            opp.get("instrument"),
+            opp.get("direction"),
+            decision.reason,
+            decision.favourable_probability,
+            decision.bayesian_success_probability,
+        )
+        return None, decision.reason
+    adjusted = apply_prediction_overlay(
+        opp,
+        state,
+        now,
+        enabled=True,
+        symbol=str(opp.get("instrument") or ""),
+        side=str(opp.get("direction") or ""),
+        stale_seconds=FX_PREDICTION_STALE_SECONDS,
+        fallback_mode=FX_PREDICTION_FALLBACK_MODE,
+        min_favourable_probability=FX_PREDICTION_MIN_FAVOURABLE_PROBABILITY,
+        min_posterior=FX_PREDICTION_MIN_POSTERIOR,
+        event_given_success=FX_PREDICTION_EVENT_GIVEN_SUCCESS,
+        kelly_base_fraction=FX_PREDICTION_KELLY_BASE_FRACTION,
+        max_size_multiplier=FX_PREDICTION_MAX_SIZE_MULTIPLIER,
+        score_scale=FX_PREDICTION_SCORE_SCALE,
+    )
+    return adjusted, None
+
+
 def _find_best_opportunity(strategy: str, pairs: list[str], session: dict, scorer) -> tuple[dict | None, str | None, str | None]:
     best = None
     reject_pair = None
@@ -3626,6 +3736,12 @@ def _find_best_opportunity(strategy: str, pairs: list[str], session: dict, score
     for pair in pairs:
         opp = scorer(pair, session)
         if opp:
+            opp, overlay_reason = _apply_prediction_overlay_to_opportunity(strategy, opp, datetime.now(timezone.utc))
+            if opp is None:
+                if blocked_reason is None:
+                    blocked_pair = pair
+                    blocked_reason = overlay_reason or "prediction_overlay_block"
+                continue
             block_reason = get_strategy_entry_block_reason(strategy, opp["instrument"], opp["direction"], opp=opp, session_name=session["name"])
             if block_reason is None:
                 current_score = float(opp.get("selection_score", opp.get("score", 0.0)) or 0.0)
@@ -5777,6 +5893,8 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
     # Tier 2 §22 — Bayesian posterior-weight scaling.
     bayesian_weight = _tier2_get_bayesian_weight(label)
     effective_kelly_mult *= percentile_mult * bayesian_weight
+    prediction_mult = prediction_size_multiplier(opp.get("metadata"))
+    effective_kelly_mult *= prediction_mult
 
     account_currency = acct.get("currency", get_account_currency())
     budget_snapshot = build_fx_budget_snapshot(balance)
@@ -5994,6 +6112,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         "percentile_value": percentile_value,
         "percentile_samples": percentile_samples,
         "bayesian_weight": bayesian_weight,
+        "prediction_size_multiplier": prediction_mult,
     }
 
     if label == "TREND" and opp.get("partial_tp_pips"):
