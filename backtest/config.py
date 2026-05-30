@@ -67,6 +67,16 @@ class BacktestConfig:
     dxy_history_file: str = ""
     vix_history_file: str = ""
     strategies: list[str] = field(default_factory=lambda: ["SCALPER"])
+    prediction_overlay_enabled: bool = False
+    prediction_overlay_state_file: str = ""
+    prediction_overlay_stale_seconds: int = 60
+    prediction_overlay_fallback_mode: str = "neutral"
+    prediction_overlay_min_favourable_probability: float = 0.50
+    prediction_overlay_min_posterior: float = 0.50
+    prediction_overlay_event_given_success: float = 0.60
+    prediction_overlay_kelly_base_fraction: float = 0.04
+    prediction_overlay_max_size_multiplier: float = 1.0
+    prediction_overlay_score_scale: float = 20.0
 
     @classmethod
     def from_env(cls) -> "BacktestConfig":
@@ -102,6 +112,16 @@ class BacktestConfig:
             dxy_history_file=env_str("BACKTEST_DXY_HISTORY_FILE", ""),
             vix_history_file=env_str("BACKTEST_VIX_HISTORY_FILE", ""),
             strategies=strategies,
+            prediction_overlay_enabled=env_str("FX_PREDICTION_OVERLAY_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
+            prediction_overlay_state_file=env_str("FX_BACKTEST_PREDICTION_STATE_FILE", env_str("FX_PREDICTION_STATE_FILE", "")),
+            prediction_overlay_stale_seconds=max(1, env_int("FX_PREDICTION_STALE_SECONDS", 60)),
+            prediction_overlay_fallback_mode=env_str("FX_PREDICTION_FALLBACK_MODE", "neutral").lower(),
+            prediction_overlay_min_favourable_probability=max(0.0, min(1.0, env_float("FX_PREDICTION_MIN_FAVOURABLE_PROBABILITY", 0.50))),
+            prediction_overlay_min_posterior=max(0.0, min(1.0, env_float("FX_PREDICTION_MIN_POSTERIOR", 0.50))),
+            prediction_overlay_event_given_success=max(0.0, min(1.0, env_float("FX_PREDICTION_EVENT_GIVEN_SUCCESS", 0.60))),
+            prediction_overlay_kelly_base_fraction=max(0.001, env_float("FX_PREDICTION_KELLY_BASE_FRACTION", 0.04)),
+            prediction_overlay_max_size_multiplier=max(0.0, env_float("FX_PREDICTION_MAX_SIZE_MULTIPLIER", 1.0)),
+            prediction_overlay_score_scale=max(0.0, env_float("FX_PREDICTION_SCORE_SCALE", 20.0)),
         )
 
     def strategy_settings(self) -> dict[str, Any]:

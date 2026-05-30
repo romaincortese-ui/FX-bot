@@ -26,6 +26,7 @@ from fxbot.flow_strategies import active_flow_window, instrument_is_flow_eligibl
 from fxbot.kill_switch import evaluate_drawdown_kill
 from fxbot.news_impact import NewsImpact, classify_news_impact
 from fxbot.percentile_sizing import size_by_percentile
+from fxbot.prediction_overlay import apply_prediction_overlay, load_prediction_state_payload, prediction_size_multiplier, select_point_in_time_prediction_state
 from fxbot.regime import Regime, classify_regime, is_strategy_enabled
 from fxbot.regime_dwell import RegimeDwellFilter
 from fxbot.seasonality import seasonal_risk_multiplier
@@ -76,6 +77,7 @@ class BacktestEngine:
         self._lane_blocklist = parse_trade_lanes(str(self.settings.get("TRADE_LANE_BLOCKLIST", "") or ""))
         self._spread_profiles: dict[str, dict[str, float]] = {}
         self._last_trade_close: dict[tuple[str, str], datetime] = {}  # (strategy, instrument) -> last close time
+        self._prediction_overlay_payload = load_prediction_state_payload(config.prediction_overlay_state_file) if config.prediction_overlay_enabled else None
 
         # ── Tier 1v2 overlay state ─────────────────────────────────────────
         # Feature flags — default ON so the backtest mirrors the live path.
@@ -624,6 +626,26 @@ class BacktestEngine:
                     opp = scorer(instrument, session, ctx, self.settings)
                     if opp is None:
                         continue
+                    if self.config.prediction_overlay_enabled:
+                        prediction_state = select_point_in_time_prediction_state(self._prediction_overlay_payload, current)
+                        opp = apply_prediction_overlay(
+                            opp,
+                            prediction_state,
+                            current,
+                            enabled=self.config.prediction_overlay_enabled,
+                            symbol=instrument,
+                            side=str(opp.get("direction", "")),
+                            stale_seconds=self.config.prediction_overlay_stale_seconds,
+                            fallback_mode=self.config.prediction_overlay_fallback_mode,
+                            min_favourable_probability=self.config.prediction_overlay_min_favourable_probability,
+                            min_posterior=self.config.prediction_overlay_min_posterior,
+                            event_given_success=self.config.prediction_overlay_event_given_success,
+                            kelly_base_fraction=self.config.prediction_overlay_kelly_base_fraction,
+                            max_size_multiplier=self.config.prediction_overlay_max_size_multiplier,
+                            score_scale=self.config.prediction_overlay_score_scale,
+                        )
+                    if opp is None:
+                        continue
                     lane_reason = trade_lane_block_reason(label, opp["instrument"], opp["direction"], self._lane_allowlist, self._lane_blocklist)
                     if lane_reason is not None:
                         self.overlay_block_counts[lane_reason] += 1
@@ -672,7 +694,8 @@ class BacktestEngine:
                 seasonal_mult = self._seasonal_mult(label, best_opp["instrument"], current)
                 decision_mult = self._decision_day_mult(best_opp["instrument"], macro_state, current)
                 news_reduce = 0.5 if best_opp.get("_news_impact") == "REDUCE" else 1.0
-                overlay_scale = percentile_mult * flow_mult * seasonal_mult * decision_mult * news_reduce * kill_risk_scale
+                prediction_mult = prediction_size_multiplier(best_opp.get("metadata") if isinstance(best_opp.get("metadata"), dict) else {})
+                overlay_scale = percentile_mult * flow_mult * seasonal_mult * decision_mult * news_reduce * kill_risk_scale * prediction_mult
                 # Clip the overlay stack to a [0.1x, 3.5x] envelope so a single
                 # extreme multiplier cannot blow out sizing.
                 overlay_scale = max(0.1, min(3.5, overlay_scale))
