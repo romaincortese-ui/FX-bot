@@ -21,6 +21,7 @@ import math
 import asyncio
 import socket
 from datetime import datetime, timezone, timedelta
+from html import escape
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except ImportError:  # pragma: no cover — fallback for Python 3.8 sandboxes.
@@ -893,6 +894,7 @@ def publish_bot_runtime_status(state: str, balance: float | None = None, error: 
         last_scan_cycle_at=_last_scan_cycle_at or None,
         scan_pool_mode=_last_scan_pool_status.get("mode", "primary"),
         market_regime_mult=round(float(_market_regime_mult), 4),
+        prediction_overlay_status=_prediction_overlay_status_text(),
         missed_opportunities=_missed_opportunity_status_summary(),
         error=error,
         **_runtime_account_metrics(balance),
@@ -3727,6 +3729,44 @@ def _apply_prediction_overlay_to_opportunity(strategy: str, opp: dict, now: date
     return adjusted, None
 
 
+def _prediction_overlay_status_text() -> str:
+    if not FX_PREDICTION_OVERLAY_ENABLED:
+        return "disabled"
+    source = "state file configured" if str(FX_PREDICTION_STATE_FILE or "").strip() else "state file missing"
+    loaded = "state loaded" if isinstance(_prediction_overlay_payload, dict) else "no state loaded"
+    return f"enabled | {loaded} | {source} | fallback {FX_PREDICTION_FALLBACK_MODE}"
+
+
+def _prediction_overlay_impact_line(metadata: dict | None) -> str:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if not metadata.get("prediction_overlay"):
+        return "Prediction overlay: no impact"
+    reason = escape(str(metadata.get("prediction_reason") or "applied"))
+    event = str(metadata.get("prediction_event_title") or metadata.get("prediction_event_id") or "").strip()
+    try:
+        probability = float(metadata.get("prediction_favourable_probability"))
+    except (TypeError, ValueError):
+        probability = None
+    try:
+        posterior = float(metadata.get("prediction_bayesian_success_probability"))
+    except (TypeError, ValueError):
+        posterior = None
+    try:
+        size_multiplier = float(metadata.get("prediction_size_multiplier"))
+    except (TypeError, ValueError):
+        size_multiplier = None
+    parts = [f"Prediction overlay: impacted | {reason}"]
+    if probability is not None:
+        parts.append(f"p {probability * 100.0:.0f}%")
+    if posterior is not None:
+        parts.append(f"posterior {posterior * 100.0:.0f}%")
+    if size_multiplier is not None:
+        parts.append(f"size {size_multiplier:.2f}x")
+    if event:
+        parts.append(f"event {escape(event[:80])}")
+    return " | ".join(parts)
+
+
 def _find_best_opportunity(strategy: str, pairs: list[str], session: dict, scorer) -> tuple[dict | None, str | None, str | None]:
     best = None
     reject_pair = None
@@ -3942,6 +3982,7 @@ def _handle_status_command():
         f"🧮 Last scan breadth: {latest_scan_text}",
         f"📋 Last active pairs: {latest_active_pairs_text}",
         f"✅ Last tradable pairs: {latest_tradable_pairs_text}",
+        f"Prediction overlay: {_prediction_overlay_status_text()}",
         f"{status_emoji} Bot: {status_text}",
     ]
     if open_trades:
@@ -6113,6 +6154,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         "percentile_samples": percentile_samples,
         "bayesian_weight": bayesian_weight,
         "prediction_size_multiplier": prediction_mult,
+        "metadata": dict(opp.get("metadata")) if isinstance(opp.get("metadata"), dict) else {},
     }
 
     if label == "TREND" and opp.get("partial_tp_pips"):
@@ -6167,6 +6209,7 @@ def open_trade_entry(opp: dict, label: str, balance: float) -> dict | None:
         f"Effective leverage: {effective_leverage_text}\n"
         f"Score: {opp['score']:.0f} | Signal: {opp.get('entry_signal', 'UNKNOWN')}\n"
         f"RSI: {rsi_text} | Vol: {vol_text} | Spread: {opp.get('spread_pips', 0):.1f}p\n"
+        f"{_prediction_overlay_impact_line(opp.get('metadata'))}\n"
         f"Kelly: {effective_kelly_mult:.2f}x | Session: {session['name']}"
     )
 
